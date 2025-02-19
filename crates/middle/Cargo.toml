@@ -1,0 +1,45 @@
+[package]
+name = "middle"
+resolver = "2"
+version = "0.1.2"
+readme = "README.md"
+edition = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+description = """
+Client Authorization middleware for REST and gRPC APIs secured via OAuth2 or Bearer Tokens, with tonic & reqwest integration. Based on the `oauth2` crate.
+"""
+
+[features]
+all = ["rustls-tls", "tonic", "client-credentials", "runtime-tokio"]
+default = ["rustls-tls", "client-credentials", "runtime-tokio"]
+rustls-tls = ["reqwest/rustls-tls", "reqwest/rustls-tls-native-roots"]
+tonic = ["dep:tonic"]
+runtime-tokio = ["tokio"]
+client-credentials = []
+
+[dependencies]
+http = "1"
+oauth2 = "5.0.0"
+reqwest = { version = "0.12", default-features = false }
+thiserror = { version = "2.0" }
+tokio = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+# chrono = { version = "0.4", optional = true }
+tracing = { version = "^0.1", features = ["attributes"] }
+typed-builder = "0.20"
+url = { workspace = true, features = ["serde"] }
+veil = "0.1"
+
+[dev-dependencies]
+mockito = "1.6.1"
+pretty_assertions = "1.4"
+serde_json = "1.0"
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros"] }
+tracing-test = "0.2.5"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

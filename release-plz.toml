@@ -1,0 +1,6 @@
+[workspace]
+release = false
+
+[[package]]
+name = "middle"
+release = true

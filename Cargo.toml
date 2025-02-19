@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "crates/middle",
+    "examples/reqwest-client-credentials",
+    "examples/tonic-bearer-token",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+homepage = "https://github.com/vakamo-labs/middle-rs"
+repository = "https://github.com/vakamo-labs/middle-rs"
+rust-version = "1.76.0"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1.43" }
+url = { version = "2.5" }
+tonic = { version = "0.12" }
+tonic-build = { version = "0.12" }
