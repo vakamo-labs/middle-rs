@@ -53,7 +53,7 @@ impl<TE: ErrorResponse> From<RequestTokenError<oauth2::HttpClientError<reqwest::
 /// [`ClientCredentialAuthorizer`]. The interceptor does not insert the access token if the intercepted call
 /// already has an `Authorization` header. The request fails with an `unauthenticated` status if the token
 /// could not be refreshed.
-/// ```
+///
 #[allow(clippy::type_complexity)]
 pub struct ClientCredentialAuthorizer<
     TE,
@@ -390,7 +390,7 @@ impl<
 {
     /// Create a new [`ClientCredentialAuthorizer`] from an existing [`oauth2::Client`].
     /// This gives gives full control over the authentication process.
-    /// For most use cases, [`ClientCredentialAuthorizer::new_simple`] is sufficient.
+    /// For most use cases, [`ClientCredentialAuthorizerBuilder::new`] is sufficient.
     #[must_use]
     pub fn new_from_client(
         client: oauth2::Client<
@@ -501,7 +501,7 @@ impl<
     ///
     /// # Panics
     ///
-    /// This method panics if [`set_http_client`] was not called and `reqwest::Client::new()` panics.
+    /// This method panics if [`Self::set_http_client`] was not called and `reqwest::Client::new()` panics.
     pub async fn build(
         self,
     ) -> Result<
