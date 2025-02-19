@@ -18,7 +18,7 @@ env:
   rust_stable: stable
   rust_nightly: nightly-2025-01-25
   rust_toolchain: '1.84'
-  rust_min: '1.76'
+  rust_min: '1.80'
 
 defaults:
   run:
@@ -61,6 +61,8 @@ jobs:
     steps:
       - run: sudo snap install --edge --classic just
       - uses: actions/checkout@v4
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
       - name: Install Rust ${{ env.rust_toolchain }}
         uses: dtolnay/rust-toolchain@stable
         with:
