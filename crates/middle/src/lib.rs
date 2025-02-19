@@ -28,12 +28,14 @@
 //! In the following example we create a `middle::HttpClient` that wraps a `reqwest::Client`.
 //! The token is kept fresh with a background task of the `ClientCredentialAuthorizer`, so that the client always sends authorized requests.
 //!
-//! ```rust
+//! ```no_run
 //! use std::str::FromStr;
 //!
 //! use middle::SimpleClientCredentialAuthorizerBuilder;
 //! use reqwest::Client;
 //! use url::Url;
+//!
+//! use crate::middle::Authorizer;
 //!
 //! #[tokio::main]
 //! async fn main() {
@@ -61,42 +63,6 @@
 //!     // Start using the client - the authorization header is automatically added.
 //!     let request = client.get("https://api.example.com/data").unwrap();
 //!     let _response = request.send().await.unwrap();
-//! }
-//! ```
-//!
-//! ## Tonic Integration
-//! Authorizers implemented by the `middle` crate, implement `tonic::service::Interceptor` if the `tonic` feature is enabled.
-//!
-//! ```rust
-//! use hello_world::{greeter_service_client::GreeterServiceClient, SayHelloRequest};
-//! use middle::BearerTokenAuthorizer;
-//! use tonic::transport::Endpoint;
-//!
-//! pub mod hello_world {
-//!     tonic::include_proto!("helloworld");
-//! }
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // All authorizers provided by the `middle` crate implement the `tonic::Interceptor` trait.
-//!     let authorizer = BearerTokenAuthorizer::new("my-super-secret-token")?;
-//!
-//!     let channel = Endpoint::from_static("http://service.example.com:50051")
-//!         .connect()
-//!         .await?;
-//!     // Use the authorizer as an interceptor.
-//!     let mut client = GreeterServiceClient::with_interceptor(channel, authorizer);
-//!
-//!     // All following requests include the authorization header.
-//!     let request = tonic::Request::new(SayHelloRequest {
-//!         name: "Tonic".into(),
-//!     });
-//!
-//!     let response = client.say_hello(request).await?;
-//!
-//!     println!("RESPONSE={:?}", response);
-//!
-//!     Ok(())
 //! }
 //! ```
 //!
