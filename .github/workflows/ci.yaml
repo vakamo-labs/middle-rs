@@ -46,10 +46,10 @@ jobs:
     steps:
       - run: sudo snap install --edge --classic just
       - uses: actions/checkout@v4
-      - name: Install Rust ${{ env.rust_toolchain }}
+      - name: Install Rust ${{ env.rust_nightly }}
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ env.rust_toolchain }},nightly
+          toolchain: ${{ env.rust_nightly }}
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: "just check-format"

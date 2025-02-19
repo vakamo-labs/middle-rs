@@ -17,7 +17,7 @@
 //! * Thread-safe token management with interior mutability
 //! * `reqwest` integration by using a wrapped `HttpClient`
 //! * `tonic` integration via Interceptors
-//! * Support for OAuth2 Client Credential flow
+//! * Support for `OAuth2` Client Credential flow
 //! * Support for Bearer Token authentication
 //! * Based on the `oauth2` crate
 //! * Safe defaults - does not follow redirects and hides sensitive data in Debug
@@ -65,7 +65,7 @@
 //! ```
 //!
 //! ## Tonic Integration
-//! ALl Authorizers implemented by the `middle` crate, implement `tonic::service::Interceptor` if the `tonic` feature is enabled.
+//! Authorizers implemented by the `middle` crate, implement `tonic::service::Interceptor` if the `tonic` feature is enabled.
 //!
 //! ```rust
 //! use hello_world::{greeter_service_client::GreeterServiceClient, SayHelloRequest};
@@ -107,7 +107,7 @@
 //! - **rustls-tls**: Enables `reqwest/rustls-tls` and `reqwest/rustls-tls-native-roots`.
 //! - **tonic**: Implement `tonic::service::Interceptor` for all Authorizers
 //! - **runtime-tokio**: Enables the `tokio` runtime (currently the only supported async runtime). Some Authorizers depend on an async runtime to spawn refresh tasks.
-//! - **client-credentials**: Enables the `ClientCredentialAuthorizer` for the OAuth2 Client Credential flow
+//! - **client-credentials**: Enables the `ClientCredentialAuthorizer` for the `OAuth2` Client Credential flow
 //!
 
 mod authorizers;
