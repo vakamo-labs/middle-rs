@@ -4,7 +4,7 @@ set export
 RUST_LOG := "debug"
 
 check-format:
-	cargo +nightly fmt --all -- --check
+	cargo +nightly-2025-01-25 fmt --all -- --check
 
 check-clippy:
 	cargo clippy --all-features --workspace -- -D warnings
