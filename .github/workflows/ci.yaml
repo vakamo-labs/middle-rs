@@ -17,7 +17,7 @@ env:
   # Change to specific Rust release to pin
   rust_stable: stable
   rust_nightly: nightly-2025-01-25
-  rust_clippy: '1.84'
+  rust_toolchain: '1.84'
   rust_min: '1.76'
 
 defaults:
@@ -46,10 +46,10 @@ jobs:
     steps:
       - run: sudo snap install --edge --classic just
       - uses: actions/checkout@v4
-      - name: Install Rust ${{ env.rust_clippy }}
+      - name: Install Rust ${{ env.rust_toolchain }}
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ env.rust_stable }},nightly
+          toolchain: ${{ env.rust_toolchain }},nightly
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: "just check-format"
@@ -61,10 +61,10 @@ jobs:
     steps:
       - run: sudo snap install --edge --classic just
       - uses: actions/checkout@v4
-      - name: Install Rust ${{ env.rust_clippy }}
+      - name: Install Rust ${{ env.rust_toolchain }}
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ env.rust_clippy }}
+          toolchain: ${{ env.rust_toolchain }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: "just check-clippy"
