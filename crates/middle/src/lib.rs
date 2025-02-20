@@ -6,12 +6,13 @@
 )]
 #![forbid(unsafe_code)]
 
+//! [![Crates.io](https://img.shields.io/crates/v/middle)](https://crates.io/crates/middle)
 //! [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 //! [![Tests](https://github.com/vakamo-labs/middle-rs/actions/workflows/ci.yaml/badge.svg)](https://github.com/vakamo-labs/middle-rs/actions/workflows/ci.yaml)
 //!
 //! # Client Authentication Middleware
 //!
-//! This crate provides client authentication for HTTP and gRPC APIs. Features include:
+//! This crate provides authentication middleware for clients that need to access secure HTTP and gRPC APIs. Features include:
 //!
 //! * Automatic token renewal when expired in a background task
 //! * Thread-safe token management with interior mutability
