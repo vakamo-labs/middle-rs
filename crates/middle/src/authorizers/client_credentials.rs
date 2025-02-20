@@ -118,16 +118,16 @@ impl<
 {
     /// Create a new [`ClientCredentialAuthorizerBuilder`].
     #[must_use]
-    pub fn new_simple_builder(
+    pub fn basic_builder(
         client_id: &str,
         client_secret: &str,
         token_url: url::Url,
-    ) -> SimpleClientCredentialAuthorizerBuilder {
-        SimpleClientCredentialAuthorizerBuilder::new(client_id, client_secret, token_url)
+    ) -> BasicClientCredentialAuthorizerBuilder {
+        BasicClientCredentialAuthorizerBuilder::new(client_id, client_secret, token_url)
     }
 
     /// Create a new [`ClientCredentialAuthorizerBuilder`] from an existing [`oauth2::Client`].
-    /// For most use-cases, it should be sufficient to use the [`ClientCredentialAuthorizer::new_simple_builder`] method.
+    /// For most use-cases, it should be sufficient to use the [`BasicClientCredentialAuthorizer::basic_builder`] method.
     #[must_use]
     pub fn builder(
         client: oauth2::Client<
@@ -188,8 +188,8 @@ impl<
     }
 }
 
-/// Specialization of [`ClientCredentialAuthorizer`] for simple use cases.
-pub type SimpleClientCredentialAuthorizer = ClientCredentialAuthorizer<
+/// Specialization of [`ClientCredentialAuthorizer`] suitable for most use cases.
+pub type BasicClientCredentialAuthorizer = ClientCredentialAuthorizer<
     BasicErrorResponse,
     BasicTokenResponse,
     BasicTokenIntrospectionResponse,
@@ -323,8 +323,8 @@ pub struct ClientCredentialAuthorizerBuilder<
     refresh_tolerance: Option<Duration>,
 }
 
-/// Specialization of [`ClientCredentialAuthorizer`] for simple use cases.
-pub type SimpleClientCredentialAuthorizerBuilder = ClientCredentialAuthorizerBuilder<
+/// Specialization of [`ClientCredentialAuthorizer`] suitable for most use cases.
+pub type BasicClientCredentialAuthorizerBuilder = ClientCredentialAuthorizerBuilder<
     BasicErrorResponse,
     BasicTokenResponse,
     BasicTokenIntrospectionResponse,
@@ -336,7 +336,7 @@ pub type SimpleClientCredentialAuthorizerBuilder = ClientCredentialAuthorizerBui
     EndpointNotSet,
 >;
 
-impl SimpleClientCredentialAuthorizerBuilder {
+impl BasicClientCredentialAuthorizerBuilder {
     #[must_use]
     /// Create a new [`ClientCredentialAuthorizer`] from a client id, client secret and token url.
     /// Initializes with 3 retries and a retry interval of 10ms.
@@ -940,7 +940,7 @@ mod test {
                 .to_string(),
             )
             .create();
-        let authorizer = SimpleClientCredentialAuthorizerBuilder::new(
+        let authorizer = BasicClientCredentialAuthorizerBuilder::new(
             "my-client",
             "my-secret",
             format!("{url}/my-tenant/oauth2/token").parse().unwrap(),
@@ -985,7 +985,7 @@ mod test {
             )
             .expect(2)
             .create();
-        let authorizer = SimpleClientCredentialAuthorizerBuilder::new(
+        let authorizer = BasicClientCredentialAuthorizerBuilder::new(
             "my-client",
             "my-secret",
             format!("{url}/my-tenant/oauth2/token").parse().unwrap(),
@@ -1032,7 +1032,7 @@ mod test {
             )
             .expect(3)
             .create();
-        let authorizer = SimpleClientCredentialAuthorizerBuilder::new(
+        let authorizer = BasicClientCredentialAuthorizerBuilder::new(
             "my-client",
             "my-secret",
             format!("{url}/my-tenant/oauth2/token").parse().unwrap(),
@@ -1078,7 +1078,7 @@ mod test {
             )
             .expect(1)
             .create();
-        let authorizer = SimpleClientCredentialAuthorizerBuilder::new(
+        let authorizer = BasicClientCredentialAuthorizerBuilder::new(
             "my-client",
             "my-secret",
             format!("{url}/my-tenant/oauth2/token").parse().unwrap(),

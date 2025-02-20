@@ -2,17 +2,17 @@
 use std::sync::Arc;
 
 use http::HeaderValue;
+#[cfg(feature = "tonic")]
+use tonic::service::Interceptor;
 
 use super::{require_ascii, Authorizer};
 use crate::error::{Error, Result};
-
-// use tonic::service::interceptor::Interceptor;
 
 /// Create a simple Authorizer that attaches a given token to any request
 /// a client sends. The token is attached with the `Bearer` auth-scheme.
 ///
 /// ## Tonic
-/// If the `tonic` feature is enabled, [`tonic::service::Interceptor`] is implemented for
+/// If the `tonic` feature is enabled, [`Interceptor`](`tonic::service::Interceptor`) is implemented for
 /// [`BearerTokenAuthorizer`]. The interceptor does not insert the access token if the intercepted call
 /// already has an `Authorization` header.
 #[derive(Clone, veil::Redact)]
@@ -51,7 +51,7 @@ impl Authorizer for BearerTokenAuthorizer {
 }
 
 #[cfg(feature = "tonic")]
-impl tonic::service::Interceptor for BearerTokenAuthorizer {
+impl Interceptor for BearerTokenAuthorizer {
     fn call(
         &mut self,
         request: tonic::Request<()>,
