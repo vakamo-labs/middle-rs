@@ -725,8 +725,9 @@ async fn request_new_token<
         match auth_response {
             Ok(auth_response) => {
                 tracing::debug!(
-                    "Successfully refreshed token for client `{}`",
+                    "Successfully refreshed token for client `{}`. Token expires in {:?}s",
                     oauth2_client.client_id().as_str(),
+                    auth_response.expires_in().map(|d| d.as_secs())
                 );
                 break auth_response;
             }
