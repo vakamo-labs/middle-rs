@@ -257,7 +257,7 @@ struct Token {
 
 impl Token {
     fn try_from_tr<TR: TokenResponse>(tr: &TR) -> Result<Self, Error> {
-        HeaderValue::from_str(tr.access_token().secret())
+        HeaderValue::from_str(&format!("Bearer {}", tr.access_token().secret()))
             .map_err(|_| Error::InvalidHeaderValue)
             .map(|mut token| {
                 token.set_sensitive(true);
@@ -671,40 +671,6 @@ async fn refresh_task<
 
         // `refresh_token` already records the result, including failures.
         let _tr = inner.refresh_token().await.ok();
-
-        // if let Ok(tr) = tr {
-        //     let expires_in = tr.expires_in();
-        //     // If it expires in less than tolerance, we wait for at least the tolerance duration
-        //     // before checking again.
-
-        //     if let Some(expires_in) = expires_in {
-        //         if expires_in < inner.tolerance {
-        //             tracing::warn!("Token refreshed. Token expires in {}s which is less than the tolerance of {}s. Refreshing in {}s.",
-        //                 expires_in.as_secs(),
-        //                 inner.tolerance.as_secs(),
-        //                 inner.tolerance.as_secs()
-        //             );
-        //             #[cfg(feature = "runtime-tokio")]
-        //             tokio::time::sleep(inner.tolerance).await;
-        //         } else {
-        //             let next_refresh = (expires_in - inner.tolerance).max(inner.tolerance);
-        //             tracing::trace!(
-        //                 "Token refreshed. Next refresh in {}s",
-        //                 next_refresh.as_secs()
-        //             );
-        //             #[cfg(feature = "runtime-tokio")]
-        //             tokio::time::sleep(next_refresh).await;
-        //         }
-        //     };
-        // } else {
-        //     // Wait at least the TOLERANCE duration before checking again
-        //     tracing::trace!(
-        //         "Failed to refresh token. Retrying in {}s",
-        //         inner.tolerance.as_secs()
-        //     );
-        //     #[cfg(feature = "runtime-tokio")]
-        //     tokio::time::sleep(inner.tolerance).await;
-        // }
     }
 }
 
@@ -955,8 +921,8 @@ mod test {
 
         let authorizer = authorizer.unwrap();
 
-        let token = authorizer.authorization_header().unwrap();
-        assert_eq!(token.to_str().unwrap(), "my-issued-token");
+        let header = authorizer.authorization_header().unwrap();
+        assert_eq!(header.to_str().unwrap(), "Bearer my-issued-token");
     }
 
     #[tokio::test]
@@ -1002,8 +968,8 @@ mod test {
 
         let authorizer = authorizer.unwrap();
 
-        let token = authorizer.authorization_header().unwrap();
-        assert_eq!(token.to_str().unwrap(), "my-issued-token");
+        let header = authorizer.authorization_header().unwrap();
+        assert_eq!(header.to_str().unwrap(), "Bearer my-issued-token");
     }
 
     #[tokio::test]
@@ -1049,8 +1015,8 @@ mod test {
 
         let authorizer = authorizer.unwrap();
 
-        let token = authorizer.authorization_header().unwrap();
-        assert_eq!(token.to_str().unwrap(), "my-issued-token");
+        let header = authorizer.authorization_header().unwrap();
+        assert_eq!(header.to_str().unwrap(), "Bearer my-issued-token");
     }
 
     #[tokio::test]
@@ -1094,7 +1060,7 @@ mod test {
 
         let authorizer = authorizer.unwrap();
 
-        let token = authorizer.authorization_header().unwrap();
-        assert_eq!(token.to_str().unwrap(), "my-issued-token");
+        let header = authorizer.authorization_header().unwrap();
+        assert_eq!(header.to_str().unwrap(), "Bearer my-issued-token");
     }
 }

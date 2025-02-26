@@ -89,6 +89,10 @@ mod tests {
             let metadata = modified_request.metadata();
             assert!(metadata.contains_key("authorization"));
             assert_eq!(
+                interceptor.authorization_header().unwrap(),
+                Arc::new(HeaderValue::from_str("Bearer my-token").unwrap())
+            );
+            assert_eq!(
                 metadata.get("authorization").unwrap().to_str().unwrap(),
                 "Bearer my-token"
             );
