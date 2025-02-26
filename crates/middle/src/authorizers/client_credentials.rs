@@ -101,6 +101,7 @@ pub struct RefreshTask {
 impl RefreshTask {
     /// Get a reference to the task.
     #[cfg(feature = "runtime-tokio")]
+    #[must_use]
     pub fn task(&self) -> &tokio::task::JoinHandle<()> {
         &self.task
     }
@@ -170,6 +171,7 @@ impl<
     }
 
     #[cfg(feature = "runtime-tokio")]
+    #[must_use]
     /// Get a reference to the refresh task.
     pub fn refresh_task(&self) -> Option<&RefreshTask> {
         self.refresh_task.as_deref()
