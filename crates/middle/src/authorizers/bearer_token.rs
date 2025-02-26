@@ -43,11 +43,6 @@ impl Authorizer for BearerTokenAuthorizer {
     fn authorization_header(&self) -> Result<Arc<HeaderValue>> {
         Ok(self.authorization_header.clone())
     }
-
-    #[cfg(feature = "runtime-tokio")]
-    fn refresh_task(&self) -> Option<Arc<tokio::task::JoinHandle<()>>> {
-        None
-    }
 }
 
 #[cfg(feature = "tonic")]

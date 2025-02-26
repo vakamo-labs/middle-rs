@@ -89,8 +89,21 @@ pub struct ClientCredentialAuthorizer<
             HasRevocationUrl,
         >,
     >,
+    refresh_task: Option<Arc<RefreshTask>>,
+}
+
+#[derive(Debug)]
+pub struct RefreshTask {
     #[cfg(feature = "runtime-tokio")]
-    refresh_task: Option<Arc<tokio::task::JoinHandle<()>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl RefreshTask {
+    /// Get a reference to the task.
+    #[cfg(feature = "runtime-tokio")]
+    pub fn task(&self) -> &tokio::task::JoinHandle<()> {
+        &self.task
+    }
 }
 
 impl<
@@ -155,38 +168,19 @@ impl<
     > {
         ClientCredentialAuthorizerBuilder::new_from_client(client)
     }
+
+    #[cfg(feature = "runtime-tokio")]
+    /// Get a reference to the refresh task.
+    pub fn refresh_task(&self) -> Option<&RefreshTask> {
+        self.refresh_task.as_deref()
+    }
 }
 
-impl<
-        TE: ErrorResponse,
-        TR: TokenResponse,
-        TIR: TokenIntrospectionResponse,
-        RT: RevocableToken,
-        TRE: ErrorResponse,
-        HasAuthUrl: EndpointState,
-        HasDeviceAuthUrl: EndpointState,
-        HasIntrospectionUrl: EndpointState,
-        HasRevocationUrl: EndpointState,
-    > Drop
-    for ClientCredentialAuthorizer<
-        TE,
-        TR,
-        TIR,
-        RT,
-        TRE,
-        HasAuthUrl,
-        HasDeviceAuthUrl,
-        HasIntrospectionUrl,
-        HasRevocationUrl,
-    >
-{
+impl Drop for RefreshTask {
     fn drop(&mut self) {
-        tracing::debug!("Dropping ClientCredentialAuthorizer.");
-        if let Some(refresh_task) = self.refresh_task.take() {
-            tracing::debug!("Stopping credential refresh task.");
-            #[cfg(feature = "runtime-tokio")]
-            refresh_task.abort();
-        }
+        tracing::debug!("Stopping credential refresh task.");
+        #[cfg(feature = "runtime-tokio")]
+        self.task.abort();
     }
 }
 
@@ -571,7 +565,7 @@ impl<
                 refresh_task(inner_cloned).await;
             });
 
-            Some(Arc::new(refresh_task))
+            Some(Arc::new(RefreshTask { task: refresh_task }))
         } else {
             tracing::debug!(
                 "Token does not expire. Disabling refresh task for client `{}`.",
@@ -835,11 +829,6 @@ impl<
 
         drop(state_read_guard);
         token
-    }
-
-    #[cfg(feature = "runtime-tokio")]
-    fn refresh_task(&self) -> Option<Arc<tokio::task::JoinHandle<()>>> {
-        self.refresh_task.as_ref().map(Clone::clone)
     }
 }
 
