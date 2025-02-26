@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/vakamo-labs/middle-rs/compare/v0.2.1...v0.3.0) - 2025-02-26
+
+### Added
+
+- Credential refresh should stop only when RefreshTask is dropped (#8)
+
 ## [0.2.1](https://github.com/vakamo-labs/middle-rs/compare/v0.2.0...v0.2.1) - 2025-02-26
 
 ### Fixed
