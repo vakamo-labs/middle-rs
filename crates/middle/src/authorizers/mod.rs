@@ -45,11 +45,6 @@ pub trait Authorizer {
             ))
         })
     }
-
-    #[cfg(feature = "runtime-tokio")]
-    /// Returns the background task that was launched to refresh the token.
-    /// Returns `None` if the authorizer does not need to refresh the token.
-    fn refresh_task(&self) -> Option<Arc<tokio::task::JoinHandle<()>>>;
 }
 
 /// Helper function to ensure that a string is ASCII.
