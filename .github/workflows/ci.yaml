@@ -1,8 +1,8 @@
 on:
   push:
-    branches: ["main", "limes-*.x"]
+    branches: ["main", "middle-*.x", "release-plz-.*"]
   pull_request:
-    branches: ["main", "limes-*.x"]
+    branches: ["main", "middle-*.x", "release-plz-.*"]
   
 name: CI
 
