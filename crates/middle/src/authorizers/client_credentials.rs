@@ -181,7 +181,9 @@ impl<
     >
 {
     fn drop(&mut self) {
+        tracing::debug!("Dropping ClientCredentialAuthorizer.");
         if let Some(refresh_task) = self.refresh_task.take() {
+            tracing::debug!("Stopping credential refresh task.");
             #[cfg(feature = "runtime-tokio")]
             refresh_task.abort();
         }
@@ -613,6 +615,10 @@ async fn refresh_task<
         >,
     >,
 ) {
+    tracing::debug!(
+        "Starting the refresh loop for client `{}`",
+        inner.oauth2_client.client_id().as_str()
+    );
     loop {
         // Determine if the token needs to be refreshed
         let now = Instant::now();
@@ -666,10 +672,12 @@ async fn refresh_task<
             }
         };
 
+        tracing::trace!("Sleeping for {}s", sleep_duration.as_secs());
         #[cfg(feature = "runtime-tokio")]
         tokio::time::sleep(sleep_duration).await;
 
         // `refresh_token` already records the result, including failures.
+        tracing::trace!("Refreshing token for client `{}`", client_id);
         let _tr = inner.refresh_token().await.ok();
     }
 }
