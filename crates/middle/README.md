@@ -24,7 +24,7 @@ The token is kept fresh with a background task of the `ClientCredentialAuthorize
 ```rust
 use std::str::FromStr;
 
-use middle::BasicClientCredentialAuthorizer;
+use middle::{Authorizer, BasicClientCredentialAuthorizer};
 use reqwest::Client;
 use url::Url;
 
@@ -36,7 +36,7 @@ async fn main() {
 
     // Create a new Authorizer. The Authorizer keeps the token refreshed in the background.
     let authorizer =
-        BasicClientCredentialAuthorizer::new(client_id, client_secret, token_endpoint)
+        BasicClientCredentialAuthorizer::basic_builder(client_id, client_secret, token_endpoint)
             .add_scope("my-scope")
             .refresh_tolerance(std::time::Duration::from_secs(30)) // Refresh 30 seconds before expiry
             .build()
@@ -45,7 +45,7 @@ async fn main() {
 
     // The current authorization header. The header is always kept up-to-date.
     // Returns an error if the last refresh failed.
-    let header = authorizer.authorization_header().unwrap();
+    let _header = authorizer.authorization_header().unwrap();
 
     // Generate a new reqwest Client and wrap it with `HttpClient`.
     let reqwest_client = Client::new();
