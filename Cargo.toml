@@ -16,5 +16,6 @@ license = "Apache-2.0"
 [workspace.dependencies]
 tokio = { version = "1.43" }
 url = { version = "2.5" }
-tonic = { version = "0.12" }
-tonic-build = { version = "0.12" }
+tonic = { version = "0.14" }
+tonic-prost-build = { version = "0.14" }
+tonic-prost = { version = "0.14" }

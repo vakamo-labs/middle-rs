@@ -739,7 +739,7 @@ async fn request_new_token<
                 if counter > max_retries {
                     tracing::error!("Failed to fetch token after {} retries: {e}", counter);
                     return Err(e.into());
-                };
+                }
                 tracing::debug!(
                     "Failed to fetch token: {e}. Retrying in {}ms",
                     retry_interval.as_millis()
