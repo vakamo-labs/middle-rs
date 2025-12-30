@@ -31,7 +31,7 @@ impl<TE: ErrorResponse> From<RequestTokenError<oauth2::HttpClientError<reqwest::
             RequestTokenError::Request(e) => Error::OAuth2RequestFailed(e.to_string()),
             RequestTokenError::Parse(e, _) => Error::OAuth2ParseError(e.to_string()),
             RequestTokenError::ServerResponse(e) => Error::OAuth2RequestFailed(e.to_string()),
-            RequestTokenError::Other(e) => Error::OAuth2RequestFailed(e.to_string()),
+            RequestTokenError::Other(e) => Error::OAuth2RequestFailed(e.clone()),
         }
     }
 }
@@ -648,7 +648,14 @@ async fn refresh_task<
                         );
                         Duration::from_secs(inner.tolerance.as_secs())
                     } else {
-                        let next_refresh = expires_in - inner.tolerance;
+                        let next_refresh = expires_in.checked_sub(inner.tolerance).unwrap_or_else(|| {
+                            tracing::error!(
+                                "Failed to calculate next refresh time: expires_in ({:?}) < tolerance ({:?}). This should not happen. Refreshing immediately.",
+                                expires_in,
+                                inner.tolerance
+                            );
+                            Duration::from_secs(0)
+                        });
                         // Token expires in more than Tolerance seconds -> Sleep until Tolerance seconds before expiry
                         tracing::trace!(
                             "Token expires in {}s. Refreshing in {}s.",
