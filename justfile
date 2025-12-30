@@ -4,7 +4,7 @@ set export
 RUST_LOG := "debug"
 
 check-format:
-	cargo +nightly-2025-01-25 fmt --all -- --check
+	cargo +nightly-2025-12-25 fmt --all -- --check
 
 check-clippy:
 	cargo clippy --all-features --workspace -- -D warnings
@@ -30,4 +30,4 @@ doc-test:
 	cargo test --no-fail-fast --doc --all-features --workspace
 
 doc: 
-	RUSTFLAGS="--cfg docsrs" cargo +nightly-2025-01-25 doc --lib --no-deps --all-features --document-private-items
+	cargo doc --lib --no-deps --all-features --document-private-items

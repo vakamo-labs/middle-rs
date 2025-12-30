@@ -1,5 +1,7 @@
 #[cfg(not(feature = "runtime-tokio"))]
-compile_error!("If `client-credentials` feature is enabled, an async runtime, such as `runtime-tokio`, must be enabled too.");
+compile_error!(
+    "If `client-credentials` feature is enabled, an async runtime, such as `runtime-tokio`, must be enabled too."
+);
 
 use std::{
     collections::HashMap,
@@ -9,13 +11,13 @@ use std::{
 
 use http::HeaderValue;
 use oauth2::{
+    Client, ClientId, ClientSecret, EndpointNotSet, EndpointSet, EndpointState, ErrorResponse,
+    RequestTokenError, RevocableToken, Scope, StandardRevocableToken, TokenIntrospectionResponse,
+    TokenResponse, TokenUrl,
     basic::{
         BasicErrorResponse, BasicRevocationErrorResponse, BasicTokenIntrospectionResponse,
         BasicTokenResponse,
     },
-    Client, ClientId, ClientSecret, EndpointNotSet, EndpointSet, EndpointState, ErrorResponse,
-    RequestTokenError, RevocableToken, Scope, StandardRevocableToken, TokenIntrospectionResponse,
-    TokenResponse, TokenUrl,
 };
 
 use super::Authorizer;
@@ -29,7 +31,7 @@ impl<TE: ErrorResponse> From<RequestTokenError<oauth2::HttpClientError<reqwest::
             RequestTokenError::Request(e) => Error::OAuth2RequestFailed(e.to_string()),
             RequestTokenError::Parse(e, _) => Error::OAuth2ParseError(e.to_string()),
             RequestTokenError::ServerResponse(e) => Error::OAuth2RequestFailed(e.to_string()),
-            RequestTokenError::Other(e) => Error::OAuth2RequestFailed(e.to_string()),
+            RequestTokenError::Other(e) => Error::OAuth2RequestFailed(e.clone()),
         }
     }
 }
@@ -108,16 +110,16 @@ impl RefreshTask {
 }
 
 impl<
-        TE: ErrorResponse + Send + Sync + 'static,
-        TR: TokenResponse + Send + Sync + 'static,
-        TIR: TokenIntrospectionResponse + Send + Sync + 'static,
-        RT: RevocableToken + Send + Sync + 'static,
-        TRE: ErrorResponse + Send + Sync + 'static,
-        HasAuthUrl: EndpointState + Send + Sync + 'static,
-        HasDeviceAuthUrl: EndpointState + Send + Sync + 'static,
-        HasIntrospectionUrl: EndpointState + Send + Sync + 'static,
-        HasRevocationUrl: EndpointState + Send + Sync + 'static,
-    >
+    TE: ErrorResponse + Send + Sync + 'static,
+    TR: TokenResponse + Send + Sync + 'static,
+    TIR: TokenIntrospectionResponse + Send + Sync + 'static,
+    RT: RevocableToken + Send + Sync + 'static,
+    TRE: ErrorResponse + Send + Sync + 'static,
+    HasAuthUrl: EndpointState + Send + Sync + 'static,
+    HasDeviceAuthUrl: EndpointState + Send + Sync + 'static,
+    HasIntrospectionUrl: EndpointState + Send + Sync + 'static,
+    HasRevocationUrl: EndpointState + Send + Sync + 'static,
+>
     ClientCredentialAuthorizer<
         TE,
         TR,
@@ -364,16 +366,16 @@ impl BasicClientCredentialAuthorizerBuilder {
 }
 
 impl<
-        TE: ErrorResponse + Send + Sync + 'static,
-        TR: TokenResponse + Send + Sync + 'static,
-        TIR: TokenIntrospectionResponse + Send + Sync + 'static,
-        RT: RevocableToken + Send + Sync + 'static,
-        TRE: ErrorResponse + Send + Sync + 'static,
-        HasAuthUrl: EndpointState + Send + Sync + 'static,
-        HasDeviceAuthUrl: EndpointState + Send + Sync + 'static,
-        HasIntrospectionUrl: EndpointState + Send + Sync + 'static,
-        HasRevocationUrl: EndpointState + Send + Sync + 'static,
-    >
+    TE: ErrorResponse + Send + Sync + 'static,
+    TR: TokenResponse + Send + Sync + 'static,
+    TIR: TokenIntrospectionResponse + Send + Sync + 'static,
+    RT: RevocableToken + Send + Sync + 'static,
+    TRE: ErrorResponse + Send + Sync + 'static,
+    HasAuthUrl: EndpointState + Send + Sync + 'static,
+    HasDeviceAuthUrl: EndpointState + Send + Sync + 'static,
+    HasIntrospectionUrl: EndpointState + Send + Sync + 'static,
+    HasRevocationUrl: EndpointState + Send + Sync + 'static,
+>
     ClientCredentialAuthorizerBuilder<
         TE,
         TR,
@@ -638,14 +640,22 @@ async fn refresh_task<
 
                     // Token expires in less than TOLERANCE seconds -> Process now
                     if expires_in < inner.tolerance {
-                        tracing::warn!("Token expires in {}s which is less than the minimum allowed refresh interval of {}s. Refreshing in {}s.",
+                        tracing::warn!(
+                            "Token expires in {}s which is less than the minimum allowed refresh interval of {}s. Refreshing in {}s.",
                             expires_in.as_secs(),
                             inner.tolerance.as_secs(),
                             inner.tolerance.as_secs()
                         );
                         Duration::from_secs(inner.tolerance.as_secs())
                     } else {
-                        let next_refresh = expires_in - inner.tolerance;
+                        let next_refresh = expires_in.checked_sub(inner.tolerance).unwrap_or_else(|| {
+                            tracing::error!(
+                                "Failed to calculate next refresh time: expires_in ({:?}) < tolerance ({:?}). This should not happen. Refreshing immediately.",
+                                expires_in,
+                                inner.tolerance
+                            );
+                            Duration::from_secs(0)
+                        });
                         // Token expires in more than Tolerance seconds -> Sleep until Tolerance seconds before expiry
                         tracing::trace!(
                             "Token expires in {}s. Refreshing in {}s.",
@@ -739,7 +749,7 @@ async fn request_new_token<
                 if counter > max_retries {
                     tracing::error!("Failed to fetch token after {} retries: {e}", counter);
                     return Err(e.into());
-                };
+                }
                 tracing::debug!(
                     "Failed to fetch token: {e}. Retrying in {}ms",
                     retry_interval.as_millis()
@@ -754,17 +764,16 @@ async fn request_new_token<
 }
 
 impl<
-        TE: ErrorResponse + 'static,
-        TR: TokenResponse,
-        TIR: TokenIntrospectionResponse,
-        RT: RevocableToken,
-        TRE: ErrorResponse + 'static,
-        HasAuthUrl: EndpointState,
-        HasDeviceAuthUrl: EndpointState,
-        HasIntrospectionUrl: EndpointState,
-        HasRevocationUrl: EndpointState,
-    >
-    Inner<TE, TR, TIR, RT, TRE, HasAuthUrl, HasDeviceAuthUrl, HasIntrospectionUrl, HasRevocationUrl>
+    TE: ErrorResponse + 'static,
+    TR: TokenResponse,
+    TIR: TokenIntrospectionResponse,
+    RT: RevocableToken,
+    TRE: ErrorResponse + 'static,
+    HasAuthUrl: EndpointState,
+    HasDeviceAuthUrl: EndpointState,
+    HasIntrospectionUrl: EndpointState,
+    HasRevocationUrl: EndpointState,
+> Inner<TE, TR, TIR, RT, TRE, HasAuthUrl, HasDeviceAuthUrl, HasIntrospectionUrl, HasRevocationUrl>
 {
     /// Refresh the token.
     /// If token refresh fails, the error is stored in the token state and returned.
@@ -798,16 +807,16 @@ impl<
 }
 
 impl<
-        TE: ErrorResponse + 'static,
-        TR: TokenResponse,
-        TIR: TokenIntrospectionResponse,
-        RT: RevocableToken,
-        TRE: ErrorResponse + 'static,
-        HasAuthUrl: EndpointState,
-        HasDeviceAuthUrl: EndpointState,
-        HasIntrospectionUrl: EndpointState,
-        HasRevocationUrl: EndpointState,
-    > Authorizer
+    TE: ErrorResponse + 'static,
+    TR: TokenResponse,
+    TIR: TokenIntrospectionResponse,
+    RT: RevocableToken,
+    TRE: ErrorResponse + 'static,
+    HasAuthUrl: EndpointState,
+    HasDeviceAuthUrl: EndpointState,
+    HasIntrospectionUrl: EndpointState,
+    HasRevocationUrl: EndpointState,
+> Authorizer
     for ClientCredentialAuthorizer<
         TE,
         TR,
@@ -836,16 +845,16 @@ impl<
 
 #[cfg(feature = "tonic")]
 impl<
-        TE: ErrorResponse + 'static,
-        TR: TokenResponse,
-        TIR: TokenIntrospectionResponse,
-        RT: RevocableToken,
-        TRE: ErrorResponse + 'static,
-        HasAuthUrl: EndpointState,
-        HasDeviceAuthUrl: EndpointState,
-        HasIntrospectionUrl: EndpointState,
-        HasRevocationUrl: EndpointState,
-    > tonic::service::Interceptor
+    TE: ErrorResponse + 'static,
+    TR: TokenResponse,
+    TIR: TokenIntrospectionResponse,
+    RT: RevocableToken,
+    TRE: ErrorResponse + 'static,
+    HasAuthUrl: EndpointState,
+    HasDeviceAuthUrl: EndpointState,
+    HasIntrospectionUrl: EndpointState,
+    HasRevocationUrl: EndpointState,
+> tonic::service::Interceptor
     for ClientCredentialAuthorizer<
         TE,
         TR,

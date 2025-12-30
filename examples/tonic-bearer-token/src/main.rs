@@ -1,4 +1,4 @@
-use hello_world::{greeter_service_client::GreeterServiceClient, SayHelloRequest};
+use hello_world::{SayHelloRequest, greeter_service_client::GreeterServiceClient};
 use middle::BearerTokenAuthorizer;
 use tonic::transport::Endpoint;
 

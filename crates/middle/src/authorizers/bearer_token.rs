@@ -5,7 +5,7 @@ use http::HeaderValue;
 #[cfg(feature = "tonic")]
 use tonic::service::Interceptor;
 
-use super::{require_ascii, Authorizer};
+use super::{Authorizer, require_ascii};
 use crate::error::{Error, Result};
 
 /// Create a simple Authorizer that attaches a given token to any request

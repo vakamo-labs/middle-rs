@@ -7,14 +7,15 @@ members = [
 resolver = "2"
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 homepage = "https://github.com/vakamo-labs/middle-rs"
 repository = "https://github.com/vakamo-labs/middle-rs"
-rust-version = "1.81.0"
+rust-version = "1.88.0"
 license = "Apache-2.0"
 
 [workspace.dependencies]
 tokio = { version = "1.43" }
 url = { version = "2.5" }
-tonic = { version = "0.12" }
-tonic-build = { version = "0.12" }
+tonic = { version = "0.14" }
+tonic-prost-build = { version = "0.14" }
+tonic-prost = { version = "0.14" }

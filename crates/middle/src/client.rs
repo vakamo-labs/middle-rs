@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use http::{header::AUTHORIZATION, HeaderValue};
+use http::{HeaderValue, header::AUTHORIZATION};
 use reqwest::IntoUrl;
 
-use crate::{error::Result, Authorizer};
+use crate::{Authorizer, error::Result};
 
 /// Wrapper around `reqwest::Client` that automatically adds the authorization header,
 /// while keeping it up-to-date using an `Authorizer`.
