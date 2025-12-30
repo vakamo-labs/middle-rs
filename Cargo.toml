@@ -14,7 +14,7 @@ rust-version = "1.88.0"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-tokio = { version = "1.43" }
+tokio = { version = "1.48" }
 url = { version = "2.5" }
 tonic = { version = "0.14" }
 tonic-prost-build = { version = "0.14" }
