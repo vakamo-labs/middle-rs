@@ -19,6 +19,11 @@ use crate::error::{Error, Result};
 pub struct BearerTokenAuthorizer {
     #[redact]
     authorization_header: Arc<HeaderValue>,
+    // Pre-computed tonic representation, cloned cheaply on the interceptor hot
+    // path instead of re-parsing the header on every request.
+    #[cfg(feature = "tonic")]
+    #[redact]
+    authorization_metadata: tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
 }
 
 impl BearerTokenAuthorizer {
@@ -29,12 +34,24 @@ impl BearerTokenAuthorizer {
     /// Fails if "Bearer {token}" is not a valid ASCII string.
     pub fn new(token: &str) -> Result<Self> {
         require_ascii(token)?;
-        let mut authentication_header = HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_e| Error::InvalidHeaderValue)?;
+        let bearer = format!("Bearer {token}");
+        let mut authentication_header =
+            HeaderValue::from_str(&bearer).map_err(|_e| Error::InvalidHeaderValue)?;
         authentication_header.set_sensitive(true);
+
+        #[cfg(feature = "tonic")]
+        let authorization_metadata = {
+            use std::str::FromStr;
+            let mut metadata = tonic::metadata::MetadataValue::from_str(&bearer)
+                .map_err(|_e| Error::InvalidHeaderValue)?;
+            metadata.set_sensitive(true);
+            metadata
+        };
 
         Ok(Self {
             authorization_header: Arc::new(authentication_header),
+            #[cfg(feature = "tonic")]
+            authorization_metadata,
         })
     }
 }
@@ -42,6 +59,14 @@ impl BearerTokenAuthorizer {
 impl Authorizer for BearerTokenAuthorizer {
     fn authorization_header(&self) -> Result<Arc<HeaderValue>> {
         Ok(self.authorization_header.clone())
+    }
+
+    #[cfg(feature = "tonic")]
+    fn authorization_header_tonic(
+        &self,
+    ) -> std::result::Result<tonic::metadata::MetadataValue<tonic::metadata::Ascii>, tonic::Status>
+    {
+        Ok(self.authorization_metadata.clone())
     }
 }
 
