@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/vakamo-labs/middle-rs/compare/v0.4.0...v0.5.0) - 2026-07-01
+
+### Fixed
+
+- *(client-credentials)* harden token refresh and cache tonic metadata ([#28](https://github.com/vakamo-labs/middle-rs/pull/28))
+
+### Other
+
+- *(authorizers)* extract shared bearer-header builder ([#30](https://github.com/vakamo-labs/middle-rs/pull/30))
+- *(deps)* bump mockito dev-dependency floor to 1.7 ([#29](https://github.com/vakamo-labs/middle-rs/pull/29))
+- *(deps)* Update veil requirement from 0.2 to 0.3 ([#26](https://github.com/vakamo-labs/middle-rs/pull/26))
+
 ## [0.4.0](https://github.com/vakamo-labs/middle-rs/compare/v0.3.1...v0.4.0) - 2025-12-30
 
 - *(deps)* Update to tonic 14 ([#22](https://github.com/vakamo-labs/middle-rs/pull/22))
