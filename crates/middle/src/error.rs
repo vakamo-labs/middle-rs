@@ -12,16 +12,6 @@ pub enum Error {
     OAuth2ParseError(String),
     #[error("Request failed: {0}")]
     ReqwestFailed(#[from] Arc<reqwest::Error>),
-}
-
-impl Error {
-    // pub fn internal(
-    //     reason: impl Into<String>,
-    //     error: impl Into<Box<dyn std::error::Error + Send + Sync>>,
-    // ) -> Self {
-    //     Self::InternalError {
-    //         reason: reason.into(),
-    //         source: error.into(),
-    //     }
-    // }
+    #[error("Token has expired and a refresh has not yet succeeded.")]
+    TokenExpired,
 }
