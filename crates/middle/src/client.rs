@@ -134,15 +134,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_client() {
+        // Use a local mock server so the test is deterministic and offline. It
+        // also verifies the authorizer actually attaches the bearer header.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/get")
+            .match_header("authorization", "Bearer test")
+            .with_status(200)
+            .create_async()
+            .await;
+
         let authorizer = BearerTokenAuthorizer::new("test").unwrap();
         let client = HttpClient::new(authorizer);
 
         let response = client
-            .get("https://httpbin.org/get")
+            .get(format!("{}/get", server.url()))
             .unwrap()
             .send()
             .await
             .unwrap();
+
+        mock.assert_async().await;
         assert!(response.status().is_success());
     }
 }
