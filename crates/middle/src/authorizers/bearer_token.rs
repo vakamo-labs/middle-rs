@@ -5,8 +5,8 @@ use http::HeaderValue;
 #[cfg(feature = "tonic")]
 use tonic::service::Interceptor;
 
-use super::{Authorizer, require_ascii};
-use crate::error::{Error, Result};
+use super::{Authorizer, bearer_header, require_ascii};
+use crate::error::Result;
 
 /// Create a simple Authorizer that attaches a given token to any request
 /// a client sends. The token is attached with the `Bearer` auth-scheme.
@@ -34,24 +34,11 @@ impl BearerTokenAuthorizer {
     /// Fails if "Bearer {token}" is not a valid ASCII string.
     pub fn new(token: &str) -> Result<Self> {
         require_ascii(token)?;
-        let bearer = format!("Bearer {token}");
-        let mut authentication_header =
-            HeaderValue::from_str(&bearer).map_err(|_e| Error::InvalidHeaderValue)?;
-        authentication_header.set_sensitive(true);
-
-        #[cfg(feature = "tonic")]
-        let authorization_metadata = {
-            use std::str::FromStr;
-            let mut metadata = tonic::metadata::MetadataValue::from_str(&bearer)
-                .map_err(|_e| Error::InvalidHeaderValue)?;
-            metadata.set_sensitive(true);
-            metadata
-        };
-
+        let built = bearer_header(token)?;
         Ok(Self {
-            authorization_header: Arc::new(authentication_header),
+            authorization_header: built.header,
             #[cfg(feature = "tonic")]
-            authorization_metadata,
+            authorization_metadata: built.metadata,
         })
     }
 }
