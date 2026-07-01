@@ -19,10 +19,10 @@ use oauth2::{
         BasicTokenResponse,
     },
 };
+use tracing::Instrument;
 
 use super::Authorizer;
 use crate::error::Error;
-use tracing::Instrument;
 
 /// Minimum delay the refresh loop waits between refresh attempts, even when the
 /// token is already within (or past) its refresh tolerance. Prevents hammering
@@ -848,8 +848,7 @@ impl<
                 // token. This prevents a transient IdP outage during the refresh
                 // window (which fires `tolerance` before expiry) from discarding an
                 // otherwise-valid token.
-                let keep_existing =
-                    matches!(&*state_write_guard, Ok(token) if !token.is_expired());
+                let keep_existing = matches!(&*state_write_guard, Ok(token) if !token.is_expired());
                 if !keep_existing {
                     *state_write_guard = Err(e.clone());
                 }
@@ -901,10 +900,8 @@ impl<
     #[cfg(feature = "tonic")]
     fn authorization_header_tonic(
         &self,
-    ) -> std::result::Result<
-        tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
-        tonic::Status,
-    > {
+    ) -> std::result::Result<tonic::metadata::MetadataValue<tonic::metadata::Ascii>, tonic::Status>
+    {
         // Clone the pre-computed metadata value (cheap, `Bytes`-backed) instead of
         // re-parsing the header string on every request.
         let state_read_guard = self.inner.token.read().expect("Non-poisoned lock");

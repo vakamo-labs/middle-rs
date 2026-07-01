@@ -64,10 +64,8 @@ impl Authorizer for BearerTokenAuthorizer {
     #[cfg(feature = "tonic")]
     fn authorization_header_tonic(
         &self,
-    ) -> std::result::Result<
-        tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
-        tonic::Status,
-    > {
+    ) -> std::result::Result<tonic::metadata::MetadataValue<tonic::metadata::Ascii>, tonic::Status>
+    {
         Ok(self.authorization_metadata.clone())
     }
 }
