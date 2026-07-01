@@ -19,9 +19,15 @@ use oauth2::{
         BasicTokenResponse,
     },
 };
+use tracing::Instrument;
 
 use super::Authorizer;
 use crate::error::Error;
+
+/// Minimum delay the refresh loop waits between refresh attempts, even when the
+/// token is already within (or past) its refresh tolerance. Prevents hammering
+/// the identity provider for very short-lived tokens or during an outage.
+const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 impl<TE: ErrorResponse> From<RequestTokenError<oauth2::HttpClientError<reqwest::Error>, TE>>
     for Error
@@ -249,23 +255,47 @@ struct Inner<
 }
 
 #[derive(veil::Redact, Clone)]
+// `token` / `token_expiry` intentionally share the struct name for clarity.
+#[allow(clippy::struct_field_names)]
 struct Token {
     #[redact]
     token: Arc<HeaderValue>,
+    // Pre-computed tonic representation, cloned cheaply on the interceptor hot
+    // path instead of re-parsing the header on every request.
+    #[cfg(feature = "tonic")]
+    #[redact]
+    metadata: tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
     token_expiry: Option<Instant>,
 }
 
 impl Token {
     fn try_from_tr<TR: TokenResponse>(tr: &TR) -> Result<Self, Error> {
-        HeaderValue::from_str(&format!("Bearer {}", tr.access_token().secret()))
-            .map_err(|_| Error::InvalidHeaderValue)
-            .map(|mut token| {
-                token.set_sensitive(true);
-                Token {
-                    token: Arc::new(token),
-                    token_expiry: tr.expires_in().map(|e| Instant::now() + e),
-                }
-            })
+        let bearer = format!("Bearer {}", tr.access_token().secret());
+        let mut token = HeaderValue::from_str(&bearer).map_err(|_| Error::InvalidHeaderValue)?;
+        token.set_sensitive(true);
+
+        #[cfg(feature = "tonic")]
+        let metadata = {
+            use std::str::FromStr;
+            let mut metadata = tonic::metadata::MetadataValue::from_str(&bearer)
+                .map_err(|_| Error::InvalidHeaderValue)?;
+            metadata.set_sensitive(true);
+            metadata
+        };
+
+        Ok(Token {
+            token: Arc::new(token),
+            #[cfg(feature = "tonic")]
+            metadata,
+            token_expiry: tr.expires_in().map(|e| Instant::now() + e),
+        })
+    }
+
+    /// Returns `true` if the token has a known expiry that has already passed.
+    /// Tokens without an expiry are treated as never expiring.
+    fn is_expired(&self) -> bool {
+        self.token_expiry
+            .is_some_and(|expiry| Instant::now() >= expiry)
     }
 }
 
@@ -620,71 +650,85 @@ async fn refresh_task<
     loop {
         // Determine if the token needs to be refreshed
         let now = Instant::now();
-        let client_id = inner.oauth2_client.client_id().as_str();
 
-        let span = tracing::span!(tracing::Level::TRACE, "refresh_task", client_id = client_id);
-        let _enter = span.enter();
+        let span = tracing::span!(
+            tracing::Level::TRACE,
+            "refresh_task",
+            client_id = inner.oauth2_client.client_id().as_str()
+        );
 
-        let sleep_duration = {
+        // Decide how long to sleep before the next refresh. Returns `None` when the
+        // token never expires and the refresh loop should stop entirely.
+        // The lock is only held inside this synchronous closure, never across an
+        // `.await` (see issue #11).
+        let sleep_duration = span.in_scope(|| -> Option<Duration> {
             let state_read_guard = inner.token.read().expect("Non-poisoned lock");
-            let token = (*state_read_guard).clone();
-            drop(state_read_guard);
 
-            if let Ok(token) = token {
-                if let Some(expiry) = token.token_expiry {
-                    let expires_in = if expiry > now {
-                        expiry - now
-                    } else {
-                        Duration::from_secs(0)
-                    };
-
-                    // Token expires in less than TOLERANCE seconds -> Process now
-                    if expires_in < inner.tolerance {
-                        tracing::warn!(
-                            "Token expires in {}s which is less than the minimum allowed refresh interval of {}s. Refreshing in {}s.",
-                            expires_in.as_secs(),
-                            inner.tolerance.as_secs(),
-                            inner.tolerance.as_secs()
-                        );
-                        Duration::from_secs(inner.tolerance.as_secs())
-                    } else {
-                        let next_refresh = expires_in.checked_sub(inner.tolerance).unwrap_or_else(|| {
-                            tracing::error!(
-                                "Failed to calculate next refresh time: expires_in ({:?}) < tolerance ({:?}). This should not happen. Refreshing immediately.",
-                                expires_in,
-                                inner.tolerance
-                            );
-                            Duration::from_secs(0)
-                        });
-                        // Token expires in more than Tolerance seconds -> Sleep until Tolerance seconds before expiry
-                        tracing::trace!(
-                            "Token expires in {}s. Refreshing in {}s.",
-                            expires_in.as_secs(),
-                            next_refresh.as_secs()
-                        );
-                        next_refresh
-                    }
-                } else {
-                    // Token does not expire. We don't need a background task
-                    tracing::debug!("Token does not expire. Disabling refresh task.",);
-                    return;
-                }
-            } else {
+            // No valid token cached (a previous refresh failed and the old token
+            // has expired): retry after `tolerance`.
+            let Ok(token) = &*state_read_guard else {
+                // Floor the retry delay so a small/zero `tolerance` can't turn a
+                // sustained outage into a tight loop against the IdP.
+                let retry_in = inner.tolerance.max(MIN_REFRESH_INTERVAL);
                 tracing::trace!(
-                    "Failed to refresh token. Retrying in {}s",
-                    inner.tolerance.as_secs()
+                    "No valid token available. Retrying in {}s",
+                    retry_in.as_secs()
                 );
-                Duration::from_secs(inner.tolerance.as_secs())
+                return Some(retry_in);
+            };
+
+            // Token never expires: stop the refresh loop entirely.
+            let Some(expiry) = token.token_expiry else {
+                tracing::debug!("Token does not expire. Disabling refresh task.");
+                return None;
+            };
+
+            let expires_in = expiry.saturating_duration_since(now);
+            if expires_in < inner.tolerance {
+                // The token already lives for less than `tolerance`, so we cannot
+                // honour the full tolerance. Refresh roughly halfway through the
+                // remaining lifetime (never below `MIN_REFRESH_INTERVAL`) so the
+                // token is renewed before it expires without busy-looping the IdP.
+                let next_refresh = (expires_in / 2).max(MIN_REFRESH_INTERVAL);
+                tracing::debug!(
+                    "Token lifetime ({}s) is shorter than the refresh tolerance ({}s). Refreshing in {}s.",
+                    expires_in.as_secs(),
+                    inner.tolerance.as_secs(),
+                    next_refresh.as_secs()
+                );
+                Some(next_refresh)
+            } else {
+                // Refresh `tolerance` before expiry, but never below the floor so a
+                // token whose lifetime only barely exceeds `tolerance` can't spin
+                // the loop against the IdP.
+                let next_refresh = expires_in
+                    .saturating_sub(inner.tolerance)
+                    .max(MIN_REFRESH_INTERVAL);
+                tracing::trace!(
+                    "Token expires in {}s. Refreshing in {}s.",
+                    expires_in.as_secs(),
+                    next_refresh.as_secs()
+                );
+                Some(next_refresh)
             }
+        });
+
+        let Some(sleep_duration) = sleep_duration else {
+            return;
         };
 
-        tracing::trace!("Sleeping for {}s", sleep_duration.as_secs());
-        #[cfg(feature = "runtime-tokio")]
-        tokio::time::sleep(sleep_duration).await;
-
         // `refresh_token` already records the result, including failures.
-        tracing::trace!("Refreshing token for client `{}`", client_id);
-        let _tr = inner.refresh_token().await.ok();
+        // Instrument the async work with the span instead of holding an `enter`
+        // guard across the `.await` points.
+        async {
+            tracing::trace!("Sleeping for {}s", sleep_duration.as_secs());
+            #[cfg(feature = "runtime-tokio")]
+            tokio::time::sleep(sleep_duration).await;
+            tracing::trace!("Refreshing token");
+            inner.refresh_token().await.ok();
+        }
+        .instrument(span)
+        .await;
     }
 }
 
@@ -789,18 +833,28 @@ impl<
         .await;
 
         // Unwrap RWLock to propagate poison (writer panicked)
-        // Get write lock immediately to not spawn multiple token fetch threads
         let mut state_write_guard = self.token.write().expect("Non-poisoned lock");
 
-        let token = tr
-            .as_ref()
-            .map_err(|e| {
+        match tr.as_ref() {
+            Ok(tr) => {
+                // Successful refresh: store the new token (or a conversion error if
+                // the access token is not a valid header value).
+                *state_write_guard = Token::try_from_tr(tr);
+            }
+            Err(e) => {
                 tracing::error!("Failed to refresh token: {e}");
-                e.clone()
-            })
-            .and_then(Token::try_from_tr);
+                // Keep serving the currently cached token while it is still valid;
+                // only surface the refresh error once we no longer have a usable
+                // token. This prevents a transient IdP outage during the refresh
+                // window (which fires `tolerance` before expiry) from discarding an
+                // otherwise-valid token.
+                let keep_existing = matches!(&*state_write_guard, Ok(token) if !token.is_expired());
+                if !keep_existing {
+                    *state_write_guard = Err(e.clone());
+                }
+            }
+        }
 
-        *state_write_guard = token;
         drop(state_write_guard);
         tr
     }
@@ -833,13 +887,31 @@ impl<
         // Unwrap RWLock to propagate poison (writer panicked)
         let state_read_guard = self.inner.token.read().expect("Non-poisoned lock");
 
-        let token = state_read_guard
-            .as_ref()
-            .map(|t| t.token.clone())
-            .map_err(Clone::clone);
+        match &*state_read_guard {
+            // A cached token that has outlived its expiry (a refresh has been
+            // failing) must not be handed out, even though we keep it around so
+            // the refresh task can decide when to give up.
+            Ok(token) if token.is_expired() => Err(Error::TokenExpired),
+            Ok(token) => Ok(token.token.clone()),
+            Err(e) => Err(e.clone()),
+        }
+    }
 
-        drop(state_read_guard);
-        token
+    #[cfg(feature = "tonic")]
+    fn authorization_header_tonic(
+        &self,
+    ) -> std::result::Result<tonic::metadata::MetadataValue<tonic::metadata::Ascii>, tonic::Status>
+    {
+        // Clone the pre-computed metadata value (cheap, `Bytes`-backed) instead of
+        // re-parsing the header string on every request.
+        let state_read_guard = self.inner.token.read().expect("Non-poisoned lock");
+        match &*state_read_guard {
+            Ok(token) if token.is_expired() => Err(tonic::Status::unauthenticated(
+                Error::TokenExpired.to_string(),
+            )),
+            Ok(token) => Ok(token.metadata.clone()),
+            Err(e) => Err(tonic::Status::unauthenticated(e.to_string())),
+        }
     }
 }
 
@@ -1071,5 +1143,216 @@ mod test {
 
         let header = authorizer.authorization_header().unwrap();
         assert_eq!(header.to_str().unwrap(), "Bearer my-issued-token");
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_refresh_failure_keeps_valid_token() {
+        let mut oauth_server = mockito::Server::new_async().await;
+        let url = oauth_server.url();
+        // Initial fetch succeeds with a long-lived token. Refresh is disabled so
+        // the background task cannot race with the manual refresh below.
+        let success = oauth_server
+            .mock("POST", "/token")
+            .with_status(200)
+            .with_header(CONTENT_TYPE.as_str(), "application/json")
+            .with_body(
+                serde_json::json!({
+                    "access_token": "first-token",
+                    "token_type": "bearer",
+                    "expires_in": 3600
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let authorizer = BasicClientCredentialAuthorizerBuilder::new(
+            "my-client",
+            "my-secret",
+            format!("{url}/token").parse().unwrap(),
+        )
+        .disable_refresh()
+        .build()
+        .await
+        .unwrap();
+
+        success.assert_async().await;
+        assert_eq!(
+            authorizer.authorization_header().unwrap().to_str().unwrap(),
+            "Bearer first-token"
+        );
+
+        // The IdP now fails for every token request.
+        let failure = oauth_server
+            .mock("POST", "/token")
+            .with_status(500)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        // A failed refresh must NOT discard the still-valid cached token.
+        let result = authorizer.inner.refresh_token().await;
+        assert!(result.is_err(), "refresh should report the failure");
+        failure.assert_async().await;
+        assert_eq!(
+            authorizer.authorization_header().unwrap().to_str().unwrap(),
+            "Bearer first-token",
+            "a still-valid token must be retained when refresh fails"
+        );
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_refresh_failure_surfaces_error_once_token_expired() {
+        let mut oauth_server = mockito::Server::new_async().await;
+        let url = oauth_server.url();
+        let success = oauth_server
+            .mock("POST", "/token")
+            .with_status(200)
+            .with_header(CONTENT_TYPE.as_str(), "application/json")
+            .with_body(
+                serde_json::json!({
+                    "access_token": "first-token",
+                    "token_type": "bearer",
+                    "expires_in": 3600
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let authorizer = BasicClientCredentialAuthorizerBuilder::new(
+            "my-client",
+            "my-secret",
+            format!("{url}/token").parse().unwrap(),
+        )
+        .disable_refresh()
+        .build()
+        .await
+        .unwrap();
+        success.assert_async().await;
+
+        // Force the cached token to be already expired.
+        {
+            let mut guard = authorizer.inner.token.write().unwrap();
+            if let Ok(token) = guard.as_mut() {
+                token.token_expiry = Some(
+                    Instant::now()
+                        .checked_sub(Duration::from_secs(1))
+                        .expect("monotonic clock is at least 1s past its epoch"),
+                );
+            }
+        }
+
+        let _failure = oauth_server
+            .mock("POST", "/token")
+            .with_status(500)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        // With no usable token left, the refresh error must be surfaced.
+        let result = authorizer.inner.refresh_token().await;
+        assert!(result.is_err());
+        assert!(
+            authorizer.authorization_header().is_err(),
+            "an expired token must not be served after a failed refresh"
+        );
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_expired_token_not_served_on_read() {
+        let mut oauth_server = mockito::Server::new_async().await;
+        let url = oauth_server.url();
+        let success = oauth_server
+            .mock("POST", "/token")
+            .with_status(200)
+            .with_header(CONTENT_TYPE.as_str(), "application/json")
+            .with_body(
+                serde_json::json!({
+                    "access_token": "first-token",
+                    "token_type": "bearer",
+                    "expires_in": 3600
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let authorizer = BasicClientCredentialAuthorizerBuilder::new(
+            "my-client",
+            "my-secret",
+            format!("{url}/token").parse().unwrap(),
+        )
+        .disable_refresh()
+        .build()
+        .await
+        .unwrap();
+        success.assert_async().await;
+        assert!(authorizer.authorization_header().is_ok());
+
+        // Force-expire the cached token. The read path must reject it without any
+        // refresh having run.
+        {
+            let mut guard = authorizer.inner.token.write().unwrap();
+            if let Ok(token) = guard.as_mut() {
+                token.token_expiry = Some(
+                    Instant::now()
+                        .checked_sub(Duration::from_secs(1))
+                        .expect("monotonic clock is at least 1s past its epoch"),
+                );
+            }
+        }
+
+        assert!(matches!(
+            authorizer.authorization_header(),
+            Err(Error::TokenExpired)
+        ));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_short_lived_token_refreshes_before_expiry() {
+        let mut oauth_server = mockito::Server::new_async().await;
+        let url = oauth_server.url();
+        // Token lifetime (2s) is shorter than the refresh tolerance (10s), so the
+        // loop must take the "refresh partway through remaining life" branch and
+        // keep renewing (~1s cadence) instead of sleeping the full tolerance. With
+        // the old behaviour it would sleep ~10s and only the initial fetch would
+        // happen within the window below.
+        let mock = oauth_server
+            .mock("POST", "/token")
+            .with_status(200)
+            .with_header(CONTENT_TYPE.as_str(), "application/json")
+            .with_body(
+                serde_json::json!({
+                    "access_token": "tok",
+                    "token_type": "bearer",
+                    "expires_in": 2
+                })
+                .to_string(),
+            )
+            .expect_at_least(2)
+            .create_async()
+            .await;
+
+        let authorizer = BasicClientCredentialAuthorizerBuilder::new(
+            "my-client",
+            "my-secret",
+            format!("{url}/token").parse().unwrap(),
+        )
+        .refresh_tolerance(Duration::from_secs(10))
+        .build()
+        .await
+        .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(2500)).await;
+        mock.assert_async().await;
+        assert!(authorizer.authorization_header().is_ok());
     }
 }
