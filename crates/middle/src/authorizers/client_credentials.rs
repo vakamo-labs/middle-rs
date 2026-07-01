@@ -270,23 +270,11 @@ struct Token {
 
 impl Token {
     fn try_from_tr<TR: TokenResponse>(tr: &TR) -> Result<Self, Error> {
-        let bearer = format!("Bearer {}", tr.access_token().secret());
-        let mut token = HeaderValue::from_str(&bearer).map_err(|_| Error::InvalidHeaderValue)?;
-        token.set_sensitive(true);
-
-        #[cfg(feature = "tonic")]
-        let metadata = {
-            use std::str::FromStr;
-            let mut metadata = tonic::metadata::MetadataValue::from_str(&bearer)
-                .map_err(|_| Error::InvalidHeaderValue)?;
-            metadata.set_sensitive(true);
-            metadata
-        };
-
+        let built = super::bearer_header(tr.access_token().secret())?;
         Ok(Token {
-            token: Arc::new(token),
+            token: built.header,
             #[cfg(feature = "tonic")]
-            metadata,
+            metadata: built.metadata,
             token_expiry: tr.expires_in().map(|e| Instant::now() + e),
         })
     }

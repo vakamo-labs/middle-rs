@@ -58,3 +58,41 @@ pub(crate) fn require_ascii(s: &str) -> Result<(), crate::error::Error> {
         Err(crate::error::Error::InvalidHeaderValue)
     }
 }
+
+/// Pre-computed representations of an `Authorization: Bearer <token>` header,
+/// shared by the authorizers so the [`HeaderValue`] and (with the `tonic`
+/// feature) the `MetadataValue` are always built and marked sensitive the same
+/// way.
+pub(crate) struct BearerHeader {
+    pub(crate) header: Arc<HeaderValue>,
+    #[cfg(feature = "tonic")]
+    pub(crate) metadata: tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
+}
+
+/// Build the sensitive `Authorization: Bearer <token>` representations from a raw
+/// token (passed without the `Bearer ` prefix).
+///
+/// # Errors
+/// Fails with `InvalidHeaderValue` if the resulting header value is invalid
+/// (for example non-ASCII).
+pub(crate) fn bearer_header(token: &str) -> Result<BearerHeader, crate::error::Error> {
+    let bearer = format!("Bearer {token}");
+    let mut header =
+        HeaderValue::from_str(&bearer).map_err(|_| crate::error::Error::InvalidHeaderValue)?;
+    header.set_sensitive(true);
+
+    #[cfg(feature = "tonic")]
+    let metadata = {
+        use std::str::FromStr;
+        let mut metadata = tonic::metadata::MetadataValue::from_str(&bearer)
+            .map_err(|_| crate::error::Error::InvalidHeaderValue)?;
+        metadata.set_sensitive(true);
+        metadata
+    };
+
+    Ok(BearerHeader {
+        header: Arc::new(header),
+        #[cfg(feature = "tonic")]
+        metadata,
+    })
+}
