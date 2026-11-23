@@ -12,7 +12,6 @@ This crate provides authentication middleware for clients that need to access se
 * `tonic` integration via Interceptors
 * Support for OAuth2 Client Credential flow
 * Support for Bearer Token authentication
-* Based on the `oauth2` crate
 * Safe defaults - does not follow redirects and hides sensitive data in Debug
 * More flows coming soon!
 

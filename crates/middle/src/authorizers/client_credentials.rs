@@ -5,42 +5,30 @@ compile_error!(
 
 use std::{
     collections::HashMap,
+    fmt,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
 use http::HeaderValue;
-use oauth2::{
-    Client, ClientId, ClientSecret, EndpointNotSet, EndpointSet, EndpointState, ErrorResponse,
-    RequestTokenError, RevocableToken, Scope, StandardRevocableToken, TokenIntrospectionResponse,
-    TokenResponse, TokenUrl,
-    basic::{
-        BasicErrorResponse, BasicRevocationErrorResponse, BasicTokenIntrospectionResponse,
-        BasicTokenResponse,
-    },
-};
 use tracing::Instrument;
 
 use super::Authorizer;
-use crate::error::Error;
+use crate::{
+    error::{ConfigError, DisplayChain, Error},
+    token_endpoint::{self, ClientAuth, Secret, TokenRequest, TokenResponse},
+};
 
 /// Minimum delay the refresh loop waits between refresh attempts, even when the
 /// token is already within (or past) its refresh tolerance. Prevents hammering
 /// the identity provider for very short-lived tokens or during an outage.
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
-impl<TE: ErrorResponse> From<RequestTokenError<oauth2::HttpClientError<reqwest::Error>, TE>>
-    for Error
-{
-    fn from(value: RequestTokenError<oauth2::HttpClientError<reqwest::Error>, TE>) -> Self {
-        match value {
-            RequestTokenError::Request(e) => Error::OAuth2RequestFailed(e.to_string()),
-            RequestTokenError::Parse(e, _) => Error::OAuth2ParseError(e.to_string()),
-            RequestTokenError::ServerResponse(e) => Error::OAuth2RequestFailed(e.to_string()),
-            RequestTokenError::Other(e) => Error::OAuth2RequestFailed(e.clone()),
-        }
-    }
-}
+/// How long one token request may take, reading the answer included.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long connecting to the token endpoint may take with the HTTP client middle builds.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 /// Authenticate with an `OAuth2` server using client credentials.
@@ -62,43 +50,13 @@ impl<TE: ErrorResponse> From<RequestTokenError<oauth2::HttpClientError<reqwest::
 /// already has an `Authorization` header. The request fails with an `unauthenticated` status if the token
 /// could not be refreshed.
 ///
-#[allow(clippy::type_complexity)]
-pub struct ClientCredentialAuthorizer<
-    TE,
-    TR,
-    TIR,
-    RT,
-    TRE,
-    HasAuthUrl = EndpointNotSet,
-    HasDeviceAuthUrl = EndpointNotSet,
-    HasIntrospectionUrl = EndpointNotSet,
-    HasRevocationUrl = EndpointNotSet,
-> where
-    TE: ErrorResponse,
-    TR: TokenResponse,
-    TIR: TokenIntrospectionResponse,
-    RT: RevocableToken,
-    TRE: ErrorResponse,
-    HasAuthUrl: EndpointState,
-    HasDeviceAuthUrl: EndpointState,
-    HasIntrospectionUrl: EndpointState,
-    HasRevocationUrl: EndpointState,
-{
-    inner: Arc<
-        Inner<
-            TE,
-            TR,
-            TIR,
-            RT,
-            TRE,
-            HasAuthUrl,
-            HasDeviceAuthUrl,
-            HasIntrospectionUrl,
-            HasRevocationUrl,
-        >,
-    >,
+pub struct ClientCredentialAuthorizer {
+    inner: Arc<Inner>,
     refresh_task: Option<Arc<RefreshTask>>,
 }
+
+/// Another name for [`ClientCredentialAuthorizer`].
+pub type BasicClientCredentialAuthorizer = ClientCredentialAuthorizer;
 
 #[derive(Debug)]
 pub struct RefreshTask {
@@ -115,67 +73,15 @@ impl RefreshTask {
     }
 }
 
-impl<
-    TE: ErrorResponse + Send + Sync + 'static,
-    TR: TokenResponse + Send + Sync + 'static,
-    TIR: TokenIntrospectionResponse + Send + Sync + 'static,
-    RT: RevocableToken + Send + Sync + 'static,
-    TRE: ErrorResponse + Send + Sync + 'static,
-    HasAuthUrl: EndpointState + Send + Sync + 'static,
-    HasDeviceAuthUrl: EndpointState + Send + Sync + 'static,
-    HasIntrospectionUrl: EndpointState + Send + Sync + 'static,
-    HasRevocationUrl: EndpointState + Send + Sync + 'static,
->
-    ClientCredentialAuthorizer<
-        TE,
-        TR,
-        TIR,
-        RT,
-        TRE,
-        HasAuthUrl,
-        HasDeviceAuthUrl,
-        HasIntrospectionUrl,
-        HasRevocationUrl,
-    >
-{
-    /// Create a new [`ClientCredentialAuthorizerBuilder`].
+impl ClientCredentialAuthorizer {
+    /// Create a new [`ClientCredentialAuthorizerBuilder`]. The client authenticates with HTTP Basic (RFC 6749, section 2.3.1).
     #[must_use]
     pub fn basic_builder(
         client_id: &str,
         client_secret: &str,
         token_url: url::Url,
-    ) -> BasicClientCredentialAuthorizerBuilder {
-        BasicClientCredentialAuthorizerBuilder::new(client_id, client_secret, token_url)
-    }
-
-    /// Create a new [`ClientCredentialAuthorizerBuilder`] from an existing [`oauth2::Client`].
-    /// For most use-cases, it should be sufficient to use the [`BasicClientCredentialAuthorizer::basic_builder`] method.
-    #[must_use]
-    pub fn builder(
-        client: oauth2::Client<
-            TE,
-            TR,
-            TIR,
-            RT,
-            TRE,
-            HasAuthUrl,
-            HasDeviceAuthUrl,
-            HasIntrospectionUrl,
-            HasRevocationUrl,
-            EndpointSet,
-        >,
-    ) -> ClientCredentialAuthorizerBuilder<
-        TE,
-        TR,
-        TIR,
-        RT,
-        TRE,
-        HasAuthUrl,
-        HasDeviceAuthUrl,
-        HasIntrospectionUrl,
-        HasRevocationUrl,
-    > {
-        ClientCredentialAuthorizerBuilder::new_from_client(client)
+    ) -> ClientCredentialAuthorizerBuilder {
+        ClientCredentialAuthorizerBuilder::new(client_id, client_secret, token_url)
     }
 
     #[cfg(feature = "runtime-tokio")]
@@ -194,62 +100,13 @@ impl Drop for RefreshTask {
     }
 }
 
-/// Specialization of [`ClientCredentialAuthorizer`] suitable for most use cases.
-pub type BasicClientCredentialAuthorizer = ClientCredentialAuthorizer<
-    BasicErrorResponse,
-    BasicTokenResponse,
-    BasicTokenIntrospectionResponse,
-    StandardRevocableToken,
-    BasicRevocationErrorResponse,
-    EndpointNotSet,
-    EndpointNotSet,
-    EndpointNotSet,
-    EndpointNotSet,
->;
-
 #[derive(Debug)]
-#[allow(clippy::type_complexity)]
-struct Inner<
-    TE,
-    TR,
-    TIR,
-    RT,
-    TRE,
-    HasAuthUrl,
-    HasDeviceAuthUrl,
-    HasIntrospectionUrl,
-    HasRevocationUrl,
-> where
-    TE: ErrorResponse,
-    TR: TokenResponse,
-    TIR: TokenIntrospectionResponse,
-    RT: RevocableToken,
-    TRE: ErrorResponse,
-    HasAuthUrl: EndpointState,
-    HasDeviceAuthUrl: EndpointState,
-    HasIntrospectionUrl: EndpointState,
-    HasRevocationUrl: EndpointState,
-{
-    // The oauth2 library also has a basic client.
-    // We can't use it unfortunately as it requires the
-    // auth url to be set.
-    oauth2_client: oauth2::Client<
-        TE,
-        TR,
-        TIR,
-        RT,
-        TRE,
-        HasAuthUrl,
-        HasDeviceAuthUrl,
-        HasIntrospectionUrl,
-        HasRevocationUrl,
-        EndpointSet, // TokenUrl is required
-    >,
-    extra_params: HashMap<String, String>,
+struct Inner {
+    request: TokenRequest,
     http_client: reqwest::Client,
+    timeout: Duration,
     max_retries: u32,
-    retry_interval: std::time::Duration,
-    scopes: Vec<Scope>,
+    retry_interval: Duration,
     token: RwLock<Result<Token, Error>>,
     tolerance: Duration,
 }
@@ -269,13 +126,16 @@ struct Token {
 }
 
 impl Token {
-    fn try_from_tr<TR: TokenResponse>(tr: &TR) -> Result<Self, Error> {
-        let built = super::bearer_header(tr.access_token().secret())?;
+    fn from_response(response: &TokenResponse) -> Result<Self, Error> {
+        let built = super::bearer_header(response.access_token.as_str())?;
         Ok(Token {
             token: built.header,
             #[cfg(feature = "tonic")]
             metadata: built.metadata,
-            token_expiry: tr.expires_in().map(|e| Instant::now() + e),
+            // `expires_in` is at most one year, so the addition does not overflow.
+            token_expiry: response
+                .expires_in
+                .and_then(|expires_in| Instant::now().checked_add(expires_in)),
         })
     }
 
@@ -290,144 +150,67 @@ impl Token {
 /// Builder for [`ClientCredentialAuthorizer`].
 ///
 /// The following configurations are available:
-/// * `max_retries`: Number of consecutive retries for token requests. Default is 3.
+/// * `max_retries`: Number of consecutive retries for token requests. Default is 3. Only errors a retry can fix are retried, see [`Error::is_retryable`].
 /// * `retry_interval`: Interval between consecutive retries. Default is 10ms.
-/// * `http_client`: Custom `reqwest::Client` to use for token requests. Default is a client with redirects disabled.
+/// * `timeout`: How long one token request may take, reading the answer included. Default is 30 seconds.
+/// * `http_client`: Custom `reqwest::Client` to use for token requests. Default is a client with redirects disabled and a connect timeout of 10 seconds.
 /// * `scopes`: Scopes to request in the token. Empty by default.
 /// * `extra_params`: Extra parameters to include in the token request. Empty by default.
 /// * `enable_refresh`: Enable automatic token refresh. Default is `true`.
 ///
-#[derive(Debug, Clone)]
-#[allow(clippy::type_complexity)]
-pub struct ClientCredentialAuthorizerBuilder<
-    TE,
-    TR,
-    TIR,
-    RT,
-    TRE,
-    HasAuthUrl = EndpointNotSet,
-    HasDeviceAuthUrl = EndpointNotSet,
-    HasIntrospectionUrl = EndpointNotSet,
-    HasRevocationUrl = EndpointNotSet,
-> where
-    TE: ErrorResponse,
-    TR: TokenResponse,
-    TIR: TokenIntrospectionResponse,
-    RT: RevocableToken,
-    TRE: ErrorResponse,
-    HasAuthUrl: EndpointState,
-    HasDeviceAuthUrl: EndpointState,
-    HasIntrospectionUrl: EndpointState,
-    HasRevocationUrl: EndpointState,
-{
-    oauth2_client: oauth2::Client<
-        TE,
-        TR,
-        TIR,
-        RT,
-        TRE,
-        HasAuthUrl,
-        HasDeviceAuthUrl,
-        HasIntrospectionUrl,
-        HasRevocationUrl,
-        EndpointSet, // TokenUrl is required for client credential flow
-    >,
+/// `Debug` shows the names of the extra parameters, not their values, and never the client secret.
+#[derive(Clone)]
+pub struct ClientCredentialAuthorizerBuilder {
+    token_url: url::Url,
+    client_auth: ClientAuth,
     max_retries: Option<u32>,
-    retry_interval: Option<std::time::Duration>,
+    retry_interval: Option<Duration>,
+    timeout: Option<Duration>,
     http_client: Option<reqwest::Client>,
-    scopes: Vec<Scope>,
+    scopes: Vec<String>,
     extra_params: HashMap<String, String>,
     enable_refresh: bool,
     refresh_tolerance: Option<Duration>,
 }
 
-/// Specialization of [`ClientCredentialAuthorizer`] suitable for most use cases.
-pub type BasicClientCredentialAuthorizerBuilder = ClientCredentialAuthorizerBuilder<
-    BasicErrorResponse,
-    BasicTokenResponse,
-    BasicTokenIntrospectionResponse,
-    StandardRevocableToken,
-    BasicRevocationErrorResponse,
-    EndpointNotSet,
-    EndpointNotSet,
-    EndpointNotSet,
-    EndpointNotSet,
->;
+/// Another name for [`ClientCredentialAuthorizerBuilder`].
+pub type BasicClientCredentialAuthorizerBuilder = ClientCredentialAuthorizerBuilder;
 
-impl BasicClientCredentialAuthorizerBuilder {
-    #[must_use]
-    /// Create a new [`ClientCredentialAuthorizer`] from a client id, client secret and token url.
-    /// Initializes with 3 retries and a retry interval of 10ms.
-    ///
-    /// # Panics
-    ///
-    /// This method panics if a TLS backend cannot be initialized, or the resolver
-    /// cannot load the system configuration. (If `reqwest::Client::new()` panics)
-    pub fn new(client_id: &str, client_secret: &str, token_url: url::Url) -> Self {
-        let client: Client<
-            BasicErrorResponse,
-            BasicTokenResponse,
-            BasicTokenIntrospectionResponse,
-            StandardRevocableToken,
-            BasicRevocationErrorResponse,
-            EndpointNotSet,
-            EndpointNotSet,
-            EndpointNotSet,
-            EndpointNotSet,
-            EndpointSet,
-        > = oauth2::Client::new(ClientId::new(client_id.to_string()))
-            .set_client_secret(ClientSecret::new(client_secret.to_string()))
-            .set_token_uri(TokenUrl::from_url(token_url));
-
-        Self::new_from_client(client)
+impl fmt::Debug for ClientCredentialAuthorizerBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut token_url = self.token_url.clone();
+        let _ = token_url.set_password(None);
+        let extra_param_names: Vec<&String> = self.extra_params.keys().collect();
+        f.debug_struct("ClientCredentialAuthorizerBuilder")
+            .field("token_url", &token_url.as_str())
+            .field("client_auth", &self.client_auth)
+            .field("max_retries", &self.max_retries)
+            .field("retry_interval", &self.retry_interval)
+            .field("timeout", &self.timeout)
+            .field("http_client", &self.http_client)
+            .field("scopes", &self.scopes)
+            .field("extra_param_names", &extra_param_names)
+            .field("enable_refresh", &self.enable_refresh)
+            .field("refresh_tolerance", &self.refresh_tolerance)
+            .finish()
     }
 }
 
-impl<
-    TE: ErrorResponse + Send + Sync + 'static,
-    TR: TokenResponse + Send + Sync + 'static,
-    TIR: TokenIntrospectionResponse + Send + Sync + 'static,
-    RT: RevocableToken + Send + Sync + 'static,
-    TRE: ErrorResponse + Send + Sync + 'static,
-    HasAuthUrl: EndpointState + Send + Sync + 'static,
-    HasDeviceAuthUrl: EndpointState + Send + Sync + 'static,
-    HasIntrospectionUrl: EndpointState + Send + Sync + 'static,
-    HasRevocationUrl: EndpointState + Send + Sync + 'static,
->
-    ClientCredentialAuthorizerBuilder<
-        TE,
-        TR,
-        TIR,
-        RT,
-        TRE,
-        HasAuthUrl,
-        HasDeviceAuthUrl,
-        HasIntrospectionUrl,
-        HasRevocationUrl,
-    >
-{
-    /// Create a new [`ClientCredentialAuthorizer`] from an existing [`oauth2::Client`].
-    /// This gives gives full control over the authentication process.
-    /// For most use cases, [`ClientCredentialAuthorizerBuilder::new`] is sufficient.
+impl ClientCredentialAuthorizerBuilder {
     #[must_use]
-    pub fn new_from_client(
-        client: oauth2::Client<
-            TE,
-            TR,
-            TIR,
-            RT,
-            TRE,
-            HasAuthUrl,
-            HasDeviceAuthUrl,
-            HasIntrospectionUrl,
-            HasRevocationUrl,
-            EndpointSet, // TokenUrl is required
-        >,
-    ) -> Self {
+    /// Create a new [`ClientCredentialAuthorizer`] from a client id, client secret and token url.
+    /// The client authenticates with HTTP Basic (RFC 6749, section 2.3.1).
+    /// Initializes with 3 retries and a retry interval of 10ms.
+    pub fn new(client_id: &str, client_secret: &str, token_url: url::Url) -> Self {
         Self {
-            oauth2_client: client,
+            token_url,
+            client_auth: ClientAuth::SecretBasic {
+                client_id: client_id.to_string(),
+                secret: Secret::new(client_secret),
+            },
             max_retries: None,
             retry_interval: None,
+            timeout: None,
             http_client: None,
             scopes: Vec::new(),
             extra_params: HashMap::new(),
@@ -437,10 +220,13 @@ impl<
     }
 
     /// Optionally specify the `reqwest::Client` to use for token requests.
-    /// When setting a custom client, please make sure to set the `redirect` policy to `Policy::none()`
-    /// to prevent SSRF vulnerabilities.
     ///
-    /// If not set, a default async client is created with redirects disabled.
+    /// middle uses the client as it is. If the client follows redirects, which reqwest does by default,
+    /// a 307 or 308 answer of the token endpoint makes reqwest send the form body again to the URL the answer names.
+    /// middle then refuses the answer, but the other URL has already received the request.
+    /// Set `redirect(reqwest::redirect::Policy::none())` on the client to prevent this.
+    ///
+    /// If not set, middle builds a client with redirects disabled and a connect timeout of 10 seconds.
     ///
     /// Use this method if you want to set custom headers or timeouts.
     #[must_use]
@@ -450,6 +236,7 @@ impl<
     }
 
     /// Optionally set the maximum number of retries when fetching a new token.
+    /// Only errors a retry can fix are retried, see [`Error::is_retryable`].
     /// The default is 3.
     #[must_use]
     pub fn set_max_retries(mut self, max_retries: u32) -> Self {
@@ -465,28 +252,40 @@ impl<
         self
     }
 
+    /// Optionally set how long one token request may take, reading the answer included.
+    /// This also applies to a client set with [`Self::set_http_client`].
+    /// The default is 30 seconds.
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
     /// Add a scope to the token request.
+    /// [`Self::build`] fails if the scope is not valid (RFC 6749, section 3.3), for example if it contains a space.
     #[must_use]
     pub fn add_scope(mut self, scope: &str) -> Self {
-        self.scopes.push(Scope::new(scope.to_string()));
+        self.scopes.push(scope.to_string());
         self
     }
 
     /// Add multiple scopes to the token request.
+    /// [`Self::build`] fails if a scope is not valid (RFC 6749, section 3.3), for example if it contains a space.
     #[must_use]
     pub fn add_scopes<I>(mut self, scopes: &[I]) -> Self
     where
         I: AsRef<str>,
     {
         self.scopes
-            .extend(scopes.iter().map(|s| Scope::new(s.as_ref().to_string())));
+            .extend(scopes.iter().map(|s| s.as_ref().to_string()));
         self
     }
 
     /// Appends an extra param to the token request.
+    /// A second call with the same name replaces the value.
     ///
-    /// For more information on security considerations and conflict handling,
-    /// please check [`oauth2::ClientCredentialsTokenRequest::add_extra_param()`].
+    /// [`Self::build`] fails for a parameter middle sets itself: `grant_type`, `scope`, `client_id`, `client_secret`,
+    /// `client_assertion`, `client_assertion_type` and `assertion`.
     #[must_use]
     pub fn add_extra_param(mut self, name: &str, value: &str) -> Self {
         self.extra_params
@@ -515,71 +314,52 @@ impl<
     ///
     /// # Errors
     ///
-    /// This method returns an error if the initial token fetch fails.
-    ///
-    /// # Panics
-    ///
-    /// This method panics if [`Self::set_http_client`] was not called and `reqwest::Client::new()` panics.
-    pub async fn build(
-        self,
-    ) -> Result<
-        ClientCredentialAuthorizer<
-            TE,
-            TR,
-            TIR,
-            RT,
-            TRE,
-            HasAuthUrl,
-            HasDeviceAuthUrl,
-            HasIntrospectionUrl,
-            HasRevocationUrl,
-        >,
-        Error,
-    > {
-        let http_client = self.http_client.unwrap_or_else(|| {
-            reqwest::Client::builder()
+    /// - [`Error::Config`] if the token URL, a scope or an extra parameter is not valid, or the HTTP client cannot be built.
+    /// - Any error of the initial token fetch.
+    pub async fn build(self) -> Result<ClientCredentialAuthorizer, Error> {
+        let request = TokenRequest::new(
+            self.token_url,
+            self.client_auth,
+            &self.scopes,
+            self.extra_params,
+        )?;
+        let http_client = match self.http_client {
+            Some(http_client) => http_client,
+            None => reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
                 .build()
-                .expect("Failed to create reqwest client")
-        });
+                .map_err(|error| ConfigError::HttpClient(Arc::new(error)))?,
+        };
 
         let retry_interval = self
             .retry_interval
             .unwrap_or_else(|| std::time::Duration::from_millis(10));
         let max_retries = self.max_retries.unwrap_or(3);
+        let timeout = self.timeout.unwrap_or(DEFAULT_TIMEOUT);
 
         // Fetch initial token
-        let tr: TR = request_new_token(
-            &self.oauth2_client,
-            &self.scopes,
-            &self.extra_params,
-            &http_client,
-            max_retries,
-            retry_interval,
-        )
-        .await?;
+        let response =
+            fetch_token(&request, &http_client, timeout, max_retries, retry_interval).await?;
+        let token = Token::from_response(&response)?;
 
         let inner = Inner {
-            oauth2_client: self.oauth2_client,
+            request,
+            http_client,
+            timeout,
             max_retries,
             retry_interval,
-            token: RwLock::new(Token::try_from_tr(&tr)),
-            scopes: self.scopes,
-            extra_params: self.extra_params,
-            http_client,
+            token: RwLock::new(Ok(token)),
             tolerance: self.refresh_tolerance.unwrap_or(Duration::from_secs(30)),
         };
-
-        // Initial refresh
-        let expires_in = tr.expires_in();
 
         let inner_arc = Arc::new(inner);
 
         // Launch refresh task in background
-        let refresh_task = if self.enable_refresh && expires_in.is_some() {
+        let refresh_task = if self.enable_refresh && response.expires_in.is_some() {
             tracing::debug!(
                 "Starting refresh task to refresh tokens for client `{}` before expiry.",
-                inner_arc.oauth2_client.client_id().as_str()
+                inner_arc.request.client_id()
             );
             let inner_cloned = inner_arc.clone();
             #[cfg(feature = "runtime-tokio")]
@@ -591,7 +371,7 @@ impl<
         } else {
             tracing::debug!(
                 "Token does not expire. Disabling refresh task for client `{}`.",
-                inner_arc.oauth2_client.client_id().as_str()
+                inner_arc.request.client_id()
             );
             None
         };
@@ -605,35 +385,10 @@ impl<
 
 /// Background task to refresh the token before it expires.
 /// If refresh fails, the error is stored in the token state. Retries continue every 60 seconds.
-#[allow(clippy::type_complexity)]
-async fn refresh_task<
-    TE: ErrorResponse + 'static,
-    TR: TokenResponse,
-    TIR: TokenIntrospectionResponse,
-    RT: RevocableToken,
-    TRE: ErrorResponse + 'static,
-    HasAuthUrl: EndpointState,
-    HasDeviceAuthUrl: EndpointState,
-    HasIntrospectionUrl: EndpointState,
-    HasRevocationUrl: EndpointState,
->(
-    inner: Arc<
-        Inner<
-            TE,
-            TR,
-            TIR,
-            RT,
-            TRE,
-            HasAuthUrl,
-            HasDeviceAuthUrl,
-            HasIntrospectionUrl,
-            HasRevocationUrl,
-        >,
-    >,
-) {
+async fn refresh_task(inner: Arc<Inner>) {
     tracing::debug!(
         "Starting the refresh loop for client `{}`",
-        inner.oauth2_client.client_id().as_str()
+        inner.request.client_id()
     );
     loop {
         // Determine if the token needs to be refreshed
@@ -642,7 +397,7 @@ async fn refresh_task<
         let span = tracing::span!(
             tracing::Level::TRACE,
             "refresh_task",
-            client_id = inner.oauth2_client.client_id().as_str()
+            client_id = inner.request.client_id()
         );
 
         // Decide how long to sleep before the next refresh. Returns `None` when the
@@ -720,101 +475,64 @@ async fn refresh_task<
     }
 }
 
-async fn request_new_token<
-    TE: ErrorResponse + 'static,
-    TR: TokenResponse,
-    TIR: TokenIntrospectionResponse,
-    RT: RevocableToken,
-    TRE: ErrorResponse + 'static,
-    HasAuthUrl: EndpointState,
-    HasDeviceAuthUrl: EndpointState,
-    HasIntrospectionUrl: EndpointState,
-    HasRevocationUrl: EndpointState,
->(
-    oauth2_client: &Client<
-        TE,
-        TR,
-        TIR,
-        RT,
-        TRE,
-        HasAuthUrl,
-        HasDeviceAuthUrl,
-        HasIntrospectionUrl,
-        HasRevocationUrl,
-        EndpointSet, // TokenUrl is required
-    >,
-    scopes: &[Scope],
-    extra_params: &HashMap<String, String>,
+/// Requests a token, retrying errors a retry can fix up to `max_retries` times.
+async fn fetch_token(
+    request: &TokenRequest,
     http_client: &reqwest::Client,
+    timeout: Duration,
     max_retries: u32,
-    retry_interval: std::time::Duration,
-) -> Result<TR, Error> {
-    let mut counter = 0;
-
-    let token = loop {
-        counter += 1;
-
-        let mut request = oauth2_client.exchange_client_credentials();
-
-        for scope in scopes {
-            request = request.add_scope(scope.clone());
-        }
-
-        for (name, value) in extra_params {
-            request = request.add_extra_param(name, value);
-        }
-
-        let auth_response = request.request_async(http_client).await;
-        // ToDo: Only retry on 500..599
-        // Requires: https://github.com/ramosbugs/oauth2-rs/issues/302
-
-        match auth_response {
-            Ok(auth_response) => {
+    retry_interval: Duration,
+) -> Result<TokenResponse, Error> {
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match token_endpoint::request_token(http_client, request, timeout).await {
+            Ok(response) => {
                 tracing::debug!(
-                    "Successfully refreshed token for client `{}`. Token expires in {:?}s",
-                    oauth2_client.client_id().as_str(),
-                    auth_response.expires_in().map(|d| d.as_secs())
+                    "Successfully fetched a token for client `{}`. Token expires in {:?}s",
+                    request.client_id(),
+                    response.expires_in.map(|d| d.as_secs())
                 );
-                break auth_response;
+                return Ok(response);
             }
-            Err(e) => {
-                if counter > max_retries {
-                    tracing::error!("Failed to fetch token after {} retries: {e}", counter);
-                    return Err(e.into());
-                }
+            Err(error) if !error.is_retryable() => {
+                tracing::error!(
+                    "Failed to fetch a token for client `{}`; a retry cannot fix this: {}",
+                    request.client_id(),
+                    DisplayChain(&error)
+                );
+                return Err(error);
+            }
+            Err(error) if attempt > max_retries => {
+                tracing::error!(
+                    "Failed to fetch a token for client `{}` after {attempt} attempts: {}",
+                    request.client_id(),
+                    DisplayChain(&error)
+                );
+                return Err(error);
+            }
+            Err(error) => {
                 tracing::debug!(
-                    "Failed to fetch token: {e}. Retrying in {}ms",
+                    "Failed to fetch a token for client `{}`: {}. Retrying in {}ms",
+                    request.client_id(),
+                    DisplayChain(&error),
                     retry_interval.as_millis()
                 );
                 #[cfg(feature = "runtime-tokio")]
                 tokio::time::sleep(retry_interval).await;
             }
         }
-    };
-
-    Ok(token)
+    }
 }
 
-impl<
-    TE: ErrorResponse + 'static,
-    TR: TokenResponse,
-    TIR: TokenIntrospectionResponse,
-    RT: RevocableToken,
-    TRE: ErrorResponse + 'static,
-    HasAuthUrl: EndpointState,
-    HasDeviceAuthUrl: EndpointState,
-    HasIntrospectionUrl: EndpointState,
-    HasRevocationUrl: EndpointState,
-> Inner<TE, TR, TIR, RT, TRE, HasAuthUrl, HasDeviceAuthUrl, HasIntrospectionUrl, HasRevocationUrl>
-{
+impl Inner {
     /// Refresh the token.
     /// If token refresh fails, the error is stored in the token state and returned.
-    async fn refresh_token(&self) -> Result<TR, Error> {
-        let tr = request_new_token(
-            &self.oauth2_client,
-            &self.scopes,
-            &self.extra_params,
+    async fn refresh_token(&self) -> Result<TokenResponse, Error> {
+        let response = fetch_token(
+            &self.request,
             &self.http_client,
+            self.timeout,
             self.max_retries,
             self.retry_interval,
         )
@@ -823,14 +541,14 @@ impl<
         // Unwrap RWLock to propagate poison (writer panicked)
         let mut state_write_guard = self.token.write().expect("Non-poisoned lock");
 
-        match tr.as_ref() {
-            Ok(tr) => {
+        match response.as_ref() {
+            Ok(response) => {
                 // Successful refresh: store the new token (or a conversion error if
                 // the access token is not a valid header value).
-                *state_write_guard = Token::try_from_tr(tr);
+                *state_write_guard = Token::from_response(response);
             }
             Err(e) => {
-                tracing::error!("Failed to refresh token: {e}");
+                tracing::error!("Failed to refresh token: {}", DisplayChain(e));
                 // Keep serving the currently cached token while it is still valid;
                 // only surface the refresh error once we no longer have a usable
                 // token. This prevents a transient IdP outage during the refresh
@@ -844,33 +562,11 @@ impl<
         }
 
         drop(state_write_guard);
-        tr
+        response
     }
 }
 
-impl<
-    TE: ErrorResponse + 'static,
-    TR: TokenResponse,
-    TIR: TokenIntrospectionResponse,
-    RT: RevocableToken,
-    TRE: ErrorResponse + 'static,
-    HasAuthUrl: EndpointState,
-    HasDeviceAuthUrl: EndpointState,
-    HasIntrospectionUrl: EndpointState,
-    HasRevocationUrl: EndpointState,
-> Authorizer
-    for ClientCredentialAuthorizer<
-        TE,
-        TR,
-        TIR,
-        RT,
-        TRE,
-        HasAuthUrl,
-        HasDeviceAuthUrl,
-        HasIntrospectionUrl,
-        HasRevocationUrl,
-    >
-{
+impl Authorizer for ClientCredentialAuthorizer {
     fn authorization_header(&self) -> Result<Arc<HeaderValue>, Error> {
         // Unwrap RWLock to propagate poison (writer panicked)
         let state_read_guard = self.inner.token.read().expect("Non-poisoned lock");
@@ -904,29 +600,7 @@ impl<
 }
 
 #[cfg(feature = "tonic")]
-impl<
-    TE: ErrorResponse + 'static,
-    TR: TokenResponse,
-    TIR: TokenIntrospectionResponse,
-    RT: RevocableToken,
-    TRE: ErrorResponse + 'static,
-    HasAuthUrl: EndpointState,
-    HasDeviceAuthUrl: EndpointState,
-    HasIntrospectionUrl: EndpointState,
-    HasRevocationUrl: EndpointState,
-> tonic::service::Interceptor
-    for ClientCredentialAuthorizer<
-        TE,
-        TR,
-        TIR,
-        RT,
-        TRE,
-        HasAuthUrl,
-        HasDeviceAuthUrl,
-        HasIntrospectionUrl,
-        HasRevocationUrl,
-    >
-{
+impl tonic::service::Interceptor for ClientCredentialAuthorizer {
     fn call(
         &mut self,
         request: tonic::Request<()>,
@@ -969,7 +643,7 @@ mod test {
             .with_body(
                 serde_json::json!({
                     "access_token": "my-issued-token",
-                    "token_type": "my-token-type",
+                    "token_type": "Bearer",
                     "expires_in": 3600
                 })
                 .to_string(),
@@ -1013,7 +687,7 @@ mod test {
             .with_body(
                 serde_json::json!({
                     "access_token": "my-issued-token",
-                    "token_type": "my-token-type",
+                    "token_type": "Bearer",
                     "expires_in": 1
                 })
                 .to_string(),
@@ -1060,7 +734,7 @@ mod test {
             .with_body(
                 serde_json::json!({
                     "access_token": "my-issued-token",
-                    "token_type": "my-token-type",
+                    "token_type": "Bearer",
                     "expires_in": 2
                 })
                 .to_string(),
@@ -1107,7 +781,7 @@ mod test {
             .with_body(
                 serde_json::json!({
                     "access_token": "my-issued-token",
-                    "token_type": "my-token-type"
+                    "token_type": "Bearer"
                 })
                 .to_string(),
             )
