@@ -9,23 +9,23 @@ repository = { workspace = true }
 rust-version = { workspace = true }
 license = { workspace = true }
 description = """
-Client Authorization Middleware for APIs secured via OAuth2 or Bearer Tokens. Tonic & reqwest integration. Based on the `oauth2` crate.
+Client Authorization Middleware for APIs secured via OAuth2 or Bearer Tokens. Tonic & reqwest integration.
 """
 
 [features]
 all = ["rustls-tls", "tonic", "client-credentials", "runtime-tokio"]
 default = ["rustls-tls", "client-credentials", "runtime-tokio"]
-rustls-tls = ["reqwest/rustls-tls", "reqwest/rustls-tls-native-roots"]
+rustls-tls = ["reqwest/rustls"]
 tonic = ["dep:tonic"]
 runtime-tokio = ["tokio"]
 client-credentials = []
 
 [dependencies]
 http = "1"
-oauth2 = "5.0.0"
-reqwest = { version = "0.12", default-features = false }
+reqwest = { version = "0.13", default-features = false }
+serde_json = "1.0"
 thiserror = { version = "2.0" }
-tokio = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["rt", "time"] }
 tonic = { workspace = true, optional = true }
 # chrono = { version = "0.4", optional = true }
 tracing = { version = "^0.1", features = ["attributes"] }
@@ -45,6 +45,14 @@ tokio = { version = "1.43", features = [
     "time",
 ] }
 tracing-test = "0.2.5"
+
+[[test]]
+name = "token_request"
+required-features = ["client-credentials"]
+
+[[test]]
+name = "token_response"
+required-features = ["client-credentials"]
 
 [package.metadata.docs.rs]
 all-features = true
