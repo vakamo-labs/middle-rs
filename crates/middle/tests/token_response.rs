@@ -84,13 +84,14 @@ async fn test_an_oauth_error_in_a_200_response_is_an_oauth_error() {
 }
 
 #[tokio::test]
-async fn test_the_oauth_error_code_decides_over_the_status() {
+async fn test_an_oauth_error_with_a_5xx_status_is_retried() {
+    // A 5xx means the server failed, so the code it sent is not reliable.
     let reply = Reply::oauth_error(503, "invalid_client", "unknown client");
-    let (error, requests) = build_error(reply, 3).await;
+    let (error, requests) = build_error(reply, 1).await;
 
     assert!(matches!(&error, Error::OAuth(oauth) if oauth.code() == &ErrorCode::InvalidClient));
-    assert!(!error.is_retryable());
-    assert_eq!(requests, 1);
+    assert!(error.is_retryable());
+    assert_eq!(requests, 2);
 }
 
 #[tokio::test]

@@ -67,18 +67,20 @@ impl Error {
 
     /// Whether the same request can succeed later.
     ///
-    /// Retryable are transport errors, timeouts, HTTP 408, 429 and 5xx without an OAuth error, the OAuth errors `server_error` and `temporarily_unavailable`, and any OAuth error with HTTP 429.
-    /// An `error` that no RFC registers, such as the reason phrase on the error page of a web framework, is retryable by its HTTP status.
-    /// Not retryable are other registered OAuth errors such as `invalid_client`, whatever their HTTP status, redirect errors of the HTTP client, answers middle cannot use, and configuration errors.
+    /// Retryable are transport errors, timeouts, and answers with HTTP 408, 429 or 5xx, whatever OAuth error they carry. These statuses ask for a later attempt, and a 5xx comes from a server that failed, so its code is not reliable.
+    /// The OAuth errors `server_error` and `temporarily_unavailable` are retryable with any status.
+    /// Not retryable are other OAuth errors with another status, such as `invalid_client` with HTTP 401, redirect errors of the HTTP client, answers middle cannot use, and configuration errors.
     /// Requests sent through [`crate::HttpClient`] are not retryable, because middle cannot know whether they are safe to repeat.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::OAuth(error) => match error.code() {
-                ErrorCode::ServerError | ErrorCode::TemporarilyUnavailable => true,
-                ErrorCode::Other(_) => is_retryable_status(error.status()),
-                _ => error.status() == StatusCode::TOO_MANY_REQUESTS,
-            },
+            Self::OAuth(error) => {
+                is_retryable_status(error.status())
+                    || matches!(
+                        error.code(),
+                        ErrorCode::ServerError | ErrorCode::TemporarilyUnavailable
+                    )
+            }
             Self::Http(error) => is_retryable_status(error.status()),
             Self::Transport(TransportError(error)) => !error.is_builder() && !error.is_redirect(),
             Self::Timeout(_) | Self::TokenExpired => true,
@@ -535,19 +537,19 @@ mod tests {
     }
 
     #[test]
-    fn test_an_oauth_error_is_retryable_by_its_code_or_a_rate_limit() {
-        assert!(!oauth(StatusCode::SERVICE_UNAVAILABLE, "invalid_client").is_retryable());
-        assert!(!oauth(StatusCode::INTERNAL_SERVER_ERROR, "invalid_request").is_retryable());
-        assert!(oauth(StatusCode::BAD_REQUEST, "temporarily_unavailable").is_retryable());
-        assert!(oauth(StatusCode::INTERNAL_SERVER_ERROR, "server_error").is_retryable());
-        assert!(oauth(StatusCode::TOO_MANY_REQUESTS, "invalid_request").is_retryable());
-    }
-
-    #[test]
-    fn test_an_unregistered_oauth_error_code_is_retryable_by_its_status() {
+    fn test_an_oauth_error_is_retryable_by_its_status_or_its_code() {
+        // 408, 429 and 5xx, whatever the code.
+        assert!(oauth(StatusCode::SERVICE_UNAVAILABLE, "invalid_client").is_retryable());
+        assert!(oauth(StatusCode::INTERNAL_SERVER_ERROR, "invalid_request").is_retryable());
         assert!(oauth(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable").is_retryable());
-        assert!(oauth(StatusCode::REQUEST_TIMEOUT, "vendor_specific").is_retryable());
-        assert!(oauth(StatusCode::TOO_MANY_REQUESTS, "vendor_specific").is_retryable());
+        assert!(oauth(StatusCode::REQUEST_TIMEOUT, "invalid_grant").is_retryable());
+        assert!(oauth(StatusCode::TOO_MANY_REQUESTS, "invalid_request").is_retryable());
+        // `server_error` and `temporarily_unavailable`, whatever the status.
+        assert!(oauth(StatusCode::BAD_REQUEST, "temporarily_unavailable").is_retryable());
+        assert!(oauth(StatusCode::OK, "server_error").is_retryable());
+        // Other codes with other statuses.
+        assert!(!oauth(StatusCode::UNAUTHORIZED, "invalid_client").is_retryable());
+        assert!(!oauth(StatusCode::BAD_REQUEST, "invalid_request").is_retryable());
         assert!(!oauth(StatusCode::BAD_REQUEST, "account_locked").is_retryable());
     }
 
