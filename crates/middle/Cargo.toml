@@ -13,17 +13,37 @@ Client Authorization Middleware for APIs secured via OAuth2 or Bearer Tokens. To
 """
 
 [features]
-all = ["rustls-tls", "tonic", "client-credentials", "runtime-tokio"]
-default = ["rustls-tls", "client-credentials", "runtime-tokio"]
+all = ["rustls-tls", "tonic", "client-credentials", "runtime-tokio", "jwt"]
+default = ["rustls-tls", "client-credentials", "runtime-tokio", "aws-lc-rs"]
 rustls-tls = ["reqwest/rustls"]
 tonic = ["dep:tonic"]
 runtime-tokio = ["tokio"]
 client-credentials = []
+# Signs JWT assertions (RFC 7523). Needs the crypto backend `aws-lc-rs` or `rust-crypto`.
+jwt = [
+    "dep:base64",
+    "dep:getrandom",
+    "dep:jsonwebtoken",
+    "dep:pem",
+    "dep:simple_asn1",
+    "dep:strum",
+]
+# Crypto backend for `jwt`. With both enabled, middle uses aws-lc-rs.
+aws-lc-rs = ["jsonwebtoken?/aws_lc_rs"]
+rust-crypto = ["jsonwebtoken?/rust_crypto"]
 
 [dependencies]
+base64 = { version = "0.23", optional = true }
+getrandom = { version = "0.4", optional = true }
 http = "1"
+jsonwebtoken = { version = "12.0", default-features = false, features = [
+    "use_pem",
+], optional = true }
+pem = { version = "4", optional = true }
 reqwest = { version = "0.13", default-features = false }
 serde_json = "1.0"
+simple_asn1 = { version = "0.6", optional = true }
+strum = { version = "0.27", features = ["derive"], optional = true }
 thiserror = { version = "2.0" }
 tokio = { workspace = true, optional = true, features = ["rt", "time"] }
 tonic = { workspace = true, optional = true }
@@ -34,6 +54,10 @@ url = { workspace = true, features = ["serde"] }
 veil = "0.3"
 
 [dev-dependencies]
+base64 = "0.23"
+jsonwebtoken = { version = "12.0", default-features = false, features = [
+    "use_pem",
+] }
 mockito = "1.7"
 pretty_assertions = "1.4"
 serde_json = "1.0"
@@ -45,6 +69,10 @@ tokio = { version = "1.43", features = [
     "time",
 ] }
 tracing-test = "0.2.5"
+
+[[test]]
+name = "jwt"
+required-features = ["jwt"]
 
 [[test]]
 name = "token_request"

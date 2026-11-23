@@ -94,9 +94,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 # Feature Flags
 
-- **all**: Includes `rustls-tls`, `tonic`, `client-credentials`, and `runtime-tokio`.
-- **default**: Includes `rustls-tls`, `client-credentials`, and `runtime-tokio`.
+- **all**: Includes `rustls-tls`, `tonic`, `client-credentials`, `runtime-tokio`, and `jwt`.
+- **default**: Includes `rustls-tls`, `client-credentials`, `runtime-tokio`, and `aws-lc-rs`.
 - **rustls-tls**: Enables reqwest's `rustls` feature: TLS with rustls and aws-lc-rs, checking certificates against the root certificates of the operating system. A container image needs them installed, for example with the `ca-certificates` package.
 - **tonic**: Implement `tonic::service::Interceptor` for all Authorizers
 - **runtime-tokio**: Enables the `tokio` runtime (currently the only supported async runtime). Some Authorizers depend on an async runtime to spawn refresh tasks.
 - **client-credentials**: Enables the `ClientCredentialAuthorizer` for the OAuth2 Client Credential flow
+- **jwt**: Signs JWT assertions (RFC 7523) with `middle::jwt`. It needs one crypto backend:
+    - **aws-lc-rs**: aws-lc-rs.
+    - **rust-crypto**: the RustCrypto crates.
+
+    With both enabled, middle signs with aws-lc-rs. middle passes its backend to every jsonwebtoken call, so it works whatever process-wide default jsonwebtoken has.
