@@ -36,11 +36,8 @@ async fn test_client_credentials_with_basic_authentication() {
         vec!["Basic bXkrY2xpZW50OnMzY3IzdCUyRiUyQiU3RSUzQQ=="]
     );
     assert_eq!(
-        request.form(),
-        vec![
-            ("grant_type".to_string(), "client_credentials".to_string()),
-            ("scope".to_string(), "read write".to_string()),
-        ]
+        request.body,
+        "grant_type=client_credentials&scope=read+write"
     );
 
     assert_eq!(

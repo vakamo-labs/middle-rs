@@ -41,21 +41,17 @@ impl Reply {
 
     /// A successful token response with `token_type` Bearer.
     pub fn token(access_token: &str, expires_in: Option<u64>) -> Self {
-        let body = match expires_in {
-            Some(expires_in) => format!(
-                r#"{{"access_token":"{access_token}","token_type":"Bearer","expires_in":{expires_in}}}"#
-            ),
-            None => format!(r#"{{"access_token":"{access_token}","token_type":"Bearer"}}"#),
-        };
-        Self::json(200, body)
+        let mut body = serde_json::json!({"access_token": access_token, "token_type": "Bearer"});
+        if let Some(expires_in) = expires_in {
+            body["expires_in"] = expires_in.into();
+        }
+        Self::json(200, body.to_string())
     }
 
     /// An OAuth error response (RFC 6749, section 5.2).
     pub fn oauth_error(status: u16, error: &str, description: &str) -> Self {
-        Self::json(
-            status,
-            format!(r#"{{"error":"{error}","error_description":"{description}"}}"#),
-        )
+        let body = serde_json::json!({"error": error, "error_description": description});
+        Self::json(status, body.to_string())
     }
 
     /// A response with a body that is not JSON, such as the HTML error page of a proxy.
