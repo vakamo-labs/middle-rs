@@ -67,8 +67,8 @@ impl Error {
 
     /// Whether the same request can succeed later.
     ///
-    /// Retryable are transport errors, timeouts, HTTP 408, 429 and 5xx, and the OAuth errors `server_error` and `temporarily_unavailable`.
-    /// Not retryable are other OAuth errors such as `invalid_client`, answers middle cannot use, and configuration errors.
+    /// Retryable are transport errors, timeouts, HTTP 408, 429 and 5xx without an OAuth error, the OAuth errors `server_error` and `temporarily_unavailable`, and any OAuth error with HTTP 429.
+    /// Not retryable are other OAuth errors such as `invalid_client`, whatever their HTTP status, answers middle cannot use, and configuration errors.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -76,7 +76,7 @@ impl Error {
                 matches!(
                     error.code(),
                     ErrorCode::ServerError | ErrorCode::TemporarilyUnavailable
-                ) || is_retryable_status(error.status())
+                ) || error.status() == StatusCode::TOO_MANY_REQUESTS
             }
             Self::Http(error) => is_retryable_status(error.status()),
             Self::Transport(TransportError(error)) | Self::ReqwestFailed(error) => {
@@ -516,6 +516,26 @@ mod tests {
             assert!(!matches!(parsed, ErrorCode::Other(_)), "{code}");
             assert_eq!(parsed.as_str(), code);
         }
+    }
+
+    fn oauth(status: StatusCode, code: &str) -> Error {
+        OAuthError {
+            status,
+            code: ErrorCode::parse(code),
+            description: None,
+            uri: None,
+            retry_after: None,
+        }
+        .into()
+    }
+
+    #[test]
+    fn test_an_oauth_error_is_retryable_by_its_code_or_a_rate_limit() {
+        assert!(!oauth(StatusCode::SERVICE_UNAVAILABLE, "invalid_client").is_retryable());
+        assert!(!oauth(StatusCode::INTERNAL_SERVER_ERROR, "invalid_request").is_retryable());
+        assert!(oauth(StatusCode::BAD_REQUEST, "temporarily_unavailable").is_retryable());
+        assert!(oauth(StatusCode::INTERNAL_SERVER_ERROR, "server_error").is_retryable());
+        assert!(oauth(StatusCode::TOO_MANY_REQUESTS, "invalid_request").is_retryable());
     }
 
     #[test]

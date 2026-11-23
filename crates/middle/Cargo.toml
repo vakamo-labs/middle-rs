@@ -46,6 +46,14 @@ tokio = { version = "1.43", features = [
 ] }
 tracing-test = "0.2.5"
 
+[[test]]
+name = "token_request"
+required-features = ["client-credentials"]
+
+[[test]]
+name = "token_response"
+required-features = ["client-credentials"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

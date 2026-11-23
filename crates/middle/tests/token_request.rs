@@ -164,10 +164,12 @@ async fn test_a_token_url_with_another_scheme_is_rejected() {
 #[tokio::test]
 async fn test_debug_output_hides_secrets() {
     let idp = FakeIdp::start(|_| Reply::token("SECRET-ACCESS-TOKEN", Some(3600))).await;
+    let mut token_url = idp.token_url();
+    token_url.set_query(Some("key=SECRET-QUERY"));
     let builder = middle::BasicClientCredentialAuthorizer::basic_builder(
         "my-client",
         "SECRET-CLIENT-SECRET",
-        idp.token_url(),
+        token_url,
     )
     .add_extra_param("audience", "SECRET-PARAMETER-VALUE");
 

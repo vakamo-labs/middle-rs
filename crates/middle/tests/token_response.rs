@@ -28,6 +28,25 @@ async fn build_error(reply: Reply, max_retries: u32) -> (Error, usize) {
     (error, idp.count())
 }
 
+/// Waits until `condition` holds, for at most 5 s.
+async fn eventually(mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    condition()
+}
+
+fn header(authorizer: &middle::BasicClientCredentialAuthorizer) -> Option<String> {
+    authorizer
+        .authorization_header()
+        .ok()
+        .and_then(|header| header.to_str().ok().map(str::to_string))
+}
+
 fn invalid_response(error: &Error) -> &ResponseProblem {
     match error {
         Error::InvalidResponse(invalid) => invalid.problem(),
@@ -62,6 +81,53 @@ async fn test_an_oauth_error_in_a_200_response_is_an_oauth_error() {
     assert_eq!(oauth.status(), StatusCode::OK);
     assert_eq!(oauth.code(), &ErrorCode::InvalidGrant);
     assert_eq!(oauth.description(), None);
+}
+
+#[tokio::test]
+async fn test_the_oauth_error_code_decides_over_the_status() {
+    let reply = Reply::oauth_error(503, "invalid_client", "unknown client");
+    let (error, requests) = build_error(reply, 3).await;
+
+    assert!(matches!(&error, Error::OAuth(oauth) if oauth.code() == &ErrorCode::InvalidClient));
+    assert!(!error.is_retryable());
+    assert_eq!(requests, 1);
+}
+
+#[tokio::test]
+async fn test_an_error_field_of_another_type_in_a_200_is_rejected() {
+    let body = json!({"error": false, "access_token": "t", "token_type": "Bearer"});
+    let (error, _) = build_error(Reply::json(200, body.to_string()), 0).await;
+
+    assert_eq!(
+        invalid_response(&error),
+        &ResponseProblem::WrongType {
+            field: "error",
+            expected: "a string"
+        }
+    );
+}
+
+#[tokio::test]
+async fn test_an_error_field_of_null_is_no_error() {
+    let body = json!({"error": null, "access_token": "t", "token_type": "Bearer"});
+    let idp = FakeIdp::start(move |_| Reply::json(200, body.to_string())).await;
+
+    let authorizer = builder(idp.token_url()).build().await.unwrap();
+
+    assert_eq!(header(&authorizer).as_deref(), Some("Bearer t"));
+}
+
+#[tokio::test]
+async fn test_an_error_object_with_a_server_error_keeps_the_status() {
+    let body = json!({"error": {"code": 503, "message": "backend down"}});
+    let (error, requests) = build_error(Reply::json(503, body.to_string()), 1).await;
+
+    assert!(
+        matches!(&error, Error::Http(http) if http.status() == StatusCode::SERVICE_UNAVAILABLE),
+        "{error:?}"
+    );
+    assert!(error.is_retryable());
+    assert_eq!(requests, 2);
 }
 
 #[tokio::test]
@@ -147,7 +213,14 @@ async fn test_expires_in_may_be_a_string_of_digits() {
 
 #[tokio::test]
 async fn test_expires_in_of_another_type_is_rejected() {
-    for expires_in in [json!("soon"), json!(-5), json!(3.5), json!("")] {
+    for expires_in in [
+        json!("soon"),
+        json!(-5),
+        json!(3.5),
+        json!(""),
+        json!(0),
+        json!("0"),
+    ] {
         let body = json!({"access_token": "t", "token_type": "Bearer", "expires_in": expires_in});
         let (error, requests) = build_error(Reply::json(200, body.to_string()), 3).await;
 
@@ -155,7 +228,7 @@ async fn test_expires_in_of_another_type_is_rejected() {
             invalid_response(&error),
             &ResponseProblem::WrongType {
                 field: "expires_in",
-                expected: "a non-negative integer"
+                expected: "a positive integer"
             },
             "expires_in: {expires_in}"
         );
@@ -185,13 +258,8 @@ async fn test_a_huge_expires_in_at_refresh_keeps_the_authorizer_working() {
     .await;
     let authorizer = builder(idp.token_url()).build().await.unwrap();
 
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-
+    assert!(eventually(|| header(&authorizer).as_deref() == Some("Bearer second")).await);
     assert_eq!(idp.count(), 2);
-    assert_eq!(
-        authorizer.authorization_header().unwrap().to_str().unwrap(),
-        "Bearer second"
-    );
 }
 
 #[tokio::test]
@@ -331,8 +399,9 @@ async fn test_a_token_request_without_an_answer_times_out() {
 #[tokio::test]
 async fn test_a_refresh_without_an_answer_does_not_stop_refreshing() {
     let idp = FakeIdp::start(|number| match number {
+        1 => Reply::token("first", Some(2)),
         2 => Reply::Hang,
-        _ => Reply::token("t", Some(2)),
+        _ => Reply::token("third", Some(2)),
     })
     .await;
     let authorizer = builder(idp.token_url())
@@ -344,10 +413,8 @@ async fn test_a_refresh_without_an_answer_does_not_stop_refreshing() {
         .unwrap();
 
     // The first refresh starts after 1 s and times out after 200 ms. The token is still valid until 2 s, so the next refresh starts 1 s later.
-    tokio::time::sleep(Duration::from_millis(2600)).await;
-
+    assert!(eventually(|| header(&authorizer).as_deref() == Some("Bearer third")).await);
     assert_eq!(idp.count(), 3);
-    assert!(authorizer.authorization_header().is_ok());
 }
 
 #[tokio::test]
@@ -372,6 +439,34 @@ async fn test_a_connection_error_keeps_its_cause() {
         .expect("the cause is the reqwest error");
     assert!(cause.is_connect());
     assert!(error.is_retryable());
+}
+
+#[tokio::test]
+async fn test_a_transport_error_does_not_show_the_query_of_the_token_url() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let token_url = format!("http://127.0.0.1:{port}/token?key=SECRET-QUERY")
+        .parse()
+        .unwrap();
+
+    let error = builder(token_url)
+        .set_max_retries(0)
+        .build()
+        .await
+        .expect_err("nothing listens on the port");
+
+    let mut chain = vec![format!("{error}"), format!("{error:?}")];
+    let mut source = error.source();
+    while let Some(cause) = source {
+        chain.push(format!("{cause}"));
+        source = cause.source();
+    }
+    for text in chain {
+        assert!(!text.contains("SECRET"), "{text}");
+    }
 }
 
 #[tokio::test]

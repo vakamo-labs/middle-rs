@@ -150,7 +150,7 @@ impl fmt::Debug for TokenRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let param_names: Vec<&str> = self.params.iter().map(|(name, _)| name.as_str()).collect();
         f.debug_struct("TokenRequest")
-            .field("url", &self.url.as_str())
+            .field("url", &redacted_url(&self.url).as_str())
             .field("client_auth", &self.client_auth)
             .field("scopes", &self.scopes)
             .field("param_names", &param_names)
@@ -190,7 +190,10 @@ async fn exchange(
             );
         }
     }
-    let response = builder.send().await.map_err(TransportError::from)?;
+    let response = builder
+        .send()
+        .await
+        .map_err(|error| transport_error(error, &request.url))?;
 
     let meta = response::Meta::from_headers(response.status(), response.headers());
     if response.url() != &request.url {
@@ -203,12 +206,14 @@ async fn exchange(
         }
         .into());
     }
-    let body = read_body(response).await?;
+    let body = read_body(response)
+        .await
+        .map_err(|error| transport_error(error, &request.url))?;
     response::parse(meta, body.as_deref())
 }
 
 /// Reads the body, or `None` if it is larger than [`MAX_RESPONSE_BYTES`].
-async fn read_body(mut response: reqwest::Response) -> Result<Option<Vec<u8>>, Error> {
+async fn read_body(mut response: reqwest::Response) -> Result<Option<Vec<u8>>, reqwest::Error> {
     let limit = u64::try_from(MAX_RESPONSE_BYTES).unwrap_or(u64::MAX);
     if response
         .content_length()
@@ -217,13 +222,27 @@ async fn read_body(mut response: reqwest::Response) -> Result<Option<Vec<u8>>, E
         return Ok(None);
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(TransportError::from)? {
+    while let Some(chunk) = response.chunk().await? {
         if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
             return Ok(None);
         }
         body.extend_from_slice(&chunk);
     }
     Ok(Some(body))
+}
+
+/// The URL without user info and query, which can hold credentials, for `Debug` output and errors.
+pub(crate) fn redacted_url(url: &Url) -> Url {
+    let mut url = url.clone();
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url
+}
+
+/// A transport error that names the token URL without its query.
+fn transport_error(error: reqwest::Error, url: &Url) -> Error {
+    TransportError::from(error.with_url(redacted_url(url))).into()
 }
 
 fn form_urlencode(text: &str) -> String {

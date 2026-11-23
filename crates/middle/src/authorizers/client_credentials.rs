@@ -178,8 +178,7 @@ pub type BasicClientCredentialAuthorizerBuilder = ClientCredentialAuthorizerBuil
 
 impl fmt::Debug for ClientCredentialAuthorizerBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut token_url = self.token_url.clone();
-        let _ = token_url.set_password(None);
+        let token_url = token_endpoint::redacted_url(&self.token_url);
         let extra_param_names: Vec<&String> = self.extra_params.keys().collect();
         f.debug_struct("ClientCredentialAuthorizerBuilder")
             .field("token_url", &token_url.as_str())
@@ -223,7 +222,8 @@ impl ClientCredentialAuthorizerBuilder {
     ///
     /// middle uses the client as it is. If the client follows redirects, which reqwest does by default,
     /// a 307 or 308 answer of the token endpoint makes reqwest send the form body again to the URL the answer names.
-    /// middle then refuses the answer, but the other URL has already received the request.
+    /// middle refuses an answer whose final URL is not the token URL, but the other URL has already received the request,
+    /// and an answer after a chain of redirects that ends at the token URL counts as the token endpoint's answer.
     /// Set `redirect(reqwest::redirect::Policy::none())` on the client to prevent this.
     ///
     /// If not set, middle builds a client with redirects disabled and a connect timeout of 10 seconds.

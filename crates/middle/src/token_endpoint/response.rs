@@ -86,17 +86,27 @@ pub(super) fn parse(meta: Meta, body: Option<&[u8]>) -> Result<TokenResponse, Er
         _ => None,
     });
 
-    if let Some(object) = &object
-        && let Some(Value::String(code)) = object.get("error")
-    {
-        return Err(OAuthError {
-            status: meta.status,
-            code: ErrorCode::parse(&sanitize(code, MAX_CODE_CHARS)),
-            description: text_field(object, "error_description"),
-            uri: text_field(object, "error_uri"),
-            retry_after: meta.retry_after,
+    if let Some(object) = &object {
+        match present(object, "error") {
+            Some(Value::String(code)) => {
+                return Err(OAuthError {
+                    status: meta.status,
+                    code: ErrorCode::parse(&sanitize(code, MAX_CODE_CHARS)),
+                    description: text_field(object, "error_description"),
+                    uri: text_field(object, "error_uri"),
+                    retry_after: meta.retry_after,
+                }
+                .into());
+            }
+            // An `error` that is not a string makes a 200 ambiguous. With another status, the status decides.
+            Some(_) if meta.status == StatusCode::OK => {
+                return Err(meta.invalid(ResponseProblem::WrongType {
+                    field: "error",
+                    expected: "a string",
+                }));
+            }
+            _ => {}
         }
-        .into());
     }
 
     // RFC 6749, section 5.1: a token comes with 200.
@@ -150,7 +160,7 @@ pub(super) fn parse(meta: Meta, body: Option<&[u8]>) -> Result<TokenResponse, Er
     let expires_in = expires_in(present(&object, "expires_in")).map_err(|()| {
         meta.invalid(ResponseProblem::WrongType {
             field: "expires_in",
-            expected: "a non-negative integer",
+            expected: "a positive integer",
         })
     })?;
 
@@ -173,7 +183,8 @@ fn text_field(object: &Map<String, Value>, field: &str) -> Option<String> {
     }
 }
 
-/// `expires_in` as a JSON integer or a string of digits, as some token endpoints send it. At most [`MAX_EXPIRES_IN`].
+/// `expires_in` as a positive JSON integer or a string of digits, as some token endpoints send it. At most [`MAX_EXPIRES_IN`].
+/// A lifetime of 0 is an error, because such a token has expired on arrival.
 fn expires_in(value: Option<&Value>) -> Result<Option<Duration>, ()> {
     let seconds = match value {
         None => return Ok(None),
@@ -186,6 +197,7 @@ fn expires_in(value: Option<&Value>) -> Result<Option<Duration>, ()> {
         Some(_) => None,
     };
     seconds
+        .filter(|seconds| *seconds > 0)
         .map(|seconds| Some(Duration::from_secs(seconds).min(MAX_EXPIRES_IN)))
         .ok_or(())
 }
@@ -221,7 +233,8 @@ mod tests {
             expires_in(Some(&Value::from("99999999999999999999999"))),
             Ok(Some(MAX_EXPIRES_IN))
         );
-        assert_eq!(expires_in(Some(&Value::from(0))), Ok(Some(Duration::ZERO)));
+        assert_eq!(expires_in(Some(&Value::from(0))), Err(()));
+        assert_eq!(expires_in(Some(&Value::from("000"))), Err(()));
     }
 
     #[test]
