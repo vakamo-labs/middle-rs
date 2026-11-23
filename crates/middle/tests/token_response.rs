@@ -131,6 +131,23 @@ async fn test_an_error_object_with_a_server_error_keeps_the_status() {
 }
 
 #[tokio::test]
+async fn test_an_unregistered_error_string_is_retried_by_the_status() {
+    // The default error page of a web framework, with the reason phrase as `error`.
+    let body = json!({"timestamp": "2026-01-01T00:00:00Z", "status": 503, "error": "Service Unavailable", "path": "/token"});
+    let (error, requests) = build_error(Reply::json(503, body.to_string()), 1).await;
+
+    let Error::OAuth(oauth) = &error else {
+        panic!("expected an OAuth error, got {error:?}");
+    };
+    assert_eq!(
+        oauth.code(),
+        &ErrorCode::Other("Service Unavailable".to_string())
+    );
+    assert!(error.is_retryable());
+    assert_eq!(requests, 2);
+}
+
+#[tokio::test]
 async fn test_a_temporarily_unavailable_error_is_retried() {
     let reply = Reply::oauth_error(400, "temporarily_unavailable", "try later");
     let (error, requests) = build_error(reply, 1).await;
@@ -186,6 +203,31 @@ async fn test_a_client_error_without_an_oauth_body_is_not_retried() {
     assert_eq!(http.status(), StatusCode::NOT_FOUND);
     assert!(!error.is_retryable());
     assert_eq!(requests, 1);
+}
+
+#[tokio::test]
+async fn test_a_rejection_whose_body_breaks_off_keeps_its_status_and_is_not_retried() {
+    let (error, requests) = build_error(Reply::CutOff { status: 401 }, 3).await;
+
+    let Error::Http(http) = &error else {
+        panic!("expected an HTTP error, got {error:?}");
+    };
+    assert_eq!(http.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(error.status(), Some(StatusCode::UNAUTHORIZED));
+    assert!(!error.is_retryable());
+    assert_eq!(requests, 1);
+}
+
+#[tokio::test]
+async fn test_a_token_answer_whose_body_breaks_off_is_a_transport_error_and_retried() {
+    let (error, requests) = build_error(Reply::CutOff { status: 200 }, 1).await;
+
+    assert!(
+        matches!(error, Error::Transport(_)),
+        "expected a transport error, got {error:?}"
+    );
+    assert!(error.is_retryable());
+    assert_eq!(requests, 2);
 }
 
 #[tokio::test]
@@ -311,8 +353,8 @@ async fn test_a_response_without_access_token_is_rejected() {
 }
 
 #[tokio::test]
-async fn test_an_access_token_that_is_not_a_bearer_token_is_rejected() {
-    for access_token in ["bad\u{1}token", "t\u{f6}k\u{e9}n", "two words", "", "a=b"] {
+async fn test_an_access_token_that_is_not_visible_ascii_is_rejected() {
+    for access_token in ["bad\u{1}token", "t\u{f6}k\u{e9}n", "two words", ""] {
         let body = json!({"access_token": access_token, "token_type": "Bearer"});
         let (error, _) = build_error(Reply::json(200, body.to_string()), 0).await;
 
@@ -320,6 +362,22 @@ async fn test_an_access_token_that_is_not_a_bearer_token_is_rejected() {
             invalid_response(&error),
             &ResponseProblem::InvalidAccessToken,
             "access token {access_token:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_an_access_token_may_hold_any_visible_ascii() {
+    // RFC 6749, appendix A.12. Some providers send percent-encoded tokens or tokens with `!`.
+    for access_token in ["AAAA%2Bfake%3Dtoken", "00D000000000000!AQ.fake", "a=b"] {
+        let body = json!({"access_token": access_token, "token_type": "Bearer"});
+        let idp = FakeIdp::start(move |_| Reply::json(200, body.to_string())).await;
+
+        let authorizer = builder(idp.token_url()).build().await.unwrap();
+
+        assert_eq!(
+            authorizer.authorization_header().unwrap().to_str().unwrap(),
+            format!("Bearer {access_token}")
         );
     }
 }
@@ -508,10 +566,55 @@ async fn test_a_redirect_followed_by_the_callers_client_is_refused() {
         .await
         .expect_err("a token from another URL is refused");
 
-    assert!(
-        matches!(invalid_response(&error), ResponseProblem::Redirected { .. }),
-        "{error:?}"
+    assert_eq!(
+        invalid_response(&error),
+        &ResponseProblem::Redirected {
+            to: target.token_url().origin().ascii_serialization()
+        }
     );
     // reqwest replays the form body on a 307, so the other host got the request.
     assert_eq!(target.count(), 1);
+}
+
+#[tokio::test]
+async fn test_a_redirect_loop_of_the_callers_client_is_not_retried() {
+    let idp = FakeIdp::start(|_| {
+        Reply::text(302, "text/plain", "moved").with_header("location", "/token")
+    })
+    .await;
+
+    let error = builder(idp.token_url())
+        .set_http_client(reqwest::Client::new())
+        .set_max_retries(3)
+        .build()
+        .await
+        .expect_err("a redirect loop fails");
+
+    let Error::Transport(transport) = &error else {
+        panic!("expected a transport error, got {error:?}");
+    };
+    let cause = transport
+        .source()
+        .and_then(|source| source.downcast_ref::<reqwest::Error>())
+        .expect("the cause is a reqwest error");
+    assert!(cause.is_redirect(), "{cause:?}");
+    assert!(!error.is_retryable());
+    // The first request and the 10 redirects reqwest follows by default.
+    assert_eq!(idp.count(), 11);
+}
+
+#[tokio::test]
+async fn test_a_response_of_unknown_length_larger_than_one_mebibyte_is_rejected() {
+    let (error, _) = build_error(
+        Reply::UntilClose {
+            body: "t".repeat(1024 * 1024 + 1),
+        },
+        0,
+    )
+    .await;
+
+    assert_eq!(
+        invalid_response(&error),
+        &ResponseProblem::TooLarge { limit: 1024 * 1024 }
+    );
 }

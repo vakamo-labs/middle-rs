@@ -261,23 +261,27 @@ impl ClientCredentialAuthorizerBuilder {
         self
     }
 
-    /// Add a scope to the token request.
+    /// Add a scope to the token request. An empty scope is skipped.
     /// [`Self::build`] fails if the scope is not valid (RFC 6749, section 3.3), for example if it contains a space.
     #[must_use]
-    pub fn add_scope(mut self, scope: &str) -> Self {
-        self.scopes.push(scope.to_string());
-        self
+    pub fn add_scope(self, scope: &str) -> Self {
+        self.add_scopes(&[scope])
     }
 
-    /// Add multiple scopes to the token request.
+    /// Add multiple scopes to the token request. Empty scopes are skipped, so a setting split on single spaces works with doubled or trailing spaces.
     /// [`Self::build`] fails if a scope is not valid (RFC 6749, section 3.3), for example if it contains a space.
     #[must_use]
     pub fn add_scopes<I>(mut self, scopes: &[I]) -> Self
     where
         I: AsRef<str>,
     {
-        self.scopes
-            .extend(scopes.iter().map(|s| s.as_ref().to_string()));
+        self.scopes.extend(
+            scopes
+                .iter()
+                .map(AsRef::as_ref)
+                .filter(|scope| !scope.is_empty())
+                .map(str::to_string),
+        );
         self
     }
 

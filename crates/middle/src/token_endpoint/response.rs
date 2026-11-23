@@ -33,6 +33,16 @@ impl Meta {
         }
     }
 
+    /// The error for a status other than 200 without an OAuth error middle can read.
+    pub(super) fn http_error(self) -> Error {
+        HttpError {
+            status: self.status,
+            content_type: self.content_type,
+            retry_after: self.retry_after,
+        }
+        .into()
+    }
+
     fn invalid(&self, problem: ResponseProblem) -> Error {
         InvalidResponse {
             status: self.status,
@@ -51,17 +61,13 @@ pub(crate) struct TokenResponse {
     pub(crate) expires_in: Option<Duration>,
 }
 
-/// A bearer token as RFC 6750, section 2.1, defines it: `1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="`.
+/// An access token of visible ASCII characters (RFC 6749, appendix A.12), without spaces, so that it fits after `Bearer ` in a header.
 /// It is always a valid header value.
 pub(crate) struct AccessToken(String);
 
 impl AccessToken {
     fn parse(token: &str) -> Option<Self> {
-        let without_padding = token.trim_end_matches('=');
-        let valid = !without_padding.is_empty()
-            && without_padding
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-._~+/".contains(&b));
+        let valid = !token.is_empty() && token.bytes().all(|b| b.is_ascii_graphic());
         valid.then(|| Self(token.to_string()))
     }
 
@@ -111,12 +117,7 @@ pub(super) fn parse(meta: Meta, body: Option<&[u8]>) -> Result<TokenResponse, Er
 
     // RFC 6749, section 5.1: a token comes with 200.
     if meta.status != StatusCode::OK {
-        return Err(HttpError {
-            status: meta.status,
-            content_type: meta.content_type,
-            retry_after: meta.retry_after,
-        }
-        .into());
+        return Err(meta.http_error());
     }
 
     if body.is_none() {

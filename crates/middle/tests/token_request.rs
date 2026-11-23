@@ -47,6 +47,25 @@ async fn test_client_credentials_with_basic_authentication() {
 }
 
 #[tokio::test]
+async fn test_empty_scopes_are_skipped() {
+    let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
+    // A setting split on single spaces, with a doubled and a trailing space.
+    let scopes: Vec<&str> = "openid  openfga ".split(' ').collect();
+
+    middle::BasicClientCredentialAuthorizer::basic_builder("c", "s", idp.token_url())
+        .add_scopes(&scopes)
+        .add_scope("")
+        .build()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        idp.requests()[0].body,
+        "grant_type=client_credentials&scope=openid+openfga"
+    );
+}
+
+#[tokio::test]
 async fn test_extra_parameters_follow_the_scope() {
     let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
 

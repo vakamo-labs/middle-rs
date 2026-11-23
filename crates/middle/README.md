@@ -96,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - **all**: Includes `rustls-tls`, `tonic`, `client-credentials`, and `runtime-tokio`.
 - **default**: Includes `rustls-tls`, `client-credentials`, and `runtime-tokio`.
-- **rustls-tls**: Enables `reqwest/rustls-tls` and `reqwest/rustls-tls-native-roots`.
+- **rustls-tls**: Enables reqwest's `rustls` feature: TLS with rustls and aws-lc-rs, checking certificates against the root certificates of the operating system. A container image needs them installed, for example with the `ca-certificates` package.
 - **tonic**: Implement `tonic::service::Interceptor` for all Authorizers
 - **runtime-tokio**: Enables the `tokio` runtime (currently the only supported async runtime). Some Authorizers depend on an async runtime to spawn refresh tasks.
 - **client-credentials**: Enables the `ClientCredentialAuthorizer` for the OAuth2 Client Credential flow

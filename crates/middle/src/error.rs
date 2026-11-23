@@ -17,7 +17,7 @@ pub enum Error {
     /// The token endpoint answered with an OAuth error (RFC 6749, section 5.2).
     #[error(transparent)]
     OAuth(#[from] OAuthError),
-    /// The token endpoint answered with a status other than 200 and a body that is not an OAuth error, such as the error page of a proxy.
+    /// The token endpoint answered with a status other than 200 and no OAuth error middle can read, such as the error page of a proxy.
     #[error(transparent)]
     Http(#[from] HttpError),
     /// The token endpoint answered, but middle cannot use the answer.
@@ -55,7 +55,7 @@ impl Error {
         }
     }
 
-    /// How long the token endpoint asked to wait before the next request, from a `Retry-After` header in seconds.
+    /// How long the token endpoint asked to wait before the next request, from a `Retry-After` header in seconds, at most one day.
     #[must_use]
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
@@ -68,22 +68,24 @@ impl Error {
     /// Whether the same request can succeed later.
     ///
     /// Retryable are transport errors, timeouts, HTTP 408, 429 and 5xx without an OAuth error, the OAuth errors `server_error` and `temporarily_unavailable`, and any OAuth error with HTTP 429.
-    /// Not retryable are other OAuth errors such as `invalid_client`, whatever their HTTP status, answers middle cannot use, and configuration errors.
+    /// An `error` that no RFC registers, such as the reason phrase on the error page of a web framework, is retryable by its HTTP status.
+    /// Not retryable are other registered OAuth errors such as `invalid_client`, whatever their HTTP status, redirect errors of the HTTP client, answers middle cannot use, and configuration errors.
+    /// Requests sent through [`crate::HttpClient`] are not retryable, because middle cannot know whether they are safe to repeat.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::OAuth(error) => {
-                matches!(
-                    error.code(),
-                    ErrorCode::ServerError | ErrorCode::TemporarilyUnavailable
-                ) || error.status() == StatusCode::TOO_MANY_REQUESTS
-            }
+            Self::OAuth(error) => match error.code() {
+                ErrorCode::ServerError | ErrorCode::TemporarilyUnavailable => true,
+                ErrorCode::Other(_) => is_retryable_status(error.status()),
+                _ => error.status() == StatusCode::TOO_MANY_REQUESTS,
+            },
             Self::Http(error) => is_retryable_status(error.status()),
-            Self::Transport(TransportError(error)) | Self::ReqwestFailed(error) => {
-                !error.is_builder()
-            }
+            Self::Transport(TransportError(error)) => !error.is_builder() && !error.is_redirect(),
             Self::Timeout(_) | Self::TokenExpired => true,
-            Self::InvalidResponse(_) | Self::Config(_) | Self::InvalidHeaderValue => false,
+            Self::InvalidResponse(_)
+            | Self::Config(_)
+            | Self::InvalidHeaderValue
+            | Self::ReqwestFailed(_) => false,
         }
     }
 }
@@ -196,6 +198,7 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
+    #[cfg(feature = "client-credentials")]
     pub(crate) fn parse(code: &str) -> Self {
         match code {
             "invalid_request" => Self::InvalidRequest,
@@ -247,7 +250,7 @@ impl fmt::Display for ErrorCode {
     }
 }
 
-/// An answer of the token endpoint with a status other than 200 and a body that is not an OAuth error.
+/// An answer of the token endpoint with a status other than 200 and no OAuth error middle can read, for example because the body is the error page of a proxy, is too large or breaks off.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpError {
     pub(crate) status: StatusCode,
@@ -355,7 +358,7 @@ pub enum ResponseProblem {
     },
     /// The `token_type` is not `Bearer`.
     UnsupportedTokenType(String),
-    /// The access token has characters a bearer token cannot have (RFC 6750, section 2.1).
+    /// The access token is empty or has characters other than visible ASCII (RFC 6749, appendix A.12), such as a space.
     InvalidAccessToken,
     /// The HTTP client followed a redirect, so the answer comes from another URL.
     Redirected {
@@ -378,7 +381,7 @@ impl fmt::Display for ResponseProblem {
                 "the token type `{token_type}` is not supported; middle supports `Bearer` only"
             ),
             Self::InvalidAccessToken => f.write_str(
-                "the access token has characters a bearer token cannot have (RFC 6750, section 2.1)",
+                "the access token is empty or has characters other than visible ASCII (RFC 6749, appendix A.12)",
             ),
             Self::Redirected { to } => write!(
                 f,
@@ -475,8 +478,10 @@ impl std::error::Error for ConfigError {
 }
 
 /// Displays an error with all its causes, separated by `: `.
+#[cfg(feature = "client-credentials")]
 pub(crate) struct DisplayChain<'a>(pub(crate) &'a (dyn std::error::Error + 'static));
 
+#[cfg(feature = "client-credentials")]
 impl fmt::Display for DisplayChain<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)?;
@@ -489,7 +494,7 @@ impl fmt::Display for DisplayChain<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "client-credentials"))]
 mod tests {
     use super::*;
 
@@ -536,6 +541,30 @@ mod tests {
         assert!(oauth(StatusCode::BAD_REQUEST, "temporarily_unavailable").is_retryable());
         assert!(oauth(StatusCode::INTERNAL_SERVER_ERROR, "server_error").is_retryable());
         assert!(oauth(StatusCode::TOO_MANY_REQUESTS, "invalid_request").is_retryable());
+    }
+
+    #[test]
+    fn test_an_unregistered_oauth_error_code_is_retryable_by_its_status() {
+        assert!(oauth(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable").is_retryable());
+        assert!(oauth(StatusCode::REQUEST_TIMEOUT, "vendor_specific").is_retryable());
+        assert!(oauth(StatusCode::TOO_MANY_REQUESTS, "vendor_specific").is_retryable());
+        assert!(!oauth(StatusCode::BAD_REQUEST, "account_locked").is_retryable());
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_request_through_the_http_client_is_not_retryable() {
+        // A port nothing listens on, so that the connection is refused.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = reqwest::Client::new()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .expect_err("nothing listens");
+        assert!(error.is_connect(), "{error:?}");
+
+        assert!(!Error::ReqwestFailed(Arc::new(error)).is_retryable());
     }
 
     #[test]

@@ -10,6 +10,7 @@ check-clippy:
 	cargo clippy --all-features --workspace -- -D warnings
 	cargo clippy --workspace -- -D warnings
 	cargo clippy --workspace --no-default-features -- -D warnings
+	cargo clippy -p middle --no-default-features -- -D warnings
 
 check-cargo-sort:
 	cargo sort -c -w

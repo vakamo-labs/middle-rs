@@ -27,6 +27,10 @@ pub enum Reply {
     },
     /// Read the request and never answer.
     Hang,
+    /// Send the status and the start of a JSON body, then close the connection before the body is complete.
+    CutOff { status: u16 },
+    /// A 200 without `content-length`, whose body ends when the connection closes.
+    UntilClose { body: String },
 }
 
 impl Reply {
@@ -187,6 +191,21 @@ async fn serve(mut socket: TcpStream, requests: Arc<Mutex<Vec<Request>>>, behavi
         };
         match behavior(number) {
             Reply::Hang => std::future::pending::<()>().await,
+            Reply::CutOff { status } => {
+                let response = format!(
+                    "HTTP/1.1 {status} {}\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{{\"error\"",
+                    reason(status)
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                return;
+            }
+            Reply::UntilClose { body } => {
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}"
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                return;
+            }
             Reply::Respond {
                 status,
                 headers,

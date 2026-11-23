@@ -4,7 +4,7 @@ mod response;
 
 use std::{fmt, time::Duration};
 
-use http::{HeaderMap, HeaderValue, header};
+use http::{HeaderMap, HeaderValue, StatusCode, header};
 pub(crate) use response::TokenResponse;
 use url::Url;
 
@@ -12,6 +12,9 @@ use crate::error::{ConfigError, Error, InvalidResponse, ResponseProblem, Transpo
 
 /// The largest answer middle reads from a token endpoint, in bytes.
 pub(crate) const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// The longest `Retry-After` middle reports, so that adding it to an instant cannot overflow.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Form parameters middle sets itself, so a caller cannot add them.
 const RESERVED_PARAMETERS: [&str; 7] = [
@@ -206,9 +209,12 @@ async fn exchange(
         }
         .into());
     }
-    let body = read_body(response)
-        .await
-        .map_err(|error| transport_error(error, &request.url))?;
+    let body = match read_body(response).await {
+        Ok(body) => body,
+        // The status of a rejection decides, also when its body breaks off.
+        Err(_) if meta.status != StatusCode::OK => return Err(meta.http_error()),
+        Err(error) => return Err(transport_error(error, &request.url)),
+    };
     response::parse(meta, body.as_deref())
 }
 
@@ -249,13 +255,14 @@ fn form_urlencode(text: &str) -> String {
     url::form_urlencoded::byte_serialize(text.as_bytes()).collect()
 }
 
-/// The `Retry-After` header in seconds. An HTTP date gives `None`.
+/// The `Retry-After` header in seconds, at most [`MAX_RETRY_AFTER`]. An HTTP date gives `None`.
 fn retry_after(headers: &HeaderMap) -> Option<Duration> {
     let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
     if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)))
+    let seconds = value.parse().unwrap_or(u64::MAX);
+    Some(Duration::from_secs(seconds).min(MAX_RETRY_AFTER))
 }
 
 #[cfg(test)]
@@ -343,5 +350,18 @@ mod tests {
         assert_eq!(retry_after(&headers), None);
         headers.insert(header::RETRY_AFTER, HeaderValue::from_static("-1"));
         assert_eq!(retry_after(&headers), None);
+    }
+
+    #[test]
+    fn test_retry_after_is_at_most_one_day() {
+        let mut headers = HeaderMap::new();
+        for value in ["86400", "86401", "99999999999999999999"] {
+            headers.insert(header::RETRY_AFTER, HeaderValue::from_static(value));
+            assert_eq!(
+                retry_after(&headers),
+                Some(Duration::from_secs(86400)),
+                "{value}"
+            );
+        }
     }
 }
