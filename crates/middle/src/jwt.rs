@@ -17,19 +17,35 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER as PROVIDER;
 #[cfg(all(feature = "rust-crypto", not(feature = "aws-lc-rs")))]
 use jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER as PROVIDER;
-use jsonwebtoken::{Algorithm, EncodingKey, jwk::ThumbprintHash};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, jwk::ThumbprintHash};
 use serde_json::{Map, Value};
+use simple_asn1::ASN1Block;
 
-use crate::error::{AssertionError, ConfigError, Error};
+use crate::error::{AssertionError, ConfigError, DisplayChain, Error};
 
 /// Registered claims middle sets itself (RFC 7519, section 4.1).
-const REGISTERED_CLAIMS: [&str; 7] = ["iss", "sub", "aud", "exp", "nbf", "iat", "jti"];
+const REGISTERED_CLAIMS: [&str; 6] = ["iss", "sub", "aud", "exp", "iat", "jti"];
 
 /// The lifetime of an assertion unless [`JwtAssertion::with_lifetime`] sets another.
 const DEFAULT_LIFETIME: Duration = Duration::from_secs(60);
 
+/// The shortest lifetime [`JwtAssertion::with_lifetime`] accepts.
+const MIN_LIFETIME: Duration = Duration::from_secs(1);
+
+/// The longest lifetime [`JwtAssertion::with_lifetime`] accepts. Servers such as Okta refuse client assertions that live longer, and an assertion can be replayed until it expires.
+const MAX_LIFETIME: Duration = Duration::from_secs(3600);
+
 /// RFC 7518, section 3.3: RSA keys have at least 2048 bits.
 const MIN_RSA_BITS: usize = 2048;
+
+/// The longest RSA key middle signs with, the limit of aws-lc-rs, so that both crypto backends accept the same keys.
+const MAX_RSA_BITS: usize = 8192;
+
+/// The tag of a SEQUENCE (X.690, section 8.9).
+const SEQUENCE: u8 = 0x30;
+
+/// The tag of `[0] EXPLICIT`, the version of an X.509 certificate (RFC 5280, section 4.1).
+const VERSION: u8 = 0xA0;
 
 /// A JWS algorithm (RFC 7518, section 3.1) that middle signs with.
 ///
@@ -80,6 +96,31 @@ enum Family {
     Hmac,
 }
 
+impl Family {
+    /// The family of a key algorithm, given as the arcs of its OID.
+    fn of_key_algorithm(arcs: &[u64]) -> Option<Self> {
+        match arcs {
+            // rsaEncryption (RFC 8017, appendix C)
+            [1, 2, 840, 113_549, 1, 1, 1] => Some(Self::Rsa),
+            // id-ecPublicKey (RFC 5480, section 2.1.1)
+            [1, 2, 840, 10_045, 2, 1] => Some(Self::Ec),
+            // id-Ed25519 (RFC 8410, section 3)
+            [1, 3, 101, 112] => Some(Self::Ed),
+            _ => None,
+        }
+    }
+
+    /// A key of the family, with its article.
+    fn key(self) -> &'static str {
+        match self {
+            Self::Rsa => "an RSA key",
+            Self::Ec => "an EC key",
+            Self::Ed => "an Ed25519 key",
+            Self::Hmac => "a shared secret",
+        }
+    }
+}
+
 impl SigningAlgorithm {
     /// The `alg` value (RFC 7518, section 3.1).
     #[must_use]
@@ -123,6 +164,15 @@ impl SigningAlgorithm {
             _ => 256,
         }
     }
+
+    /// The curve an `ES*` algorithm signs with (RFC 7518, section 3.4).
+    fn curve(self) -> Option<&'static str> {
+        match self {
+            Self::Es256 => Some("P-256"),
+            Self::Es384 => Some("P-384"),
+            _ => None,
+        }
+    }
 }
 
 fn unknown_algorithm(name: &str) -> ConfigError {
@@ -141,36 +191,30 @@ pub struct SigningKey {
 }
 
 impl SigningKey {
-    /// Loads a private key in PEM form: RSA in PKCS#1 or PKCS#8 for `RS*` and `PS*`, EC in PKCS#8 for `ES*`, Ed25519 in PKCS#8 for `EdDSA`.
+    /// Loads a private key in PEM form: RSA in PKCS#1 (`RSA PRIVATE KEY`) or PKCS#8 (`PRIVATE KEY`) for `RS*` and `PS*`, EC in PKCS#8 for `ES*`, Ed25519 in PKCS#8 for `EdDSA`.
     ///
     /// # Errors
     ///
-    /// [`ConfigError::InvalidSigningKey`] if the key does not fit the algorithm or cannot sign,
+    /// [`ConfigError::InvalidSigningKey`] if the PEM holds no private key, such as a public key or a certificate, if the key does not fit the algorithm or cannot sign, or for an RSA key longer than 8192 bits,
     /// [`ConfigError::WeakSigningKey`] for an RSA key shorter than 2048 bits (RFC 7518, section 3.3).
     pub fn from_pem(
         pem: impl AsRef<[u8]>,
         algorithm: SigningAlgorithm,
     ) -> Result<Self, ConfigError> {
-        let pem = pem.as_ref();
-        let key = match algorithm.family() {
-            Family::Rsa => EncodingKey::from_rsa_pem(pem).map_err(|_| {
-                invalid("the key is not an RSA private key in PEM form (PKCS#1 or PKCS#8)")
-            })?,
-            Family::Ec => EncodingKey::from_ec_pem(pem).map_err(|_| {
-                if contains(pem, b"EC PRIVATE KEY") {
-                    invalid("the EC key is in SEC1 form; convert it to PKCS#8 with `openssl pkcs8 -topk8 -nocrypt`")
-                } else {
-                    invalid("the key is not an EC private key in PKCS#8 PEM form; convert a SEC1 key with `openssl pkcs8 -topk8 -nocrypt`")
-                }
-            })?,
-            Family::Ed => EncodingKey::from_ed_pem(pem)
-                .map_err(|_| invalid("the key is not an Ed25519 private key in PKCS#8 PEM form"))?,
+        let load: fn(&[u8]) -> jsonwebtoken::errors::Result<EncodingKey> = match algorithm.family()
+        {
+            Family::Rsa => EncodingKey::from_rsa_pem,
+            Family::Ec => EncodingKey::from_ec_pem,
+            Family::Ed => EncodingKey::from_ed_pem,
             Family::Hmac => {
                 return Err(invalid(
                     "an HMAC algorithm signs with a shared secret: use `SigningKey::from_secret`",
                 ));
             }
         };
+        let pem = pem.as_ref();
+        check_private_key(pem, algorithm)?;
+        let key = load(pem).map_err(|error| invalid(format!("the key cannot be read: {error}")))?;
         if algorithm.family() == Family::Rsa {
             let bits = rsa_modulus_bits(key.as_bytes())
                 .ok_or_else(|| invalid("the RSA key cannot be read"))?;
@@ -180,6 +224,11 @@ impl SigningKey {
                     bits,
                     minimum: MIN_RSA_BITS,
                 });
+            }
+            if bits > MAX_RSA_BITS {
+                return Err(invalid(format!(
+                    "the RSA key has {bits} bits; middle signs with RSA keys of {MIN_RSA_BITS} to {MAX_RSA_BITS} bits"
+                )));
             }
         }
         Self::checked(algorithm, key)
@@ -210,8 +259,11 @@ impl SigningKey {
                 minimum,
             });
         }
-        let key = EncodingKey::from_secret(secret)
-            .map_err(|_| invalid("the shared secret cannot be used as an HMAC key"))?;
+        let key = EncodingKey::from_secret(secret).map_err(|error| {
+            invalid(format!(
+                "the shared secret cannot be used as an HMAC key: {error}"
+            ))
+        })?;
         Self::checked(algorithm, key)
     }
 
@@ -224,7 +276,7 @@ impl SigningKey {
             x5t_s256: None,
         };
         key.sign_bytes(b"middle checks the key")
-            .map_err(|_| invalid(&format!("the key cannot sign with {algorithm}")))?;
+            .map_err(|error| error.cannot_sign(algorithm))?;
         Ok(key)
     }
 
@@ -235,11 +287,14 @@ impl SigningKey {
         self
     }
 
-    /// Sets the `x5t#S256` header (RFC 7515, section 4.1.8) from the certificate of the key in PEM form, as servers that register certificates expect.
+    /// Sets the `x5t#S256` header (RFC 7515, section 4.1.8) from the X.509 certificate of the key in PEM form, as servers that register certificates expect.
+    ///
+    /// middle checks that the certificate holds the public key of this key.
     ///
     /// # Errors
     ///
-    /// [`ConfigError::InvalidCertificate`] if the text holds no PEM certificate.
+    /// [`ConfigError::InvalidCertificate`] if the text holds no PEM certificate (`CERTIFICATE`) or the certificate cannot be read,
+    /// [`ConfigError::CertificateKeyMismatch`] if the public key of the certificate does not belong to this key, which is always so for a shared secret.
     pub fn with_certificate_pem(self, certificate: impl AsRef<[u8]>) -> Result<Self, ConfigError> {
         let certificate = pem::parse(certificate).map_err(|_| ConfigError::InvalidCertificate)?;
         if certificate.tag() != "CERTIFICATE" {
@@ -248,20 +303,48 @@ impl SigningKey {
         self.with_certificate_der(certificate.contents())
     }
 
-    /// Sets the `x5t#S256` header (RFC 7515, section 4.1.8) from the certificate of the key in DER form.
+    /// Sets the `x5t#S256` header (RFC 7515, section 4.1.8) from the X.509 certificate of the key in DER form.
+    ///
+    /// middle checks that the certificate holds the public key of this key.
     ///
     /// # Errors
     ///
-    /// [`ConfigError::InvalidCertificate`] if the thumbprint cannot be computed.
+    /// [`ConfigError::InvalidCertificate`] if the certificate cannot be read,
+    /// [`ConfigError::CertificateKeyMismatch`] if the public key of the certificate does not belong to this key, which is always so for a shared secret.
     pub fn with_certificate_der(
         mut self,
         certificate: impl AsRef<[u8]>,
     ) -> Result<Self, ConfigError> {
-        let digest =
-            (PROVIDER.key_utils.compute_digest)(certificate.as_ref(), ThumbprintHash::SHA256)
-                .map_err(|_| ConfigError::InvalidCertificate)?;
+        let certificate = certificate.as_ref();
+        self.check_certificate(certificate)?;
+        let digest = (PROVIDER.key_utils.compute_digest)(certificate, ThumbprintHash::SHA256)
+            .map_err(|_| ConfigError::InvalidCertificate)?;
         self.x5t_s256 = Some(URL_SAFE_NO_PAD.encode(digest));
         Ok(self)
+    }
+
+    /// Checks that a signature of this key verifies with the public key of the certificate in DER form.
+    fn check_certificate(&self, certificate: &[u8]) -> Result<(), ConfigError> {
+        let (family, public_key) =
+            certificate_public_key(certificate).ok_or(ConfigError::InvalidCertificate)?;
+        let public_key = match (self.algorithm.family(), family) {
+            (Family::Rsa, Some(Family::Rsa)) => DecodingKey::from_rsa_der(&public_key),
+            (Family::Ec, Some(Family::Ec)) => DecodingKey::from_ec_der(&public_key),
+            // RFC 8410, section 4: an Ed25519 public key has 32 bytes. jsonwebtoken's RustCrypto verifier panics on a shorter one.
+            (Family::Ed, Some(Family::Ed)) if public_key.len() == 32 => {
+                DecodingKey::from_ed_der(&public_key)
+            }
+            _ => return Err(ConfigError::CertificateKeyMismatch),
+        };
+        let message = b"middle checks the certificate";
+        let signature = self
+            .sign_bytes(message)
+            .map_err(|error| error.cannot_sign(self.algorithm))?;
+        let verifier = (PROVIDER.verifier_factory)(&self.algorithm.jsonwebtoken(), &public_key)
+            .map_err(|_| ConfigError::CertificateKeyMismatch)?;
+        verifier
+            .verify(message, &signature)
+            .map_err(|_| ConfigError::CertificateKeyMismatch)
     }
 
     /// The algorithm the key signs with.
@@ -299,6 +382,16 @@ impl fmt::Debug for SigningKey {
 /// The cause of a failed signature.
 struct SignError(Arc<dyn std::error::Error + Send + Sync>);
 
+impl SignError {
+    /// The key cannot sign, with the cause: an error kind of jsonwebtoken or a reason of the crypto backend, which hold no key material.
+    fn cannot_sign(&self, algorithm: SigningAlgorithm) -> ConfigError {
+        invalid(format!(
+            "the key cannot sign with {algorithm}: {}",
+            DisplayChain(&*self.0)
+        ))
+    }
+}
+
 /// A JWT assertion (RFC 7523, section 3): signed with a new `jti`, `iat` and `exp` on every call of [`JwtAssertion::sign`].
 ///
 /// `Debug` shows the claims middle sets and the names of extra claims, never the key or their values.
@@ -307,16 +400,16 @@ pub struct JwtAssertion {
     key: SigningKey,
     issuer: String,
     subject: String,
-    audience: Vec<String>,
+    audience: String,
     lifetime: Duration,
     token_type: Option<String>,
     claims: Map<String, Value>,
 }
 
 impl JwtAssertion {
-    /// An assertion from `issuer` about `subject` for `audience`, valid for 60 seconds, with the header `typ: JWT`.
+    /// An assertion from `issuer` about `subject` for `audience`, valid for 60 seconds, with the header `typ: JWT`. `aud` is `audience` as a single string.
     ///
-    /// For JWT client authentication, `issuer` and `subject` are both the client id (RFC 7523, section 3).
+    /// For JWT client authentication, `issuer` and `subject` are both the client id (RFC 7523, section 3), and `audience` is the issuer identifier of the authorization server (RFC 10070). Some providers, such as Entra ID and Okta, document their token endpoint URL as the audience: pass what the provider expects.
     #[must_use]
     pub fn new(
         key: SigningKey,
@@ -328,45 +421,47 @@ impl JwtAssertion {
             key,
             issuer: issuer.into(),
             subject: subject.into(),
-            audience: vec![audience.into()],
+            audience: audience.into(),
             lifetime: DEFAULT_LIFETIME,
             token_type: Some("JWT".to_string()),
             claims: Map::new(),
         }
     }
 
-    /// Adds an audience. With more than one, `aud` is an array.
-    #[must_use]
-    pub fn with_audience(mut self, audience: impl Into<String>) -> Self {
-        self.audience.push(audience.into());
-        self
-    }
-
-    /// Sets how long an assertion is valid, in whole seconds.
+    /// Sets how long an assertion is valid, from one second to one hour. `exp` is `iat` plus the whole seconds of the lifetime, so a fraction of a second is cut off.
     ///
     /// # Errors
     ///
-    /// [`ConfigError::AssertionLifetime`] for a lifetime shorter than one second.
+    /// [`ConfigError::AssertionLifetime`] for a lifetime shorter than one second or longer than one hour. Servers such as Okta refuse client assertions that live longer, and an assertion can be replayed until it expires.
     pub fn with_lifetime(mut self, lifetime: Duration) -> Result<Self, ConfigError> {
-        if lifetime < Duration::from_secs(1) {
+        if !(MIN_LIFETIME..=MAX_LIFETIME).contains(&lifetime) {
             return Err(ConfigError::AssertionLifetime(lifetime));
         }
         self.lifetime = lifetime;
         Ok(self)
     }
 
-    /// Sets the `typ` header, for example `client-authentication+jwt` (RFC 10070), or leaves it out with `None`.
+    /// Sets the `typ` header, for example `client-authentication+jwt` (RFC 10070).
     #[must_use]
-    pub fn with_type(mut self, token_type: Option<impl Into<String>>) -> Self {
-        self.token_type = token_type.map(Into::into);
+    pub fn with_type(mut self, token_type: impl Into<String>) -> Self {
+        self.token_type = Some(token_type.into());
+        self
+    }
+
+    /// Leaves out the `typ` header.
+    #[must_use]
+    pub fn without_type(mut self) -> Self {
+        self.token_type = None;
         self
     }
 
     /// Adds a claim.
     ///
+    /// middle sets no `nbf`, because a server whose clock is slightly behind refuses an assertion whose `nbf` is its `iat`. Add `nbf` here if a server requires it.
+    ///
     /// # Errors
     ///
-    /// [`ConfigError::ReservedClaim`] for a claim middle sets itself: `iss`, `sub`, `aud`, `exp`, `nbf`, `iat`, `jti`.
+    /// [`ConfigError::ReservedClaim`] for a claim middle sets itself: `iss`, `sub`, `aud`, `exp`, `iat`, `jti`.
     pub fn with_claim(
         mut self,
         name: impl Into<String>,
@@ -412,11 +507,7 @@ impl JwtAssertion {
         let mut claims = self.claims.clone();
         claims.insert("iss".to_string(), self.issuer.as_str().into());
         claims.insert("sub".to_string(), self.subject.as_str().into());
-        let audience = match self.audience.as_slice() {
-            [audience] => Value::from(audience.as_str()),
-            audiences => Value::from(audiences.to_vec()),
-        };
-        claims.insert("aud".to_string(), audience);
+        claims.insert("aud".to_string(), self.audience.as_str().into());
         claims.insert("iat".to_string(), now.into());
         claims.insert(
             "exp".to_string(),
@@ -481,14 +572,183 @@ impl fmt::Debug for SignedJwt {
     }
 }
 
-fn invalid(reason: &str) -> ConfigError {
-    ConfigError::InvalidSigningKey(reason.to_string())
+fn invalid(reason: impl Into<String>) -> ConfigError {
+    ConfigError::InvalidSigningKey(reason.into())
 }
 
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
+/// Checks that the first PEM block holds a private key that fits the algorithm, before jsonwebtoken loads it.
+///
+/// jsonwebtoken's `EncodingKey::from_rsa_pem` also loads an RSA public key or certificate, so middle reads the label and the key algorithm itself. The messages name labels, algorithms and curves, never key material.
+fn check_private_key(pem: &[u8], algorithm: SigningAlgorithm) -> Result<(), ConfigError> {
+    let block = pem::parse(pem).map_err(|_| invalid("the key is not in PEM form"))?;
+    let (family, curve) = match block.tag() {
+        "PRIVATE KEY" => pkcs8_key_algorithm(block.contents())?,
+        "RSA PRIVATE KEY" => (Family::Rsa, None),
+        "EC PRIVATE KEY" if algorithm.family() == Family::Ec => {
+            return Err(invalid(
+                "the EC key is in SEC1 form; convert it to PKCS#8 with `openssl pkcs8 -topk8 -nocrypt`",
+            ));
+        }
+        "EC PRIVATE KEY" => (Family::Ec, None),
+        "PUBLIC KEY" | "RSA PUBLIC KEY" => {
+            return Err(invalid("the PEM holds a public key, not a private key"));
+        }
+        "CERTIFICATE" => return Err(invalid("the PEM holds a certificate, not a private key")),
+        label => {
+            return Err(invalid(format!(
+                "the PEM holds `{label}`, not `PRIVATE KEY` or `RSA PRIVATE KEY`"
+            )));
+        }
+    };
+    if family != algorithm.family() {
+        return Err(invalid(format!(
+            "the key is {}, but {algorithm} needs {}",
+            family.key(),
+            algorithm.family().key()
+        )));
+    }
+    match (algorithm.curve(), curve) {
+        (Some(needed), Some(curve)) if curve != needed => Err(invalid(format!(
+            "the EC key is on the curve {curve}, but {algorithm} needs {needed}"
+        ))),
+        // RFC 5480, section 2.1.1: an EC key names its curve.
+        (Some(_), None) => Err(invalid(
+            "the EC key does not name its curve; convert it to a named curve with `openssl pkey -in key.pem -ec_param_enc named_curve -out key-named.pem`",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The family and, for an EC key, the curve of a private key in PKCS#8 form (RFC 5958, section 2).
+fn pkcs8_key_algorithm(der: &[u8]) -> Result<(Family, Option<String>), ConfigError> {
+    let not_pkcs8 = || invalid("the key is not in PKCS#8 form");
+    let blocks = simple_asn1::from_der(der).map_err(|_| not_pkcs8())?;
+    let [ASN1Block::Sequence(_, fields)] = blocks.as_slice() else {
+        return Err(not_pkcs8());
+    };
+    let (key_algorithm, parameter) = fields
+        .get(1)
+        .and_then(algorithm_identifier)
+        .ok_or_else(not_pkcs8)?;
+    let family = Family::of_key_algorithm(&key_algorithm).ok_or_else(|| {
+        invalid(format!(
+            "the key has the algorithm {}, which middle does not sign with",
+            dotted(&key_algorithm)
+        ))
+    })?;
+    let curve = parameter
+        .filter(|_| family == Family::Ec)
+        .map(|curve| match curve.as_slice() {
+            // Named curves (RFC 5480, section 2.1.1.1).
+            [1, 2, 840, 10_045, 3, 1, 7] => "P-256".to_string(),
+            [1, 3, 132, 0, 34] => "P-384".to_string(),
+            [1, 3, 132, 0, 35] => "P-521".to_string(),
+            _ => dotted(&curve),
+        });
+    Ok((family, curve))
+}
+
+/// The algorithm and, if it is an OID, the parameter of an `AlgorithmIdentifier` (RFC 5280, section 4.1.1.2), as the arcs of their OIDs. For an EC key, the parameter is its named curve.
+fn algorithm_identifier(identifier: &ASN1Block) -> Option<(Vec<u64>, Option<Vec<u64>>)> {
+    let ASN1Block::Sequence(_, fields) = identifier else {
+        return None;
+    };
+    let Some(ASN1Block::ObjectIdentifier(_, algorithm)) = fields.first() else {
+        return None;
+    };
+    let parameter = match fields.get(1) {
+        Some(ASN1Block::ObjectIdentifier(_, parameter)) => Some(parameter.as_vec().ok()?),
+        _ => None,
+    };
+    Some((algorithm.as_vec().ok()?, parameter))
+}
+
+/// The family and the `subjectPublicKey` of an X.509 certificate in DER form (RFC 5280, section 4.1).
+///
+/// The `subjectPublicKey` is in the form jsonwebtoken's `DecodingKey::from_rsa_der`, `from_ec_der` and `from_ed_der` read. middle reads the certificate itself: jsonwebtoken takes the first key algorithm OID anywhere in the certificate, and when the issuer signs with Ed25519, that is the OID of the signature algorithm.
+///
+/// middle walks the DER headers to the `subjectPublicKeyInfo` and decodes only that element. It skips the names unread: a CA may write them as a `BMPString` or as a `PrintableString` with characters such as `*`, which `simple_asn1` refuses.
+fn certificate_public_key(der: &[u8]) -> Option<(Option<Family>, Vec<u8>)> {
+    let (certificate, rest) = split_element(der)?;
+    if certificate.tag != SEQUENCE || !rest.is_empty() {
+        return None;
+    }
+    let (to_be_signed, _) = split_element(certificate.content)?;
+    if to_be_signed.tag != SEQUENCE {
+        return None;
+    }
+    let mut fields = to_be_signed.content;
+    // The version is `[0] EXPLICIT`, which an X.509 v1 certificate leaves out.
+    if fields.first() == Some(&VERSION) {
+        fields = split_element(fields)?.1;
+    }
+    // serialNumber, signature, issuer, validity and subject.
+    for _ in 0..5 {
+        fields = split_element(fields)?.1;
+    }
+    let (subject_public_key_info, _) = split_element(fields)?;
+    let blocks = simple_asn1::from_der(subject_public_key_info.encoded).ok()?;
+    let [ASN1Block::Sequence(_, subject_public_key_info)] = blocks.as_slice() else {
+        return None;
+    };
+    let [identifier, ASN1Block::BitString(_, _, public_key)] = subject_public_key_info.as_slice()
+    else {
+        return None;
+    };
+    let (key_algorithm, _) = algorithm_identifier(identifier)?;
+    Some((Family::of_key_algorithm(&key_algorithm), public_key.clone()))
+}
+
+/// A DER element (X.690, section 8.1).
+struct Element<'a> {
+    tag: u8,
+    /// The whole element: tag, length and content.
+    encoded: &'a [u8],
+    content: &'a [u8],
+}
+
+/// Splits the first DER element off `der` and returns it with the bytes after it.
+///
+/// It reads a tag of one byte and a definite length in short or long form, and refuses an indefinite length or a length past the end. It reads no further than the element's header, so a deep nesting costs nothing.
+fn split_element(der: &[u8]) -> Option<(Element<'_>, &[u8])> {
+    let (&tag, after_tag) = der.split_first()?;
+    // A tag number above 30 takes more bytes (X.690, section 8.1.2.4); no element before the key of a certificate has one.
+    if (tag & 0x1f) == 0x1f {
+        return None;
+    }
+    let (&first, after_first) = after_tag.split_first()?;
+    let (length, after_length) = if first < 0x80 {
+        (usize::from(first), after_first)
+    } else {
+        // The low bits count the length bytes. 0x80 alone is the indefinite length, which DER does not allow.
+        let count = usize::from(first & 0x7f);
+        if count == 0 || count > size_of::<usize>() {
+            return None;
+        }
+        let (bytes, after_length) = after_first.split_at_checked(count)?;
+        let length = bytes
+            .iter()
+            .fold(0, |length, &byte| (length << 8) | usize::from(byte));
+        (length, after_length)
+    };
+    let (content, rest) = after_length.split_at_checked(length)?;
+    let encoded = &der[..der.len() - rest.len()];
+    Some((
+        Element {
+            tag,
+            encoded,
+            content,
+        },
+        rest,
+    ))
+}
+
+/// An OID in dotted form, such as `1.3.101.112`.
+fn dotted(arcs: &[u64]) -> String {
+    arcs.iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// The modulus length of an RSA private key in PKCS#1 form (RFC 8017, appendix A.1.2), the form jsonwebtoken keeps for PKCS#1 and PKCS#8 PEM alike.

@@ -493,12 +493,15 @@ pub enum ConfigError {
     /// middle sets this claim itself.
     #[cfg(feature = "jwt")]
     ReservedClaim(String),
-    /// An assertion lifetime shorter than one second.
+    /// An assertion lifetime shorter than one second or longer than one hour.
     #[cfg(feature = "jwt")]
     AssertionLifetime(std::time::Duration),
-    /// The certificate is not a PEM certificate.
+    /// The certificate is not an X.509 certificate in the form given: PEM with the label `CERTIFICATE`, or DER.
     #[cfg(feature = "jwt")]
     InvalidCertificate,
+    /// The public key of the certificate does not belong to the signing key. A shared secret for `HS*` has no certificate.
+    #[cfg(feature = "jwt")]
+    CertificateKeyMismatch,
 }
 
 impl fmt::Display for ConfigError {
@@ -545,10 +548,16 @@ impl fmt::Display for ConfigError {
             #[cfg(feature = "jwt")]
             Self::AssertionLifetime(lifetime) => write!(
                 f,
-                "an assertion lifetime must be at least one second, not {lifetime:?}"
+                "an assertion lifetime must be from one second to one hour, not {lifetime:?}"
             ),
             #[cfg(feature = "jwt")]
-            Self::InvalidCertificate => f.write_str("the certificate is not a PEM certificate"),
+            Self::InvalidCertificate => {
+                f.write_str("the certificate cannot be read as an X.509 certificate")
+            }
+            #[cfg(feature = "jwt")]
+            Self::CertificateKeyMismatch => {
+                f.write_str("the public key of the certificate does not belong to the signing key")
+            }
         }
     }
 }
@@ -563,10 +572,10 @@ impl std::error::Error for ConfigError {
 }
 
 /// Displays an error with all its causes, separated by `: `.
-#[cfg(feature = "client-credentials")]
+#[cfg(any(feature = "client-credentials", feature = "jwt"))]
 pub(crate) struct DisplayChain<'a>(pub(crate) &'a (dyn std::error::Error + 'static));
 
-#[cfg(feature = "client-credentials")]
+#[cfg(any(feature = "client-credentials", feature = "jwt"))]
 impl fmt::Display for DisplayChain<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)?;

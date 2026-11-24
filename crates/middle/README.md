@@ -94,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 # Feature Flags
 
-- **all**: Includes `rustls-tls`, `tonic`, `client-credentials`, `runtime-tokio`, and `jwt`.
+- **all**: Includes `rustls-tls`, `tonic`, `client-credentials`, `runtime-tokio`, `jwt`, and `aws-lc-rs`.
 - **default**: Includes `rustls-tls`, `client-credentials`, `runtime-tokio`, and `aws-lc-rs`.
 - **rustls-tls**: Enables reqwest's `rustls` feature: TLS with rustls and aws-lc-rs, checking certificates against the root certificates of the operating system. A container image needs them installed, for example with the `ca-certificates` package.
 - **tonic**: Implement `tonic::service::Interceptor` for all Authorizers
@@ -105,3 +105,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     - **rust-crypto**: the RustCrypto crates.
 
     With both enabled, middle signs with aws-lc-rs. middle passes its backend to every jsonwebtoken call, so it works whatever process-wide default jsonwebtoken has.
+
+    If your application also uses jsonwebtoken 12, enable the same backend in middle as in jsonwebtoken. With both backends in one build, jsonwebtoken has no default backend, and your own `jsonwebtoken::encode` and `jsonwebtoken::decode` calls panic unless your application calls `jsonwebtoken::crypto::CryptoProvider::install_default` at startup. middle is not affected.

@@ -17,5 +17,6 @@ license = "Apache-2.0"
 tokio = { version = "1.48" }
 url = { version = "2.5" }
 tonic = { version = "0.14" }
+protoc-bin-vendored = { version = "3" }
 tonic-prost-build = { version = "0.14" }
 tonic-prost = { version = "0.14" }
