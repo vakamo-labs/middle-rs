@@ -41,6 +41,12 @@ const MIN_RSA_BITS: usize = 2048;
 /// The longest RSA key middle signs with, the limit of aws-lc-rs, so that both crypto backends accept the same keys.
 const MAX_RSA_BITS: usize = 8192;
 
+/// The tag of an INTEGER (X.690, section 8.3).
+const INTEGER: u8 = 0x02;
+
+/// The tag of a BIT STRING (X.690, section 8.6).
+const BIT_STRING: u8 = 0x03;
+
 /// The tag of a SEQUENCE (X.690, section 8.9).
 const SEQUENCE: u8 = 0x30;
 
@@ -703,14 +709,21 @@ fn algorithm_identifier(identifier: &ASN1Block) -> Option<(Vec<u64>, Option<Vec<
 ///
 /// The `subjectPublicKey` is in the form jsonwebtoken's `DecodingKey::from_rsa_der`, `from_ec_der` and `from_ed_der` read. middle reads the certificate itself: jsonwebtoken takes the first key algorithm OID anywhere in the certificate, and when the issuer signs with Ed25519, that is the OID of the signature algorithm.
 ///
-/// middle walks the DER headers to the `subjectPublicKeyInfo` and decodes only that element, with [`decode_der`]. It skips the names unread: a CA may write them as a `BMPString` or as a `PrintableString` with characters such as `*`, which `simple_asn1` refuses.
+/// middle walks the DER headers to the `subjectPublicKeyInfo` and decodes only that element, with [`decode_der`]. It checks that the certificate has its three parts and that the fields before the key have their types, and skips the names unread: a CA may write them as a `BMPString` or as a `PrintableString` with characters such as `*`, which `simple_asn1` refuses.
 fn certificate_public_key(der: &[u8]) -> Option<(Option<Family>, Vec<u8>)> {
     let (certificate, rest) = split_element(der)?;
     if certificate.tag != SEQUENCE || !rest.is_empty() {
         return None;
     }
-    let (to_be_signed, _) = split_element(certificate.content)?;
-    if to_be_signed.tag != SEQUENCE {
+    // tbsCertificate, signatureAlgorithm and signatureValue (RFC 5280, section 4.1).
+    let (to_be_signed, rest) = split_element(certificate.content)?;
+    let (signature_algorithm, rest) = split_element(rest)?;
+    let (signature_value, rest) = split_element(rest)?;
+    if to_be_signed.tag != SEQUENCE
+        || signature_algorithm.tag != SEQUENCE
+        || signature_value.tag != BIT_STRING
+        || !rest.is_empty()
+    {
         return None;
     }
     let mut fields = to_be_signed.content;
@@ -718,9 +731,13 @@ fn certificate_public_key(der: &[u8]) -> Option<(Option<Family>, Vec<u8>)> {
     if fields.first() == Some(&VERSION) {
         fields = split_element(fields)?.1;
     }
-    // serialNumber, signature, issuer, validity and subject.
-    for _ in 0..5 {
-        fields = split_element(fields)?.1;
+    // serialNumber, then signature, issuer, validity and subject.
+    for tag in [INTEGER, SEQUENCE, SEQUENCE, SEQUENCE, SEQUENCE] {
+        let (field, rest) = split_element(fields)?;
+        if field.tag != tag {
+            return None;
+        }
+        fields = rest;
     }
     let (subject_public_key_info, _) = split_element(fields)?;
     let blocks = decode_der(subject_public_key_info.encoded)?;
@@ -872,6 +889,90 @@ mod tests {
         ] {
             assert!(!nests_at_most(der, MAX_NESTING), "{der:02x?}");
         }
+    }
+
+    /// A DER element with the tag and content, its length in short or long form.
+    fn element(tag: u8, content: &[u8]) -> Vec<u8> {
+        let length = content.len();
+        let header = if length < 0x80 {
+            vec![tag, u8::try_from(length).unwrap()]
+        } else {
+            let bytes: Vec<u8> = length
+                .to_be_bytes()
+                .into_iter()
+                .skip_while(|&byte| byte == 0)
+                .collect();
+            [
+                &[tag, 0x80 | u8::try_from(bytes.len()).unwrap()][..],
+                &bytes,
+            ]
+            .concat()
+        };
+        [header.as_slice(), content].concat()
+    }
+
+    /// The P-256 test certificate in parts: the encoded fields of its tbsCertificate, and its encoded signatureAlgorithm and signatureValue.
+    fn certificate_parts() -> (Vec<Vec<u8>>, Vec<u8>) {
+        let pem = pem::parse(include_str!(
+            "../tests/fixtures/jwt/certificate-ec-p256.pem"
+        ))
+        .unwrap();
+        let (certificate, _) = split_element(pem.contents()).unwrap();
+        let (to_be_signed, signature) = split_element(certificate.content).unwrap();
+        let mut fields = Vec::new();
+        let mut rest = to_be_signed.content;
+        while !rest.is_empty() {
+            let (field, after) = split_element(rest).unwrap();
+            fields.push(field.encoded.to_vec());
+            rest = after;
+        }
+        (fields, signature.to_vec())
+    }
+
+    fn certificate(fields: &[Vec<u8>], signature: &[u8]) -> Vec<u8> {
+        element(
+            SEQUENCE,
+            &[element(SEQUENCE, &fields.concat()), signature.to_vec()].concat(),
+        )
+    }
+
+    #[test]
+    fn test_a_certificate_rebuilt_from_its_parts_is_read() {
+        let (fields, signature) = certificate_parts();
+        assert!(certificate_public_key(&certificate(&fields, &signature)).is_some());
+    }
+
+    #[test]
+    fn test_a_certificate_missing_or_adding_a_part_is_refused() {
+        let (fields, signature) = certificate_parts();
+        let (signature_algorithm, _) = split_element(&signature).unwrap();
+        // Only the tbsCertificate, no signatureValue, and an element after the signatureValue.
+        for signature in [
+            Vec::new(),
+            signature_algorithm.encoded.to_vec(),
+            [signature.clone(), element(0x05, &[])].concat(),
+        ] {
+            assert!(certificate_public_key(&certificate(&fields, &signature)).is_none());
+        }
+    }
+
+    #[test]
+    fn test_a_certificate_with_a_field_of_the_wrong_type_is_refused() {
+        let (fields, signature) = certificate_parts();
+        let null = element(0x05, &[]);
+        let first = usize::from(fields[0][0] == VERSION);
+        // serialNumber, signature, issuer, validity and subject, one at a time.
+        for position in first..first + 5 {
+            let mut fields = fields.clone();
+            fields[position] = null.clone();
+            assert!(
+                certificate_public_key(&certificate(&fields, &signature)).is_none(),
+                "field {position}"
+            );
+        }
+        // Five NULLs before the subjectPublicKeyInfo of the certificate.
+        let fields = [vec![null; 5], vec![fields[first + 5].clone()]].concat();
+        assert!(certificate_public_key(&certificate(&fields, &signature)).is_none());
     }
 
     #[test]
