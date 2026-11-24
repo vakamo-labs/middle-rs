@@ -1,7 +1,7 @@
 //! Signing JWT assertions (RFC 7523, section 3) for the JWT bearer grant and for JWT client authentication.
 //!
-//! middle signs with jsonwebtoken and the crypto backend that the feature `aws-lc-rs` or `rust-crypto` selects.
-//! It passes that backend to every call, so signing works whatever process-wide default jsonwebtoken has.
+//! middle signs with jsonwebtoken and the crypto backend that the feature `aws-lc-rs` or `rust-crypto` selects. Enable exactly one of them with `jwt`; if the application uses jsonwebtoken 12, enable the backend it uses.
+//! middle passes that backend to every call, so signing works whatever process-wide default jsonwebtoken has.
 
 #[cfg(not(any(feature = "aws-lc-rs", feature = "rust-crypto")))]
 compile_error!("The feature `jwt` needs a crypto backend: enable `aws-lc-rs` or `rust-crypto`.");
@@ -46,6 +46,15 @@ const SEQUENCE: u8 = 0x30;
 
 /// The tag of `[0] EXPLICIT`, the version of an X.509 certificate (RFC 5280, section 4.1).
 const VERSION: u8 = 0xA0;
+
+/// The bit of a tag that marks a constructed element, whose content is more elements (X.690, section 8.1.2.5).
+const CONSTRUCTED: u8 = 0x20;
+
+/// The deepest nesting of DER elements middle decodes. Keys and certificates nest a few levels deep. `simple_asn1`, which decodes them for middle and jsonwebtoken, recurses once per level without a limit, and a few thousand levels overflow a stack of 2 MiB.
+const MAX_NESTING: usize = 16;
+
+/// The PEM labels of the private keys [`check_private_key`] reads.
+const PRIVATE_KEY_LABELS: [&str; 3] = ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY"];
 
 /// A JWS algorithm (RFC 7518, section 3.1) that middle signs with.
 ///
@@ -193,9 +202,11 @@ pub struct SigningKey {
 impl SigningKey {
     /// Loads a private key in PEM form: RSA in PKCS#1 (`RSA PRIVATE KEY`) or PKCS#8 (`PRIVATE KEY`) for `RS*` and `PS*`, EC in PKCS#8 for `ES*`, Ed25519 in PKCS#8 for `EdDSA`.
     ///
+    /// The text may hold other PEM blocks before or after the key, such as its certificate: middle reads the first private key and ignores the other blocks.
+    ///
     /// # Errors
     ///
-    /// [`ConfigError::InvalidSigningKey`] if the PEM holds no private key, such as a public key or a certificate, if the key does not fit the algorithm or cannot sign, or for an RSA key longer than 8192 bits,
+    /// [`ConfigError::InvalidSigningKey`] if the PEM holds no private key, such as only a public key or a certificate, if the key does not fit the algorithm or cannot sign, or for an RSA key longer than 8192 bits,
     /// [`ConfigError::WeakSigningKey`] for an RSA key shorter than 2048 bits (RFC 7518, section 3.3).
     pub fn from_pem(
         pem: impl AsRef<[u8]>,
@@ -212,9 +223,10 @@ impl SigningKey {
                 ));
             }
         };
-        let pem = pem.as_ref();
-        check_private_key(pem, algorithm)?;
-        let key = load(pem).map_err(|error| invalid(format!("the key cannot be read: {error}")))?;
+        let block = private_key_block(pem.as_ref())?;
+        check_private_key(&block, algorithm)?;
+        let key = load_private_key(load, &block)
+            .map_err(|error| invalid(format!("the key cannot be read: {error}")))?;
         if algorithm.family() == Family::Rsa {
             let bits = rsa_modulus_bits(key.as_bytes())
                 .ok_or_else(|| invalid("the RSA key cannot be read"))?;
@@ -289,17 +301,18 @@ impl SigningKey {
 
     /// Sets the `x5t#S256` header (RFC 7515, section 4.1.8) from the X.509 certificate of the key in PEM form, as servers that register certificates expect.
     ///
-    /// middle checks that the certificate holds the public key of this key.
+    /// The text may hold other PEM blocks before or after the certificate, such as the private key or the certificates of the issuers: middle reads the first certificate and ignores the other blocks. middle checks that the certificate holds the public key of this key.
     ///
     /// # Errors
     ///
-    /// [`ConfigError::InvalidCertificate`] if the text holds no PEM certificate (`CERTIFICATE`) or the certificate cannot be read,
+    /// [`ConfigError::InvalidCertificate`] if the text is not in PEM form, holds no PEM certificate (`CERTIFICATE`), or the certificate cannot be read,
     /// [`ConfigError::CertificateKeyMismatch`] if the public key of the certificate does not belong to this key, which is always so for a shared secret.
     pub fn with_certificate_pem(self, certificate: impl AsRef<[u8]>) -> Result<Self, ConfigError> {
-        let certificate = pem::parse(certificate).map_err(|_| ConfigError::InvalidCertificate)?;
-        if certificate.tag() != "CERTIFICATE" {
-            return Err(ConfigError::InvalidCertificate);
-        }
+        let blocks = pem::parse_many(certificate).map_err(|_| ConfigError::InvalidCertificate)?;
+        let certificate = blocks
+            .iter()
+            .find(|block| block.tag() == "CERTIFICATE")
+            .ok_or(ConfigError::InvalidCertificate)?;
         self.with_certificate_der(certificate.contents())
     }
 
@@ -576,11 +589,34 @@ fn invalid(reason: impl Into<String>) -> ConfigError {
     ConfigError::InvalidSigningKey(reason.into())
 }
 
-/// Checks that the first PEM block holds a private key that fits the algorithm, before jsonwebtoken loads it.
+/// The first PEM block of the text that holds a private key. If no block does, the first block, so that [`check_private_key`] names what the text holds.
+fn private_key_block(pem: &[u8]) -> Result<pem::Pem, ConfigError> {
+    let not_pem = || invalid("the key is not in PEM form");
+    let blocks = pem::parse_many(pem).map_err(|_| not_pem())?;
+    let index = blocks
+        .iter()
+        .position(|block| PRIVATE_KEY_LABELS.contains(&block.tag()))
+        .unwrap_or(0);
+    blocks.into_iter().nth(index).ok_or_else(not_pem)
+}
+
+/// Loads a private key block with jsonwebtoken.
+///
+/// jsonwebtoken reads the first block of a PEM text, so middle hands it the block alone. jsonwebtoken decodes the DER of the block with `simple_asn1`, so middle refuses a nesting deeper than [`MAX_NESTING`] first, with the error jsonwebtoken gives for DER it cannot decode.
+fn load_private_key(
+    load: fn(&[u8]) -> jsonwebtoken::errors::Result<EncodingKey>,
+    block: &pem::Pem,
+) -> jsonwebtoken::errors::Result<EncodingKey> {
+    if !nests_at_most(block.contents(), MAX_NESTING) {
+        return Err(jsonwebtoken::errors::ErrorKind::InvalidKeyFormat.into());
+    }
+    load(pem::encode(block).as_bytes())
+}
+
+/// Checks that a PEM block holds a private key that fits the algorithm, before jsonwebtoken loads it.
 ///
 /// jsonwebtoken's `EncodingKey::from_rsa_pem` also loads an RSA public key or certificate, so middle reads the label and the key algorithm itself. The messages name labels, algorithms and curves, never key material.
-fn check_private_key(pem: &[u8], algorithm: SigningAlgorithm) -> Result<(), ConfigError> {
-    let block = pem::parse(pem).map_err(|_| invalid("the key is not in PEM form"))?;
+fn check_private_key(block: &pem::Pem, algorithm: SigningAlgorithm) -> Result<(), ConfigError> {
     let (family, curve) = match block.tag() {
         "PRIVATE KEY" => pkcs8_key_algorithm(block.contents())?,
         "RSA PRIVATE KEY" => (Family::Rsa, None),
@@ -622,7 +658,7 @@ fn check_private_key(pem: &[u8], algorithm: SigningAlgorithm) -> Result<(), Conf
 /// The family and, for an EC key, the curve of a private key in PKCS#8 form (RFC 5958, section 2).
 fn pkcs8_key_algorithm(der: &[u8]) -> Result<(Family, Option<String>), ConfigError> {
     let not_pkcs8 = || invalid("the key is not in PKCS#8 form");
-    let blocks = simple_asn1::from_der(der).map_err(|_| not_pkcs8())?;
+    let blocks = decode_der(der).ok_or_else(not_pkcs8)?;
     let [ASN1Block::Sequence(_, fields)] = blocks.as_slice() else {
         return Err(not_pkcs8());
     };
@@ -667,7 +703,7 @@ fn algorithm_identifier(identifier: &ASN1Block) -> Option<(Vec<u64>, Option<Vec<
 ///
 /// The `subjectPublicKey` is in the form jsonwebtoken's `DecodingKey::from_rsa_der`, `from_ec_der` and `from_ed_der` read. middle reads the certificate itself: jsonwebtoken takes the first key algorithm OID anywhere in the certificate, and when the issuer signs with Ed25519, that is the OID of the signature algorithm.
 ///
-/// middle walks the DER headers to the `subjectPublicKeyInfo` and decodes only that element. It skips the names unread: a CA may write them as a `BMPString` or as a `PrintableString` with characters such as `*`, which `simple_asn1` refuses.
+/// middle walks the DER headers to the `subjectPublicKeyInfo` and decodes only that element, with [`decode_der`]. It skips the names unread: a CA may write them as a `BMPString` or as a `PrintableString` with characters such as `*`, which `simple_asn1` refuses.
 fn certificate_public_key(der: &[u8]) -> Option<(Option<Family>, Vec<u8>)> {
     let (certificate, rest) = split_element(der)?;
     if certificate.tag != SEQUENCE || !rest.is_empty() {
@@ -687,7 +723,7 @@ fn certificate_public_key(der: &[u8]) -> Option<(Option<Family>, Vec<u8>)> {
         fields = split_element(fields)?.1;
     }
     let (subject_public_key_info, _) = split_element(fields)?;
-    let blocks = simple_asn1::from_der(subject_public_key_info.encoded).ok()?;
+    let blocks = decode_der(subject_public_key_info.encoded)?;
     let [ASN1Block::Sequence(_, subject_public_key_info)] = blocks.as_slice() else {
         return None;
     };
@@ -709,10 +745,10 @@ struct Element<'a> {
 
 /// Splits the first DER element off `der` and returns it with the bytes after it.
 ///
-/// It reads a tag of one byte and a definite length in short or long form, and refuses an indefinite length or a length past the end. It reads no further than the element's header, so a deep nesting costs nothing.
+/// It reads a tag of one byte and a definite length in short or long form, and refuses an indefinite length or a length past the end. It reads only the header of the element and does not descend into its content.
 fn split_element(der: &[u8]) -> Option<(Element<'_>, &[u8])> {
     let (&tag, after_tag) = der.split_first()?;
-    // A tag number above 30 takes more bytes (X.690, section 8.1.2.4); no element before the key of a certificate has one.
+    // A tag number above 30 takes more bytes (X.690, section 8.1.2.4); no element of the keys and certificates middle reads has one.
     if (tag & 0x1f) == 0x1f {
         return None;
     }
@@ -743,6 +779,31 @@ fn split_element(der: &[u8]) -> Option<(Element<'_>, &[u8])> {
     ))
 }
 
+/// Whether the DER elements in `der` nest at most `levels` deep.
+///
+/// It descends into the elements whose content `simple_asn1` decodes: constructed elements, and a SEQUENCE or SET without the constructed bit. It refuses what [`split_element`] refuses, and recurses at most `levels` deep.
+fn nests_at_most(mut der: &[u8], levels: usize) -> bool {
+    while !der.is_empty() {
+        let Some((element, rest)) = split_element(der) else {
+            return false;
+        };
+        let nests = element.tag & CONSTRUCTED != 0 || matches!(element.tag, 0x10 | 0x11);
+        if nests && (levels == 0 || !nests_at_most(element.content, levels - 1)) {
+            return false;
+        }
+        der = rest;
+    }
+    true
+}
+
+/// Decodes DER with `simple_asn1`, if its elements nest at most [`MAX_NESTING`] levels deep.
+fn decode_der(der: &[u8]) -> Option<Vec<ASN1Block>> {
+    if !nests_at_most(der, MAX_NESTING) {
+        return None;
+    }
+    simple_asn1::from_der(der).ok()
+}
+
 /// An OID in dotted form, such as `1.3.101.112`.
 fn dotted(arcs: &[u64]) -> String {
     arcs.iter()
@@ -753,7 +814,7 @@ fn dotted(arcs: &[u64]) -> String {
 
 /// The modulus length of an RSA private key in PKCS#1 form (RFC 8017, appendix A.1.2), the form jsonwebtoken keeps for PKCS#1 and PKCS#8 PEM alike.
 fn rsa_modulus_bits(pkcs1: &[u8]) -> Option<usize> {
-    let blocks = simple_asn1::from_der(pkcs1).ok()?;
+    let blocks = decode_der(pkcs1)?;
     let [simple_asn1::ASN1Block::Sequence(_, fields)] = blocks.as_slice() else {
         return None;
     };
@@ -770,6 +831,48 @@ mod tests {
     use strum::VariantArray as _;
 
     use super::*;
+
+    /// `depth` elements with the tag, each in the one before, the innermost one empty.
+    fn nested(tag: u8, depth: usize) -> Vec<u8> {
+        (0..depth).fold(Vec::new(), |inner, _| {
+            [&[tag, u8::try_from(inner.len()).unwrap()], inner.as_slice()].concat()
+        })
+    }
+
+    #[test]
+    fn test_der_may_nest_up_to_the_limit() {
+        assert!(nests_at_most(&nested(SEQUENCE, MAX_NESTING), MAX_NESTING));
+        let siblings = [nested(SEQUENCE, MAX_NESTING), nested(SEQUENCE, MAX_NESTING)].concat();
+        assert!(nests_at_most(&siblings, MAX_NESTING));
+        // `simple_asn1` does not decode the content of an OCTET STRING.
+        let in_octet_string = [&[0x04, 34], nested(SEQUENCE, MAX_NESTING + 1).as_slice()].concat();
+        assert!(nests_at_most(&in_octet_string, MAX_NESTING));
+    }
+
+    #[test]
+    fn test_der_nested_deeper_than_the_limit_is_refused() {
+        // A SEQUENCE, a SET, a SEQUENCE and a SET without the constructed bit, which `simple_asn1` decodes alike, and `[0] EXPLICIT`.
+        for tag in [SEQUENCE, 0x31, 0x10, 0x11, VERSION] {
+            assert!(
+                !nests_at_most(&nested(tag, MAX_NESTING + 1), MAX_NESTING),
+                "{tag:#x}"
+            );
+        }
+        let deep_second = [nested(SEQUENCE, 1), nested(SEQUENCE, MAX_NESTING + 1)].concat();
+        assert!(!nests_at_most(&deep_second, MAX_NESTING));
+    }
+
+    #[test]
+    fn test_der_that_cannot_be_split_is_refused() {
+        // A length past the end, an indefinite length, and a tag number above 30.
+        for der in [
+            &[0x30, 0x01][..],
+            &[0x30, 0x80, 0x00, 0x00],
+            &[0x1f, 0x22, 0x00],
+        ] {
+            assert!(!nests_at_most(der, MAX_NESTING), "{der:02x?}");
+        }
+    }
 
     #[test]
     fn test_every_algorithm_has_the_alg_value_of_jsonwebtoken() {
