@@ -23,6 +23,9 @@ const RSA_PUBLIC: &str = include_str!("fixtures/jwt/rsa-2048-public.pem");
 const RSA_PUBLIC_PKCS1: &str = include_str!("fixtures/jwt/rsa-2048-public-pkcs1.pem");
 const RSA_1024: &str = include_str!("fixtures/jwt/rsa-1024-pkcs8.pem");
 const RSA_8200: &str = include_str!("fixtures/jwt/rsa-8200-pkcs8.pem");
+/// An RSA key of 2048 bits with three primes (RFC 8017, section 3.2).
+const RSA_3_PRIMES_PKCS8: &str = include_str!("fixtures/jwt/rsa-2048-3-primes-pkcs8.pem");
+const RSA_3_PRIMES_PKCS1: &str = include_str!("fixtures/jwt/rsa-2048-3-primes-pkcs1.pem");
 const EC_P256: &str = include_str!("fixtures/jwt/ec-p256-pkcs8.pem");
 /// `ec-p256-pkcs8.pem` with the curve as explicit parameters.
 const EC_P256_EXPLICIT: &str = include_str!("fixtures/jwt/ec-p256-explicit-pkcs8.pem");
@@ -61,13 +64,20 @@ const HMAC_SECRET: &[u8] = b"0123456789abcdef0123456789abcdef0123456789abcdef012
 const ENCRYPTED_PRIVATE_KEY: &str =
     "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n-----END ENCRYPTED PRIVATE KEY-----\n";
 const NOT_PKCS8: &str = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
+const NOT_SEC1: &str = "-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n";
 /// The curve P-256, as `openssl ecparam -name prime256v1 -genkey` writes it before the key.
 const EC_PARAMETERS_P256: &str =
     "-----BEGIN EC PARAMETERS-----\nBggqhkjOPQMBBw==\n-----END EC PARAMETERS-----\n";
-/// The levels of a nesting that overflows a stack of 2 MiB in `simple_asn1`, which recurses once per level, in a debug build.
-const DEEP: usize = 5_000;
+/// The levels of a deep nesting: a DER decoder that recurses once per level overflows a stack of 2 MiB on a few thousand of them.
+const DEEP: usize = 100_000;
 /// The OID rsaEncryption (RFC 8017, appendix C) in DER, without tag and length.
 const RSA_ENCRYPTION: [u8; 9] = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+/// The OID of the curve P-256 (RFC 5480, section 2.1.1.1) in DER, without tag and length.
+const SECP256R1: [u8; 8] = [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+/// The OID of the curve P-384 (RFC 5480, section 2.1.1.1) in DER, without tag and length.
+const SECP384R1: [u8; 5] = [0x2b, 0x81, 0x04, 0x00, 0x22];
+/// The reason for an `EC PRIVATE KEY` that is not in SEC1 form with a named curve.
+const NOT_SEC1_REASON: &str = "the key is not in SEC1 form with a named curve; convert it to a named curve with `openssl pkey -in key.pem -ec_param_enc named_curve -out key-named.pem`";
 
 struct Decoded {
     header: Value,
@@ -138,31 +148,57 @@ fn pem_block(label: &str, der: &[u8]) -> String {
     )
 }
 
-/// A DER element (X.690, section 8.1) with the length in its shortest form.
-fn element(tag: u8, content: &[u8]) -> Vec<u8> {
-    let mut encoded = vec![tag];
-    match u8::try_from(content.len()) {
-        Ok(length) if length < 0x80 => encoded.push(length),
+/// The header of a DER element (X.690, section 8.1): the tag, and the length in its shortest form, as DER requires.
+fn header(tag: u8, length: usize) -> Vec<u8> {
+    let mut header = vec![tag];
+    match u8::try_from(length) {
+        Ok(short) if short < 0x80 => header.push(short),
         _ => {
-            let bytes = content.len().to_be_bytes();
+            let bytes = length.to_be_bytes();
             let leading_zeros = bytes.iter().take_while(|&&byte| byte == 0).count();
-            encoded.push(0x80 | u8::try_from(bytes.len() - leading_zeros).unwrap());
-            encoded.extend_from_slice(&bytes[leading_zeros..]);
+            header.push(0x80 | u8::try_from(bytes.len() - leading_zeros).unwrap());
+            header.extend_from_slice(&bytes[leading_zeros..]);
         }
     }
-    encoded.extend_from_slice(content);
-    encoded
+    header
 }
 
-/// `depth` SEQUENCEs, each in the one before, the innermost one empty. Each header has a length of three bytes, so a level takes five bytes.
-fn nested_sequences(depth: usize) -> Vec<u8> {
-    let mut nested = Vec::with_capacity(depth * 5);
-    for level in (0..depth).rev() {
-        let length = (level * 5).to_be_bytes();
-        nested.extend_from_slice(&[0x30, 0x83]);
-        nested.extend_from_slice(&length[length.len() - 3..]);
+/// A DER element (X.690, section 8.1) with the length in its shortest form.
+fn element(tag: u8, content: &[u8]) -> Vec<u8> {
+    [header(tag, content.len()).as_slice(), content].concat()
+}
+
+/// The private key of `ec-p256-sec1.pem` in SEC1 form (RFC 5915, section 3) with the parameters given and without the public key, as PEM.
+fn ec_p256_sec1_with(parameters: Option<&[u8]>) -> String {
+    let key = der(EC_P256_SEC1);
+    // Version 1, then the private key as an OCTET STRING of 32 bytes.
+    let private_key = key
+        .windows(5)
+        .position(|window| window == [0x02, 0x01, 0x01, 0x04, 0x20])
+        .expect("the private key")
+        + 5;
+    let mut fields = [
+        element(0x02, &[1]),
+        element(0x04, &key[private_key..private_key + 32]),
+    ]
+    .concat();
+    if let Some(parameters) = parameters {
+        fields.extend(element(0xa0, parameters));
     }
-    nested
+    pem_block("EC PRIVATE KEY", &element(0x30, &fields))
+}
+
+/// `depth` SEQUENCEs, each in the one before, the innermost one empty, each length in its shortest form.
+fn nested_sequences(depth: usize) -> Vec<u8> {
+    // The headers from the innermost level out: the content of each level is the levels inside it.
+    let mut headers = Vec::with_capacity(depth);
+    let mut length = 0;
+    for _ in 0..depth {
+        let level = header(0x30, length);
+        length += level.len();
+        headers.push(level);
+    }
+    headers.into_iter().rev().flatten().collect()
 }
 
 /// Runs `parse` on a thread with a stack of 2 MiB, the stack of tokio's worker threads, so that a recursion too deep for it aborts the test.
@@ -337,16 +373,52 @@ fn test_an_rsa_key_may_be_in_pkcs1_form() {
 }
 
 #[test]
-fn test_an_ec_key_in_sec1_form_is_rejected_with_a_hint() {
+fn test_an_ec_key_may_be_in_sec1_form() {
     let with_parameters = format!("{EC_PARAMETERS_P256}{EC_P256_SEC1}");
+    // RFC 5915, section 3: the public key is optional. `openssl ec -no_public` leaves it out.
+    let without_public_key = ec_p256_sec1_with(Some(&element(0x06, &SECP256R1)));
+    let p256 = DecodingKey::from_ec_pem(EC_P256_PUBLIC.as_bytes()).unwrap();
 
-    for pem in [EC_P256_SEC1, &with_parameters] {
-        let error = SigningKey::from_pem(pem, SigningAlgorithm::Es256).unwrap_err();
+    for pem in [EC_P256_SEC1, &with_parameters, &without_public_key] {
+        let key = SigningKey::from_pem(pem, SigningAlgorithm::Es256)
+            .unwrap()
+            .with_certificate_pem(CERTIFICATE_EC_P256)
+            .unwrap();
 
-        assert_eq!(
-            invalid_key_reason(error),
-            "the EC key is in SEC1 form; convert it to PKCS#8 with `openssl pkcs8 -topk8 -nocrypt`"
-        );
+        let jwt = assertion(key).sign().unwrap();
+
+        let decoded = verify(jwt.as_str(), Algorithm::ES256, &p256);
+        assert_eq!(decoded.header["x5t#S256"], CERTIFICATE_EC_P256_X5T_S256);
+    }
+}
+
+#[test]
+fn test_an_ec_key_in_sec1_form_must_name_the_curve_of_the_algorithm() {
+    let p384 = ec_p256_sec1_with(Some(&element(0x06, &SECP384R1)));
+    let without_curve = ec_p256_sec1_with(None);
+    // ECParameters as a SEQUENCE, the form of explicit parameters (`openssl ec -param_enc explicit`), which RFC 5915 does not allow.
+    let explicit = ec_p256_sec1_with(Some(&element(0x30, &element(0x02, &[1]))));
+    for (pem, algorithm, reason) in [
+        (
+            EC_P256_SEC1,
+            SigningAlgorithm::Es384,
+            "the EC key is on the curve P-256, but ES384 needs P-384",
+        ),
+        (
+            p384.as_str(),
+            SigningAlgorithm::Es256,
+            "the EC key is on the curve P-384, but ES256 needs P-256",
+        ),
+        (
+            without_curve.as_str(),
+            SigningAlgorithm::Es256,
+            "the EC key in SEC1 form does not name its curve (RFC 5915, section 3)",
+        ),
+        (explicit.as_str(), SigningAlgorithm::Es256, NOT_SEC1_REASON),
+        (NOT_SEC1, SigningAlgorithm::Es256, NOT_SEC1_REASON),
+    ] {
+        let error = SigningKey::from_pem(pem, algorithm).unwrap_err();
+        assert_eq!(invalid_key_reason(error), reason, "{algorithm}: {pem}");
     }
 }
 
@@ -501,7 +573,7 @@ fn test_a_public_key_or_certificate_is_not_a_private_key() {
         (
             ENCRYPTED_PRIVATE_KEY,
             SigningAlgorithm::Rs256,
-            "the PEM holds `ENCRYPTED PRIVATE KEY`, not `PRIVATE KEY` or `RSA PRIVATE KEY`",
+            "the PEM holds `ENCRYPTED PRIVATE KEY`, not `PRIVATE KEY`, `RSA PRIVATE KEY` or `EC PRIVATE KEY`",
         ),
     ] {
         let error = SigningKey::from_pem(pem, algorithm).unwrap_err();
@@ -531,15 +603,12 @@ fn test_a_key_that_cannot_sign_is_rejected_with_the_cause() {
 }
 
 #[test]
-fn test_a_key_that_cannot_be_read_is_rejected_with_the_cause() {
+fn test_a_key_that_cannot_be_read_is_rejected() {
     let pem = "-----BEGIN RSA PRIVATE KEY-----\nbm90IERFUg==\n-----END RSA PRIVATE KEY-----\n";
 
     let error = SigningKey::from_pem(pem, SigningAlgorithm::Rs256).unwrap_err();
 
-    assert_eq!(
-        invalid_key_reason(error),
-        "the key cannot be read: InvalidKeyFormat"
-    );
+    assert_eq!(invalid_key_reason(error), "the key is not in PKCS#1 form");
 }
 
 #[test]
@@ -550,6 +619,19 @@ fn test_an_rsa_key_longer_than_8192_bits_is_rejected() {
         invalid_key_reason(error),
         "the RSA key has 8200 bits; middle signs with RSA keys of 2048 to 8192 bits"
     );
+}
+
+#[test]
+fn test_an_rsa_key_with_more_than_two_primes_is_rejected() {
+    for pem in [RSA_3_PRIMES_PKCS8, RSA_3_PRIMES_PKCS1] {
+        let error = SigningKey::from_pem(pem, SigningAlgorithm::Rs256).unwrap_err();
+
+        assert_eq!(
+            invalid_key_reason(error),
+            "the RSA key has more than two primes; middle signs with RSA keys of two primes",
+            "{pem}"
+        );
+    }
 }
 
 #[test]
@@ -871,8 +953,15 @@ fn test_a_certificate_that_cannot_be_read_is_rejected() {
 }
 
 #[test]
+fn test_the_nesting_of_these_tests_is_der() {
+    assert_eq!(nested_sequences(3), [0x30, 0x04, 0x30, 0x02, 0x30, 0x00]);
+    // From 65 levels on, the content of the outermost level is longer than 127 bytes, and its length takes the long form.
+    assert_eq!(nested_sequences(65)[..5], [0x30, 0x81, 0x80, 0x30, 0x7e]);
+}
+
+#[test]
 fn test_a_deeply_nested_certificate_is_rejected_without_a_crash() {
-    let nested = nested_sequences(100_000);
+    let nested = nested_sequences(DEEP);
     let key = SigningKey::from_pem(RSA_PKCS8, SigningAlgorithm::Rs256).unwrap();
 
     let error = key.with_certificate_der(nested).unwrap_err();
@@ -885,21 +974,34 @@ fn test_a_deeply_nested_certificate_is_rejected_without_a_crash() {
 
 #[test]
 fn test_a_deep_nesting_in_the_public_key_of_a_certificate_is_rejected_without_a_crash() {
-    // An X.509 v1 certificate whose `subjectPublicKeyInfo` is a deep nesting. middle skips the fields before it unread, so they are empty.
-    let empty = element(0x30, &[]);
-    let to_be_signed = [
-        element(0x02, &[1]),
-        empty.clone(),
-        empty.clone(),
-        empty.clone(),
-        empty,
-        nested_sequences(DEEP),
-    ]
-    .concat();
-    let certificate = element(0x30, &element(0x30, &to_be_signed));
+    // An X.509 v1 certificate with the `subjectPublicKeyInfo` given. middle reads only the types of the other fields and parts, so they are empty.
+    let certificate = |subject_public_key_info: &[u8]| {
+        let empty = element(0x30, &[]);
+        let to_be_signed = [
+            element(0x02, &[1]),
+            empty.clone(),
+            empty.clone(),
+            empty.clone(),
+            empty.clone(),
+            subject_public_key_info.to_vec(),
+        ]
+        .concat();
+        let signature_value = element(0x03, &[0]);
+        element(
+            0x30,
+            &[element(0x30, &to_be_signed), empty, signature_value].concat(),
+        )
+    };
     let key = SigningKey::from_pem(RSA_PKCS8, SigningAlgorithm::Rs256).unwrap();
+    // With the public key of the signing key, middle accepts the certificate, so it reads the `subjectPublicKeyInfo`.
+    assert!(
+        key.clone()
+            .with_certificate_der(certificate(&der(RSA_PUBLIC)))
+            .is_ok()
+    );
+    let deep = certificate(&nested_sequences(DEEP));
 
-    let error = on_a_2_mib_stack(move || key.with_certificate_der(certificate).unwrap_err());
+    let error = on_a_2_mib_stack(move || key.with_certificate_der(deep).unwrap_err());
 
     assert!(
         matches!(error, ConfigError::InvalidCertificate),
@@ -920,20 +1022,20 @@ fn test_a_deeply_nested_pkcs8_key_is_rejected_without_a_crash() {
 #[test]
 fn test_a_deep_nesting_in_the_rsa_key_of_a_pkcs8_key_is_rejected_without_a_crash() {
     // PKCS#8 (RFC 5958, section 2): version 0, rsaEncryption with NULL parameters, and the RSA key as an OCTET STRING.
-    let algorithm = element(
-        0x30,
-        &[element(0x06, &RSA_ENCRYPTION), element(0x05, &[])].concat(),
-    );
-    let pkcs8 = element(
-        0x30,
-        &[
-            element(0x02, &[0]),
-            algorithm,
-            element(0x04, &nested_sequences(DEEP)),
-        ]
-        .concat(),
-    );
-    let pem = pem_block("PRIVATE KEY", &pkcs8);
+    let pkcs8 = |rsa: &[u8]| {
+        let algorithm = element(
+            0x30,
+            &[element(0x06, &RSA_ENCRYPTION), element(0x05, &[])].concat(),
+        );
+        let pkcs8 = element(
+            0x30,
+            &[element(0x02, &[0]), algorithm, element(0x04, rsa)].concat(),
+        );
+        pem_block("PRIVATE KEY", &pkcs8)
+    };
+    // With the RSA key of `rsa-2048-pkcs1.pem`, the key loads, so middle reads the RSA key.
+    assert!(SigningKey::from_pem(pkcs8(&der(RSA_PKCS1)), SigningAlgorithm::Rs256).is_ok());
+    let pem = pkcs8(&nested_sequences(DEEP));
 
     let error =
         on_a_2_mib_stack(move || SigningKey::from_pem(pem, SigningAlgorithm::Rs256).unwrap_err());
@@ -948,10 +1050,7 @@ fn test_a_deeply_nested_pkcs1_key_is_rejected_without_a_crash() {
     let error =
         on_a_2_mib_stack(move || SigningKey::from_pem(pem, SigningAlgorithm::Rs256).unwrap_err());
 
-    assert_eq!(
-        invalid_key_reason(error),
-        "the key cannot be read: InvalidKeyFormat"
-    );
+    assert_eq!(invalid_key_reason(error), "the key is not in PKCS#1 form");
 }
 
 #[test]

@@ -7,19 +7,27 @@
 compile_error!("The feature `jwt` needs a crypto backend: enable `aws-lc-rs` or `rust-crypto`.");
 
 use std::{
+    borrow::Cow,
     fmt,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use der::{
+    Decode as _, Encode as _, Reader as _, SliceReader, Tag, TagNumber, Tagged as _,
+    asn1::{AnyRef, ObjectIdentifier, OctetStringRef},
+};
 #[cfg(feature = "aws-lc-rs")]
 use jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER as PROVIDER;
 #[cfg(all(feature = "rust-crypto", not(feature = "aws-lc-rs")))]
 use jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER as PROVIDER;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, jwk::ThumbprintHash};
+use pkcs1::RsaPrivateKeyRef;
+use pkcs8::PrivateKeyInfoRef;
+use sec1::{EcParameters, EcPrivateKey};
 use serde_json::{Map, Value};
-use simple_asn1::ASN1Block;
+use spki::{AlgorithmIdentifierRef, SubjectPublicKeyInfoRef};
 
 use crate::error::{AssertionError, ConfigError, DisplayChain, Error};
 
@@ -41,25 +49,31 @@ const MIN_RSA_BITS: usize = 2048;
 /// The longest RSA key middle signs with, the limit of aws-lc-rs, so that both crypto backends accept the same keys.
 const MAX_RSA_BITS: usize = 8192;
 
-/// The tag of an INTEGER (X.690, section 8.3).
-const INTEGER: u8 = 0x02;
-
-/// The tag of a BIT STRING (X.690, section 8.6).
-const BIT_STRING: u8 = 0x03;
-
-/// The tag of a SEQUENCE (X.690, section 8.9).
-const SEQUENCE: u8 = 0x30;
-
 /// The tag of `[0] EXPLICIT`, the version of an X.509 certificate (RFC 5280, section 4.1).
-const VERSION: u8 = 0xA0;
+const VERSION: Tag = Tag::ContextSpecific {
+    constructed: true,
+    number: TagNumber(0),
+};
 
-/// The bit of a tag that marks a constructed element, whose content is more elements (X.690, section 8.1.2.5).
-const CONSTRUCTED: u8 = 0x20;
+/// The key algorithm rsaEncryption (RFC 8017, appendix C).
+const RSA_ENCRYPTION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
 
-/// The deepest nesting of DER elements middle decodes. Keys and certificates nest a few levels deep. `simple_asn1`, which decodes them for middle and jsonwebtoken, recurses once per level without a limit, and a few thousand levels overflow a stack of 2 MiB.
-const MAX_NESTING: usize = 16;
+/// The key algorithm id-ecPublicKey (RFC 5480, section 2.1.1).
+const ID_EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
 
-/// The PEM labels of the private keys [`check_private_key`] reads.
+/// The key algorithm id-Ed25519 (RFC 8410, section 3).
+const ID_ED25519: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.112");
+
+/// The named curve P-256 (RFC 5480, section 2.1.1.1).
+const SECP256R1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
+
+/// The named curve P-384 (RFC 5480, section 2.1.1.1).
+const SECP384R1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.34");
+
+/// The named curve P-521 (RFC 5480, section 2.1.1.1).
+const SECP521R1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.35");
+
+/// The PEM labels of the private keys [`private_key_der`] reads.
 const PRIVATE_KEY_LABELS: [&str; 3] = ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY"];
 
 /// A JWS algorithm (RFC 7518, section 3.1) that middle signs with.
@@ -112,15 +126,12 @@ enum Family {
 }
 
 impl Family {
-    /// The family of a key algorithm, given as the arcs of its OID.
-    fn of_key_algorithm(arcs: &[u64]) -> Option<Self> {
-        match arcs {
-            // rsaEncryption (RFC 8017, appendix C)
-            [1, 2, 840, 113_549, 1, 1, 1] => Some(Self::Rsa),
-            // id-ecPublicKey (RFC 5480, section 2.1.1)
-            [1, 2, 840, 10_045, 2, 1] => Some(Self::Ec),
-            // id-Ed25519 (RFC 8410, section 3)
-            [1, 3, 101, 112] => Some(Self::Ed),
+    /// The family of a key algorithm.
+    fn of_key_algorithm(algorithm: ObjectIdentifier) -> Option<Self> {
+        match algorithm {
+            RSA_ENCRYPTION => Some(Self::Rsa),
+            ID_EC_PUBLIC_KEY => Some(Self::Ec),
+            ID_ED25519 => Some(Self::Ed),
             _ => None,
         }
     }
@@ -181,12 +192,22 @@ impl SigningAlgorithm {
     }
 
     /// The curve an `ES*` algorithm signs with (RFC 7518, section 3.4).
-    fn curve(self) -> Option<&'static str> {
+    fn curve(self) -> Option<ObjectIdentifier> {
         match self {
-            Self::Es256 => Some("P-256"),
-            Self::Es384 => Some("P-384"),
+            Self::Es256 => Some(SECP256R1),
+            Self::Es384 => Some(SECP384R1),
             _ => None,
         }
+    }
+}
+
+/// The name of a curve, such as `P-256`, or its OID in dotted form.
+fn curve_name(curve: ObjectIdentifier) -> String {
+    match curve {
+        SECP256R1 => "P-256".to_string(),
+        SECP384R1 => "P-384".to_string(),
+        SECP521R1 => "P-521".to_string(),
+        _ => curve.to_string(),
     }
 }
 
@@ -206,9 +227,9 @@ pub struct SigningKey {
 }
 
 impl SigningKey {
-    /// Loads a private key in PEM form: RSA in PKCS#1 (`RSA PRIVATE KEY`) or PKCS#8 (`PRIVATE KEY`) for `RS*` and `PS*`, EC in PKCS#8 for `ES*`, Ed25519 in PKCS#8 for `EdDSA`.
+    /// Loads a private key in PEM form: RSA in PKCS#1 (`RSA PRIVATE KEY`) or PKCS#8 (`PRIVATE KEY`) for `RS*` and `PS*`, EC in SEC1 (`EC PRIVATE KEY`) or PKCS#8 for `ES*`, Ed25519 in PKCS#8 for `EdDSA`. An EC key names its curve.
     ///
-    /// The text may hold other PEM blocks before or after the key, such as its certificate: middle reads the first private key and ignores the other blocks.
+    /// The text may hold other PEM blocks before or after the key, such as its certificate or the `EC PARAMETERS` that `openssl ecparam -genkey` writes before an EC key: middle reads the first private key and ignores the other blocks.
     ///
     /// # Errors
     ///
@@ -218,11 +239,10 @@ impl SigningKey {
         pem: impl AsRef<[u8]>,
         algorithm: SigningAlgorithm,
     ) -> Result<Self, ConfigError> {
-        let load: fn(&[u8]) -> jsonwebtoken::errors::Result<EncodingKey> = match algorithm.family()
-        {
-            Family::Rsa => EncodingKey::from_rsa_pem,
-            Family::Ec => EncodingKey::from_ec_pem,
-            Family::Ed => EncodingKey::from_ed_pem,
+        let load: fn(&[u8]) -> EncodingKey = match algorithm.family() {
+            Family::Rsa => EncodingKey::from_rsa_der,
+            Family::Ec => EncodingKey::from_ec_der,
+            Family::Ed => EncodingKey::from_ed_der,
             Family::Hmac => {
                 return Err(invalid(
                     "an HMAC algorithm signs with a shared secret: use `SigningKey::from_secret`",
@@ -230,26 +250,8 @@ impl SigningKey {
             }
         };
         let block = private_key_block(pem.as_ref())?;
-        check_private_key(&block, algorithm)?;
-        let key = load_private_key(load, &block)
-            .map_err(|error| invalid(format!("the key cannot be read: {error}")))?;
-        if algorithm.family() == Family::Rsa {
-            let bits = rsa_modulus_bits(key.as_bytes())
-                .ok_or_else(|| invalid("the RSA key cannot be read"))?;
-            if bits < MIN_RSA_BITS {
-                return Err(ConfigError::WeakSigningKey {
-                    algorithm,
-                    bits,
-                    minimum: MIN_RSA_BITS,
-                });
-            }
-            if bits > MAX_RSA_BITS {
-                return Err(invalid(format!(
-                    "the RSA key has {bits} bits; middle signs with RSA keys of {MIN_RSA_BITS} to {MAX_RSA_BITS} bits"
-                )));
-            }
-        }
-        Self::checked(algorithm, key)
+        let der = private_key_der(&block, algorithm)?;
+        Self::checked(algorithm, load(&der))
     }
 
     /// A shared secret for `HS*`, such as a client secret for `client_secret_jwt`.
@@ -347,11 +349,11 @@ impl SigningKey {
         let (family, public_key) =
             certificate_public_key(certificate).ok_or(ConfigError::InvalidCertificate)?;
         let public_key = match (self.algorithm.family(), family) {
-            (Family::Rsa, Some(Family::Rsa)) => DecodingKey::from_rsa_der(&public_key),
-            (Family::Ec, Some(Family::Ec)) => DecodingKey::from_ec_der(&public_key),
+            (Family::Rsa, Some(Family::Rsa)) => DecodingKey::from_rsa_der(public_key),
+            (Family::Ec, Some(Family::Ec)) => DecodingKey::from_ec_der(public_key),
             // RFC 8410, section 4: an Ed25519 public key has 32 bytes. jsonwebtoken's RustCrypto verifier panics on a shorter one.
             (Family::Ed, Some(Family::Ed)) if public_key.len() == 32 => {
-                DecodingKey::from_ed_der(&public_key)
+                DecodingKey::from_ed_der(public_key)
             }
             _ => return Err(ConfigError::CertificateKeyMismatch),
         };
@@ -595,7 +597,7 @@ fn invalid(reason: impl Into<String>) -> ConfigError {
     ConfigError::InvalidSigningKey(reason.into())
 }
 
-/// The first PEM block of the text that holds a private key. If no block does, the first block, so that [`check_private_key`] names what the text holds.
+/// The first PEM block of the text that holds a private key. If no block does, the first block, so that [`private_key_der`] names what the text holds.
 fn private_key_block(pem: &[u8]) -> Result<pem::Pem, ConfigError> {
     let not_pem = || invalid("the key is not in PEM form");
     let blocks = pem::parse_many(pem).map_err(|_| not_pem())?;
@@ -606,239 +608,201 @@ fn private_key_block(pem: &[u8]) -> Result<pem::Pem, ConfigError> {
     blocks.into_iter().nth(index).ok_or_else(not_pem)
 }
 
-/// Loads a private key block with jsonwebtoken.
+/// Checks that a PEM block holds a private key that fits the algorithm, and returns the key in DER in the form jsonwebtoken's backends sign with: PKCS#1 for RSA, PKCS#8 for EC and Ed25519.
 ///
-/// jsonwebtoken reads the first block of a PEM text, so middle hands it the block alone. jsonwebtoken decodes the DER of the block with `simple_asn1`, so middle refuses a nesting deeper than [`MAX_NESTING`] first, with the error jsonwebtoken gives for DER it cannot decode.
-fn load_private_key(
-    load: fn(&[u8]) -> jsonwebtoken::errors::Result<EncodingKey>,
+/// jsonwebtoken's `EncodingKey::from_rsa_der`, `from_ec_der` and `from_ed_der` keep the bytes unread, and the backend reads them when it signs, so middle reads the label and the key itself. The messages name labels, algorithms and curves, never key material.
+fn private_key_der(
     block: &pem::Pem,
-) -> jsonwebtoken::errors::Result<EncodingKey> {
-    if !nests_at_most(block.contents(), MAX_NESTING) {
-        return Err(jsonwebtoken::errors::ErrorKind::InvalidKeyFormat.into());
+    algorithm: SigningAlgorithm,
+) -> Result<Cow<'_, [u8]>, ConfigError> {
+    let der = block.contents();
+    match block.tag() {
+        "PRIVATE KEY" => pkcs8_private_key(der, algorithm),
+        "RSA PRIVATE KEY" => {
+            check_family(Family::Rsa, algorithm)?;
+            let key = RsaPrivateKeyRef::from_der(der)
+                .map_err(|_| invalid("the key is not in PKCS#1 form"))?;
+            check_rsa_key(&key, algorithm)?;
+            Ok(Cow::Borrowed(der))
+        }
+        "EC PRIVATE KEY" => {
+            check_family(Family::Ec, algorithm)?;
+            sec1_private_key(der, algorithm).map(Cow::Owned)
+        }
+        "PUBLIC KEY" | "RSA PUBLIC KEY" => {
+            Err(invalid("the PEM holds a public key, not a private key"))
+        }
+        "CERTIFICATE" => Err(invalid("the PEM holds a certificate, not a private key")),
+        label => Err(invalid(format!(
+            "the PEM holds `{label}`, not `PRIVATE KEY`, `RSA PRIVATE KEY` or `EC PRIVATE KEY`"
+        ))),
     }
-    load(pem::encode(block).as_bytes())
 }
 
-/// Checks that a PEM block holds a private key that fits the algorithm, before jsonwebtoken loads it.
-///
-/// jsonwebtoken's `EncodingKey::from_rsa_pem` also loads an RSA public key or certificate, so middle reads the label and the key algorithm itself. The messages name labels, algorithms and curves, never key material.
-fn check_private_key(block: &pem::Pem, algorithm: SigningAlgorithm) -> Result<(), ConfigError> {
-    let (family, curve) = match block.tag() {
-        "PRIVATE KEY" => pkcs8_key_algorithm(block.contents())?,
-        "RSA PRIVATE KEY" => (Family::Rsa, None),
-        "EC PRIVATE KEY" if algorithm.family() == Family::Ec => {
-            return Err(invalid(
-                "the EC key is in SEC1 form; convert it to PKCS#8 with `openssl pkcs8 -topk8 -nocrypt`",
-            ));
+/// The DER jsonwebtoken's backends sign with for a private key in PKCS#8 form (RFC 5958, section 2): the RSA key in PKCS#1 form it holds, or the PKCS#8 key itself for EC and Ed25519.
+fn pkcs8_private_key(
+    der: &[u8],
+    algorithm: SigningAlgorithm,
+) -> Result<Cow<'_, [u8]>, ConfigError> {
+    let key =
+        PrivateKeyInfoRef::from_der(der).map_err(|_| invalid("the key is not in PKCS#8 form"))?;
+    let key_algorithm = key.algorithm.oid;
+    let family = Family::of_key_algorithm(key_algorithm).ok_or_else(|| {
+        invalid(format!(
+            "the key has the algorithm {key_algorithm}, which middle does not sign with"
+        ))
+    })?;
+    check_family(family, algorithm)?;
+    match family {
+        Family::Rsa => {
+            let rsa = key.private_key.as_bytes();
+            let rsa_key = RsaPrivateKeyRef::from_der(rsa)
+                .map_err(|_| invalid("the RSA key cannot be read"))?;
+            check_rsa_key(&rsa_key, algorithm)?;
+            Ok(Cow::Borrowed(rsa))
         }
-        "EC PRIVATE KEY" => (Family::Ec, None),
-        "PUBLIC KEY" | "RSA PUBLIC KEY" => {
-            return Err(invalid("the PEM holds a public key, not a private key"));
+        Family::Ec => {
+            // RFC 5480, section 2.1.1: the parameters of an EC key are the OID of its named curve.
+            let curve = key
+                .algorithm
+                .parameters
+                .and_then(|parameters| ObjectIdentifier::try_from(parameters).ok())
+                .ok_or_else(|| invalid(
+                    "the EC key does not name its curve; convert it to a named curve with `openssl pkey -in key.pem -ec_param_enc named_curve -out key-named.pem`",
+                ))?;
+            check_curve(curve, algorithm)?;
+            Ok(Cow::Borrowed(der))
         }
-        "CERTIFICATE" => return Err(invalid("the PEM holds a certificate, not a private key")),
-        label => {
-            return Err(invalid(format!(
-                "the PEM holds `{label}`, not `PRIVATE KEY` or `RSA PRIVATE KEY`"
-            )));
-        }
-    };
-    if family != algorithm.family() {
-        return Err(invalid(format!(
-            "the key is {}, but {algorithm} needs {}",
-            family.key(),
-            algorithm.family().key()
-        )));
+        Family::Ed | Family::Hmac => Ok(Cow::Borrowed(der)),
     }
-    match (algorithm.curve(), curve) {
-        (Some(needed), Some(curve)) if curve != needed => Err(invalid(format!(
-            "the EC key is on the curve {curve}, but {algorithm} needs {needed}"
+}
+
+/// Wraps an EC private key in SEC1 form (RFC 5915, section 3) into PKCS#8 (RFC 5958, section 2), the form jsonwebtoken's backends sign with: the algorithm id-ecPublicKey with the curve of the key as its parameter (RFC 5480, section 2.1.1), and the SEC1 key as the private key.
+fn sec1_private_key(der: &[u8], algorithm: SigningAlgorithm) -> Result<Vec<u8>, ConfigError> {
+    // RFC 5915, section 3: the parameters are a named curve. `sec1` refuses explicit parameters, which `openssl ec -param_enc explicit` writes.
+    let key = EcPrivateKey::from_der(der).map_err(|_| {
+        invalid(
+            "the key is not in SEC1 form with a named curve; convert it to a named curve with `openssl pkey -in key.pem -ec_param_enc named_curve -out key-named.pem`",
+        )
+    })?;
+    let curve = key
+        .parameters
+        .and_then(EcParameters::named_curve)
+        .ok_or_else(|| {
+            invalid("the EC key in SEC1 form does not name its curve (RFC 5915, section 3)")
+        })?;
+    check_curve(curve, algorithm)?;
+    let key_algorithm = AlgorithmIdentifierRef {
+        oid: ID_EC_PUBLIC_KEY,
+        parameters: Some(AnyRef::from(&curve)),
+    };
+    let cannot_convert = |_| invalid("the EC key in SEC1 form cannot be converted to PKCS#8");
+    let private_key = OctetStringRef::new(der).map_err(cannot_convert)?;
+    PrivateKeyInfoRef::new(key_algorithm, private_key)
+        .to_der()
+        .map_err(cannot_convert)
+}
+
+/// Checks that a key of the family fits the algorithm.
+fn check_family(family: Family, algorithm: SigningAlgorithm) -> Result<(), ConfigError> {
+    if family == algorithm.family() {
+        return Ok(());
+    }
+    Err(invalid(format!(
+        "the key is {}, but {algorithm} needs {}",
+        family.key(),
+        algorithm.family().key()
+    )))
+}
+
+/// Checks that an EC key on the named curve fits the algorithm.
+fn check_curve(curve: ObjectIdentifier, algorithm: SigningAlgorithm) -> Result<(), ConfigError> {
+    match algorithm.curve() {
+        Some(needed) if curve != needed => Err(invalid(format!(
+            "the EC key is on the curve {}, but {algorithm} needs {}",
+            curve_name(curve),
+            curve_name(needed)
         ))),
-        // RFC 5480, section 2.1.1: an EC key names its curve.
-        (Some(_), None) => Err(invalid(
-            "the EC key does not name its curve; convert it to a named curve with `openssl pkey -in key.pem -ec_param_enc named_curve -out key-named.pem`",
-        )),
         _ => Ok(()),
     }
 }
 
-/// The family and, for an EC key, the curve of a private key in PKCS#8 form (RFC 5958, section 2).
-fn pkcs8_key_algorithm(der: &[u8]) -> Result<(Family, Option<String>), ConfigError> {
-    let not_pkcs8 = || invalid("the key is not in PKCS#8 form");
-    let blocks = decode_der(der).ok_or_else(not_pkcs8)?;
-    let [ASN1Block::Sequence(_, fields)] = blocks.as_slice() else {
-        return Err(not_pkcs8());
+/// Checks that an RSA private key in PKCS#1 form (RFC 8017, appendix A.1.2) has two primes and from 2048 to 8192 bits.
+fn check_rsa_key(
+    key: &RsaPrivateKeyRef<'_>,
+    algorithm: SigningAlgorithm,
+) -> Result<(), ConfigError> {
+    // RFC 8017, section 3.2: `otherPrimeInfos` holds the primes after the first two.
+    if key.other_prime_infos.is_some() {
+        return Err(invalid(
+            "the RSA key has more than two primes; middle signs with RSA keys of two primes",
+        ));
+    }
+    // Big-endian, without leading zeros.
+    let bits = match key.modulus.as_bytes().split_first() {
+        Some((&first, rest)) => rest.len() * 8 + (8 - first.leading_zeros() as usize),
+        None => 0,
     };
-    let (key_algorithm, parameter) = fields
-        .get(1)
-        .and_then(algorithm_identifier)
-        .ok_or_else(not_pkcs8)?;
-    let family = Family::of_key_algorithm(&key_algorithm).ok_or_else(|| {
-        invalid(format!(
-            "the key has the algorithm {}, which middle does not sign with",
-            dotted(&key_algorithm)
-        ))
-    })?;
-    let curve = parameter
-        .filter(|_| family == Family::Ec)
-        .map(|curve| match curve.as_slice() {
-            // Named curves (RFC 5480, section 2.1.1.1).
-            [1, 2, 840, 10_045, 3, 1, 7] => "P-256".to_string(),
-            [1, 3, 132, 0, 34] => "P-384".to_string(),
-            [1, 3, 132, 0, 35] => "P-521".to_string(),
-            _ => dotted(&curve),
+    if bits < MIN_RSA_BITS {
+        return Err(ConfigError::WeakSigningKey {
+            algorithm,
+            bits,
+            minimum: MIN_RSA_BITS,
         });
-    Ok((family, curve))
-}
-
-/// The algorithm and, if it is an OID, the parameter of an `AlgorithmIdentifier` (RFC 5280, section 4.1.1.2), as the arcs of their OIDs. For an EC key, the parameter is its named curve.
-fn algorithm_identifier(identifier: &ASN1Block) -> Option<(Vec<u64>, Option<Vec<u64>>)> {
-    let ASN1Block::Sequence(_, fields) = identifier else {
-        return None;
-    };
-    let Some(ASN1Block::ObjectIdentifier(_, algorithm)) = fields.first() else {
-        return None;
-    };
-    let parameter = match fields.get(1) {
-        Some(ASN1Block::ObjectIdentifier(_, parameter)) => Some(parameter.as_vec().ok()?),
-        _ => None,
-    };
-    Some((algorithm.as_vec().ok()?, parameter))
+    }
+    if bits > MAX_RSA_BITS {
+        return Err(invalid(format!(
+            "the RSA key has {bits} bits; middle signs with RSA keys of {MIN_RSA_BITS} to {MAX_RSA_BITS} bits"
+        )));
+    }
+    Ok(())
 }
 
 /// The family and the `subjectPublicKey` of an X.509 certificate in DER form (RFC 5280, section 4.1).
 ///
-/// The `subjectPublicKey` is in the form jsonwebtoken's `DecodingKey::from_rsa_der`, `from_ec_der` and `from_ed_der` read. middle reads the certificate itself: jsonwebtoken takes the first key algorithm OID anywhere in the certificate, and when the issuer signs with Ed25519, that is the OID of the signature algorithm.
+/// The `subjectPublicKey` is in the form jsonwebtoken's `DecodingKey::from_rsa_der`, `from_ec_der` and `from_ed_der` read.
 ///
-/// middle walks the DER headers to the `subjectPublicKeyInfo` and decodes only that element, with [`decode_der`]. It checks that the certificate has its three parts and that the fields before the key have their types, and skips the names unread: a CA may write them as a `BMPString` or as a `PrintableString` with characters such as `*`, which `simple_asn1` refuses.
-fn certificate_public_key(der: &[u8]) -> Option<(Option<Family>, Vec<u8>)> {
-    let (certificate, rest) = split_element(der)?;
-    if certificate.tag != SEQUENCE || !rest.is_empty() {
-        return None;
-    }
+/// middle checks that the certificate has its three parts and that the fields before the key have their types, and decodes only the `subjectPublicKeyInfo`, with `spki`. It skips the other fields unread: a CA may write the names as a `BMPString` or as a `PrintableString` with characters such as `*`, which strict decoders refuse.
+fn certificate_public_key(der: &[u8]) -> Option<(Option<Family>, &[u8])> {
+    let mut reader = SliceReader::new(der).ok()?;
     // tbsCertificate, signatureAlgorithm and signatureValue (RFC 5280, section 4.1).
-    let (to_be_signed, rest) = split_element(certificate.content)?;
-    let (signature_algorithm, rest) = split_element(rest)?;
-    let (signature_value, rest) = split_element(rest)?;
-    if to_be_signed.tag != SEQUENCE
-        || signature_algorithm.tag != SEQUENCE
-        || signature_value.tag != BIT_STRING
-        || !rest.is_empty()
-    {
-        return None;
-    }
-    let mut fields = to_be_signed.content;
-    // The version is `[0] EXPLICIT`, which an X.509 v1 certificate leaves out.
-    if fields.first() == Some(&VERSION) {
-        fields = split_element(fields)?.1;
-    }
-    // serialNumber, then signature, issuer, validity and subject.
-    for tag in [INTEGER, SEQUENCE, SEQUENCE, SEQUENCE, SEQUENCE] {
-        let (field, rest) = split_element(fields)?;
-        if field.tag != tag {
-            return None;
-        }
-        fields = rest;
-    }
-    let (subject_public_key_info, _) = split_element(fields)?;
-    let blocks = decode_der(subject_public_key_info.encoded)?;
-    let [ASN1Block::Sequence(_, subject_public_key_info)] = blocks.as_slice() else {
-        return None;
-    };
-    let [identifier, ASN1Block::BitString(_, _, public_key)] = subject_public_key_info.as_slice()
-    else {
-        return None;
-    };
-    let (key_algorithm, _) = algorithm_identifier(identifier)?;
-    Some((Family::of_key_algorithm(&key_algorithm), public_key.clone()))
-}
-
-/// A DER element (X.690, section 8.1).
-struct Element<'a> {
-    tag: u8,
-    /// The whole element: tag, length and content.
-    encoded: &'a [u8],
-    content: &'a [u8],
-}
-
-/// Splits the first DER element off `der` and returns it with the bytes after it.
-///
-/// It reads a tag of one byte and a definite length in short or long form, and refuses an indefinite length or a length past the end. It reads only the header of the element and does not descend into its content.
-fn split_element(der: &[u8]) -> Option<(Element<'_>, &[u8])> {
-    let (&tag, after_tag) = der.split_first()?;
-    // A tag number above 30 takes more bytes (X.690, section 8.1.2.4); no element of the keys and certificates middle reads has one.
-    if (tag & 0x1f) == 0x1f {
-        return None;
-    }
-    let (&first, after_first) = after_tag.split_first()?;
-    let (length, after_length) = if first < 0x80 {
-        (usize::from(first), after_first)
-    } else {
-        // The low bits count the length bytes. 0x80 alone is the indefinite length, which DER does not allow.
-        let count = usize::from(first & 0x7f);
-        if count == 0 || count > size_of::<usize>() {
-            return None;
-        }
-        let (bytes, after_length) = after_first.split_at_checked(count)?;
-        let length = bytes
-            .iter()
-            .fold(0, |length, &byte| (length << 8) | usize::from(byte));
-        (length, after_length)
-    };
-    let (content, rest) = after_length.split_at_checked(length)?;
-    let encoded = &der[..der.len() - rest.len()];
+    let subject_public_key_info = reader
+        .sequence(|certificate| {
+            let subject_public_key_info = certificate.sequence(|to_be_signed| {
+                // The version is `[0] EXPLICIT`, which an X.509 v1 certificate leaves out.
+                if Tag::peek(to_be_signed)? == VERSION {
+                    AnyRef::decode(to_be_signed)?;
+                }
+                // serialNumber, then signature, issuer, validity and subject.
+                for tag in [
+                    Tag::Integer,
+                    Tag::Sequence,
+                    Tag::Sequence,
+                    Tag::Sequence,
+                    Tag::Sequence,
+                ] {
+                    AnyRef::decode(to_be_signed)?.tag().assert_eq(tag)?;
+                }
+                let subject_public_key_info = SubjectPublicKeyInfoRef::decode(to_be_signed)?;
+                // issuerUniqueID, subjectUniqueID and extensions.
+                to_be_signed.read_slice(to_be_signed.remaining_len())?;
+                Ok::<_, der::Error>(subject_public_key_info)
+            })?;
+            AnyRef::decode(certificate)?
+                .tag()
+                .assert_eq(Tag::Sequence)?;
+            AnyRef::decode(certificate)?
+                .tag()
+                .assert_eq(Tag::BitString)?;
+            Ok::<_, der::Error>(subject_public_key_info)
+        })
+        .ok()?;
+    reader.finish().ok()?;
+    let public_key = subject_public_key_info.subject_public_key.as_bytes()?;
     Some((
-        Element {
-            tag,
-            encoded,
-            content,
-        },
-        rest,
+        Family::of_key_algorithm(subject_public_key_info.algorithm.oid),
+        public_key,
     ))
-}
-
-/// Whether the DER elements in `der` nest at most `levels` deep.
-///
-/// It descends into the elements whose content `simple_asn1` decodes: constructed elements, and a SEQUENCE or SET without the constructed bit. It refuses what [`split_element`] refuses, and recurses at most `levels` deep.
-fn nests_at_most(mut der: &[u8], levels: usize) -> bool {
-    while !der.is_empty() {
-        let Some((element, rest)) = split_element(der) else {
-            return false;
-        };
-        let nests = element.tag & CONSTRUCTED != 0 || matches!(element.tag, 0x10 | 0x11);
-        if nests && (levels == 0 || !nests_at_most(element.content, levels - 1)) {
-            return false;
-        }
-        der = rest;
-    }
-    true
-}
-
-/// Decodes DER with `simple_asn1`, if its elements nest at most [`MAX_NESTING`] levels deep.
-fn decode_der(der: &[u8]) -> Option<Vec<ASN1Block>> {
-    if !nests_at_most(der, MAX_NESTING) {
-        return None;
-    }
-    simple_asn1::from_der(der).ok()
-}
-
-/// An OID in dotted form, such as `1.3.101.112`.
-fn dotted(arcs: &[u64]) -> String {
-    arcs.iter()
-        .map(u64::to_string)
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
-/// The modulus length of an RSA private key in PKCS#1 form (RFC 8017, appendix A.1.2), the form jsonwebtoken keeps for PKCS#1 and PKCS#8 PEM alike.
-fn rsa_modulus_bits(pkcs1: &[u8]) -> Option<usize> {
-    let blocks = decode_der(pkcs1)?;
-    let [simple_asn1::ASN1Block::Sequence(_, fields)] = blocks.as_slice() else {
-        return None;
-    };
-    match fields.get(1)? {
-        simple_asn1::ASN1Block::Integer(_, modulus) => usize::try_from(modulus.bits()).ok(),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -849,66 +813,22 @@ mod tests {
 
     use super::*;
 
-    /// `depth` elements with the tag, each in the one before, the innermost one empty.
-    fn nested(tag: u8, depth: usize) -> Vec<u8> {
-        (0..depth).fold(Vec::new(), |inner, _| {
-            [&[tag, u8::try_from(inner.len()).unwrap()], inner.as_slice()].concat()
-        })
-    }
-
     #[test]
-    fn test_der_may_nest_up_to_the_limit() {
-        assert!(nests_at_most(&nested(SEQUENCE, MAX_NESTING), MAX_NESTING));
-        let siblings = [nested(SEQUENCE, MAX_NESTING), nested(SEQUENCE, MAX_NESTING)].concat();
-        assert!(nests_at_most(&siblings, MAX_NESTING));
-        // `simple_asn1` does not decode the content of an OCTET STRING.
-        let in_octet_string = [&[0x04, 34], nested(SEQUENCE, MAX_NESTING + 1).as_slice()].concat();
-        assert!(nests_at_most(&in_octet_string, MAX_NESTING));
-    }
-
-    #[test]
-    fn test_der_nested_deeper_than_the_limit_is_refused() {
-        // A SEQUENCE, a SET, a SEQUENCE and a SET without the constructed bit, which `simple_asn1` decodes alike, and `[0] EXPLICIT`.
-        for tag in [SEQUENCE, 0x31, 0x10, 0x11, VERSION] {
-            assert!(
-                !nests_at_most(&nested(tag, MAX_NESTING + 1), MAX_NESTING),
-                "{tag:#x}"
-            );
-        }
-        let deep_second = [nested(SEQUENCE, 1), nested(SEQUENCE, MAX_NESTING + 1)].concat();
-        assert!(!nests_at_most(&deep_second, MAX_NESTING));
-    }
-
-    #[test]
-    fn test_der_that_cannot_be_split_is_refused() {
-        // A length past the end, an indefinite length, and a tag number above 30.
+    fn test_der_that_cannot_be_read_is_refused() {
+        // A length past the end, an indefinite length, a length not in its shortest form, and a tag number above 30.
         for der in [
             &[0x30, 0x01][..],
             &[0x30, 0x80, 0x00, 0x00],
+            &[0x30, 0x81, 0x00],
             &[0x1f, 0x22, 0x00],
         ] {
-            assert!(!nests_at_most(der, MAX_NESTING), "{der:02x?}");
+            assert!(certificate_public_key(der).is_none(), "{der:02x?}");
         }
     }
 
-    /// A DER element with the tag and content, its length in short or long form.
-    fn element(tag: u8, content: &[u8]) -> Vec<u8> {
-        let length = content.len();
-        let header = if length < 0x80 {
-            vec![tag, u8::try_from(length).unwrap()]
-        } else {
-            let bytes: Vec<u8> = length
-                .to_be_bytes()
-                .into_iter()
-                .skip_while(|&byte| byte == 0)
-                .collect();
-            [
-                &[tag, 0x80 | u8::try_from(bytes.len()).unwrap()][..],
-                &bytes,
-            ]
-            .concat()
-        };
-        [header.as_slice(), content].concat()
+    /// A DER element with the tag and content.
+    fn element(tag: Tag, content: &[u8]) -> Vec<u8> {
+        AnyRef::new(tag, content).unwrap().to_der().unwrap()
     }
 
     /// The P-256 test certificate in parts: the encoded fields of its tbsCertificate, and its encoded signatureAlgorithm and signatureValue.
@@ -917,22 +837,26 @@ mod tests {
             "../tests/fixtures/jwt/certificate-ec-p256.pem"
         ))
         .unwrap();
-        let (certificate, _) = split_element(pem.contents()).unwrap();
-        let (to_be_signed, signature) = split_element(certificate.content).unwrap();
-        let mut fields = Vec::new();
-        let mut rest = to_be_signed.content;
-        while !rest.is_empty() {
-            let (field, after) = split_element(rest).unwrap();
-            fields.push(field.encoded.to_vec());
-            rest = after;
-        }
-        (fields, signature.to_vec())
+        let mut reader = SliceReader::new(pem.contents()).unwrap();
+        reader
+            .sequence(|certificate| {
+                let fields = certificate.sequence(|to_be_signed| {
+                    let mut fields = Vec::new();
+                    while !to_be_signed.is_finished() {
+                        fields.push(to_be_signed.tlv_bytes()?.to_vec());
+                    }
+                    Ok::<_, der::Error>(fields)
+                })?;
+                let signature = certificate.read_slice(certificate.remaining_len())?;
+                Ok::<_, der::Error>((fields, signature.to_vec()))
+            })
+            .unwrap()
     }
 
     fn certificate(fields: &[Vec<u8>], signature: &[u8]) -> Vec<u8> {
         element(
-            SEQUENCE,
-            &[element(SEQUENCE, &fields.concat()), signature.to_vec()].concat(),
+            Tag::Sequence,
+            &[element(Tag::Sequence, &fields.concat()), signature.to_vec()].concat(),
         )
     }
 
@@ -945,12 +869,16 @@ mod tests {
     #[test]
     fn test_a_certificate_missing_or_adding_a_part_is_refused() {
         let (fields, signature) = certificate_parts();
-        let (signature_algorithm, _) = split_element(&signature).unwrap();
+        let signature_algorithm = SliceReader::new(&signature)
+            .unwrap()
+            .tlv_bytes()
+            .unwrap()
+            .to_vec();
         // Only the tbsCertificate, no signatureValue, and an element after the signatureValue.
         for signature in [
             Vec::new(),
-            signature_algorithm.encoded.to_vec(),
-            [signature.clone(), element(0x05, &[])].concat(),
+            signature_algorithm,
+            [signature.clone(), element(Tag::Null, &[])].concat(),
         ] {
             assert!(certificate_public_key(&certificate(&fields, &signature)).is_none());
         }
@@ -959,8 +887,8 @@ mod tests {
     #[test]
     fn test_a_certificate_with_a_field_of_the_wrong_type_is_refused() {
         let (fields, signature) = certificate_parts();
-        let null = element(0x05, &[]);
-        let first = usize::from(fields[0][0] == VERSION);
+        let null = element(Tag::Null, &[]);
+        let first = usize::from(AnyRef::from_der(&fields[0]).unwrap().tag() == VERSION);
         // serialNumber, signature, issuer, validity and subject, one at a time.
         for position in first..first + 5 {
             let mut fields = fields.clone();
