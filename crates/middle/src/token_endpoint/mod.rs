@@ -54,13 +54,46 @@ impl fmt::Debug for Secret {
 pub(crate) enum ClientAuth {
     /// HTTP Basic with the client id and secret, each form-urlencoded first (RFC 6749, section 2.3.1).
     SecretBasic { client_id: String, secret: Secret },
+    /// The client id and secret as the form parameters `client_id` and `client_secret` (RFC 6749, section 2.3.1; OAuth 2.1 draft, section 2.4.1).
+    SecretPost { client_id: String, secret: Secret },
 }
 
 impl ClientAuth {
     fn client_id(&self) -> &str {
         match self {
-            Self::SecretBasic { client_id, .. } => client_id,
+            Self::SecretBasic { client_id, .. } | Self::SecretPost { client_id, .. } => client_id,
         }
+    }
+}
+
+/// Checks the token URL: `https`, or `http` with a loopback host or `allow_http`; no fragment (RFC 6749, section 3.2) and no user name or password.
+fn check_token_url(url: &Url, allow_http: bool) -> Result<(), ConfigError> {
+    match url.scheme() {
+        "https" => {}
+        "http" if allow_http || is_loopback(url) => {}
+        "http" => {
+            return Err(ConfigError::HttpTokenUrl(
+                url.host_str().unwrap_or_default().to_string(),
+            ));
+        }
+        scheme => return Err(ConfigError::TokenUrlScheme(scheme.to_string())),
+    }
+    if url.fragment().is_some() {
+        return Err(ConfigError::TokenUrlWithFragment);
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ConfigError::TokenUrlWithUserInfo);
+    }
+    Ok(())
+}
+
+/// Whether the host of the URL is `localhost` or a loopback address: `127.0.0.0/8` or `::1`. The url crate writes domains in lower case.
+fn is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain == "localhost",
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
     }
 }
 
@@ -92,22 +125,15 @@ pub(crate) struct TokenRequest {
 }
 
 impl TokenRequest {
-    /// Checks the token URL, the scopes and the extra form parameters.
+    /// Checks the token URL, the scopes and the extra form parameters. `allow_http` allows an `http` token URL with any host.
     pub(crate) fn new(
         url: Url,
         client_auth: ClientAuth,
         scopes: &[String],
         params: impl IntoIterator<Item = (String, String)>,
+        allow_http: bool,
     ) -> Result<Self, ConfigError> {
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(ConfigError::TokenUrlScheme(url.scheme().to_string()));
-        }
-        if url.fragment().is_some() {
-            return Err(ConfigError::TokenUrlWithFragment);
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(ConfigError::TokenUrlWithUserInfo);
-        }
+        check_token_url(&url, allow_http)?;
         let scopes = scopes
             .iter()
             .map(|scope| Scope::new(scope))
@@ -136,10 +162,14 @@ impl TokenRequest {
         self.client_auth.client_id()
     }
 
-    /// The form body: `grant_type`, `scope`, then the extra parameters.
+    /// The form body: `grant_type`, the client credentials for `client_secret_post`, `scope`, then the extra parameters.
     fn form(&self) -> String {
         let mut form = url::form_urlencoded::Serializer::new(String::new());
         form.append_pair("grant_type", "client_credentials");
+        if let ClientAuth::SecretPost { client_id, secret } = &self.client_auth {
+            form.append_pair("client_id", client_id);
+            form.append_pair("client_secret", secret.expose());
+        }
         if !self.scopes.is_empty() {
             let scopes: Vec<&str> = self.scopes.iter().map(|scope| scope.0.as_str()).collect();
             form.append_pair("scope", &scopes.join(" "));
@@ -184,6 +214,8 @@ pub(crate) async fn request_token(
                 Some(form_urlencode(secret.expose())),
             );
         }
+        // The credentials are in the form body.
+        ClientAuth::SecretPost { .. } => {}
     }
     let response = builder
         .send()
@@ -272,7 +304,46 @@ mod tests {
             params
                 .iter()
                 .map(|(name, value)| ((*name).to_string(), (*value).to_string())),
+            false,
         )
+    }
+
+    fn check_url(url: &str, allow_http: bool) -> Result<(), ConfigError> {
+        check_token_url(&url.parse().unwrap(), allow_http)
+    }
+
+    #[test]
+    fn test_http_is_allowed_for_loopback_hosts() {
+        for url in [
+            "http://localhost/token",
+            "http://LOCALHOST:8080/token",
+            "http://127.0.0.1/token",
+            "http://127.255.0.9/token",
+            "http://[::1]:8080/token",
+            "https://idp.example.com/token",
+        ] {
+            assert!(check_url(url, false).is_ok(), "{url}");
+        }
+    }
+
+    #[test]
+    fn test_http_with_another_host_needs_danger_allow_http() {
+        for (url, host) in [
+            ("http://idp.example.com/token", "idp.example.com"),
+            (
+                "http://localhost.example.com/token",
+                "localhost.example.com",
+            ),
+            ("http://10.0.0.1/token", "10.0.0.1"),
+            ("http://0.0.0.0/token", "0.0.0.0"),
+            ("http://[::2]/token", "[::2]"),
+        ] {
+            assert!(
+                matches!(check_url(url, false), Err(ConfigError::HttpTokenUrl(h)) if h == host),
+                "{url}"
+            );
+            assert!(check_url(url, true).is_ok(), "{url}");
+        }
     }
 
     #[test]

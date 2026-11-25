@@ -9,11 +9,10 @@ use middle::{Authorizer as _, Error, ErrorCode, ResponseProblem};
 use serde_json::json;
 use support::{FakeIdp, Reply};
 
-fn builder(token_url: url::Url) -> middle::BasicClientCredentialAuthorizerBuilder {
-    middle::BasicClientCredentialAuthorizer::basic_builder(
-        "my-client",
-        "SECRET-CLIENT-SECRET",
+fn builder(token_url: url::Url) -> middle::ClientCredentialAuthorizerBuilder {
+    middle::ClientCredentialAuthorizer::builder(
         token_url,
+        middle::ClientAuthentication::client_secret_basic("my-client", "SECRET-CLIENT-SECRET"),
     )
 }
 
@@ -40,7 +39,7 @@ async fn eventually(mut condition: impl FnMut() -> bool) -> bool {
     condition()
 }
 
-fn header(authorizer: &middle::BasicClientCredentialAuthorizer) -> Option<String> {
+fn header(authorizer: &middle::ClientCredentialAuthorizer) -> Option<String> {
     authorizer
         .authorization_header()
         .ok()

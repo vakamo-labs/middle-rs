@@ -13,11 +13,10 @@ use std::{
 use middle::{Authorizer as _, ConfigError, Error};
 use support::{FakeIdp, Reply, wait_until};
 
-fn builder(token_url: url::Url) -> middle::BasicClientCredentialAuthorizerBuilder {
-    middle::BasicClientCredentialAuthorizer::basic_builder(
-        "my-client",
-        "SECRET-CLIENT-SECRET",
+fn builder(token_url: url::Url) -> middle::ClientCredentialAuthorizerBuilder {
+    middle::ClientCredentialAuthorizer::builder(
         token_url,
+        middle::ClientAuthentication::client_secret_basic("my-client", "SECRET-CLIENT-SECRET"),
     )
 }
 
