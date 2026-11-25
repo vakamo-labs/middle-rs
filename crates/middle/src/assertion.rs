@@ -1,4 +1,4 @@
-//! Assertions for JWT client authentication (RFC 7523, section 2.2; RFC 7521, section 4.2).
+//! Assertions for JWT client authentication and the JWT bearer grant (RFC 7523, sections 2.1 and 2.2; RFC 7521).
 
 use std::fmt;
 #[cfg(feature = "client-credentials")]
@@ -8,6 +8,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(feature = "client-credentials")]
@@ -80,7 +81,8 @@ fn is_compact_jws(jwt: &str) -> bool {
 }
 
 /// An assertion as middle sends it to the token endpoint, such as a signed or an encrypted JWT (RFC 7523).
-/// middle sends it with the `client_assertion_type` `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`. `Debug` never shows it.
+/// middle sends it as the `assertion` of the JWT bearer grant, or as a `client_assertion` with the `client_assertion_type`
+/// `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`. `Debug` never shows it.
 #[cfg(feature = "client-credentials")]
 #[derive(Clone)]
 pub struct Assertion(String);
@@ -135,7 +137,7 @@ impl fmt::Debug for Assertion {
 pub type AssertionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Assertion, AssertionError>> + Send + 'a>>;
 
-/// Supplies the assertion for JWT client authentication, see [`crate::ClientAuthentication::client_assertion`].
+/// Supplies the assertion for the JWT bearer grant ([`crate::Authorizer::jwt_bearer`]) or for JWT client authentication ([`crate::ClientAuthentication::client_assertion`]).
 ///
 /// Sources are, for example, a [`FileAssertion`] for a Kubernetes service account token, a `jwt::JwtAssertion` (feature `jwt`) that middle signs, or a key management service that signs.
 /// `Arc<S>` and `Box<S>` are sources too, so one source can serve several authorizers.
@@ -221,6 +223,9 @@ impl fmt::Debug for AssertionContext {
 /// A signed JWT that is read from a file for every token request, such as a Kubernetes service account token in a projected volume.
 ///
 /// Whitespace at the start and the end of the file is ignored. The file may hold at most 64 KiB, and it must be a regular file or a link to one.
+///
+/// If the payload of the JWT has an `exp` (RFC 7519, section 4.1.4) that has passed, middle does not send it. The token request then fails with an [`AssertionError`]
+/// that names the file, and middle retries the request. When the file holds a new JWT, the next retry sends it.
 #[cfg(feature = "client-credentials")]
 #[derive(Debug, Clone)]
 pub struct FileAssertion {
@@ -302,14 +307,29 @@ fn read_assertion(path: &Path) -> Result<Assertion, AssertionError> {
             path.display()
         )));
     }
-    std::str::from_utf8(content.trim_ascii())
+    let jwt = std::str::from_utf8(content.trim_ascii())
         .ok()
         .and_then(|jwt| SignedJwt::new(jwt).ok())
-        .map(Assertion::from)
         .ok_or_else(|| {
             AssertionError::new(format!(
                 "the assertion file `{}` {NOT_A_SIGNED_JWT}",
                 path.display()
             ))
-        })
+        })?;
+    if let Some(exp) = crate::cache::jwt_exp(jwt.as_str()).filter(|exp| has_passed(*exp)) {
+        return Err(AssertionError::new(format!(
+            "the JWT in the assertion file `{}` has expired: its `exp` is {exp}",
+            path.display()
+        )));
+    }
+    Ok(Assertion::from(jwt))
+}
+
+/// Whether the time `exp`, in seconds since 1970, has come (RFC 7519, section 4.1.4).
+#[cfg(feature = "client-credentials")]
+fn has_passed(exp: f64) -> bool {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |now| now.as_secs_f64());
+    now >= exp
 }

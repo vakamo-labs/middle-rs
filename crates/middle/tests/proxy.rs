@@ -4,7 +4,7 @@
 
 mod support;
 
-use middle::{ClientAuthentication, ClientCredentialAuthorizer};
+use middle::{Authorizer, ClientAuthentication};
 use support::{FakeIdp, Reply};
 
 #[tokio::test]
@@ -20,7 +20,7 @@ async fn test_a_loopback_token_url_bypasses_the_proxy() {
         std::env::remove_var("no_proxy");
     }
     let builder = |token_url: url::Url| {
-        ClientCredentialAuthorizer::builder(
+        Authorizer::client_credentials(
             token_url,
             ClientAuthentication::client_secret_basic("c", "s"),
         )

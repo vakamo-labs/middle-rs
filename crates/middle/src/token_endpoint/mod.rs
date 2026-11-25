@@ -55,6 +55,18 @@ impl fmt::Debug for Secret {
 /// The `client_assertion_type` of a JWT client assertion (RFC 7523, section 2.2).
 const JWT_BEARER_CLIENT_ASSERTION: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 
+/// The `grant_type` of the JWT bearer grant (RFC 7523, section 2.1).
+const JWT_BEARER_GRANT: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
+
+/// The grant of a token request.
+#[derive(Clone, Debug)]
+pub(crate) enum Grant {
+    /// The client credentials grant (RFC 6749, section 4.4).
+    ClientCredentials,
+    /// The JWT bearer grant (RFC 7523, section 2.1): an assertion from the source is the grant.
+    JwtBearer(Arc<dyn AssertionSource>),
+}
+
 /// How the client authenticates at the token endpoint.
 #[derive(Clone, Debug)]
 pub(crate) enum ClientAuth {
@@ -129,20 +141,42 @@ impl Scope {
     }
 }
 
-/// A checked client-credentials token request, sent again for every token.
+/// A checked token request, sent again for every token.
 #[derive(Clone)]
 pub(crate) struct TokenRequest {
     url: Url,
-    client_auth: ClientAuth,
+    grant: Grant,
+    client_auth: Option<ClientAuth>,
     scopes: Vec<Scope>,
     params: Vec<(String, String)>,
+}
+
+/// The grant parameters of one request, with a new assertion for [`Grant::JwtBearer`].
+enum GrantForm {
+    ClientCredentials,
+    JwtBearer(Assertion),
+}
+
+/// The client credentials in the form body of one request, with a new assertion for [`ClientAuth::Assertion`].
+enum ClientForm<'a> {
+    /// No client authentication, or the client credentials are in the `Authorization` header.
+    None,
+    Secret {
+        client_id: &'a str,
+        secret: &'a Secret,
+    },
+    Assertion {
+        client_id: Option<&'a str>,
+        assertion: Assertion,
+    },
 }
 
 impl TokenRequest {
     /// Checks the token URL, the scopes and the extra form parameters. `allow_http` allows an `http` token URL with any host.
     pub(crate) fn new(
         url: Url,
-        client_auth: ClientAuth,
+        grant: Grant,
+        client_auth: Option<ClientAuth>,
         scopes: &[String],
         params: impl IntoIterator<Item = (String, String)>,
         allow_http: bool,
@@ -166,14 +200,19 @@ impl TokenRequest {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             url,
+            grant,
             client_auth,
             scopes,
             params,
         })
     }
 
-    pub(crate) fn client_id(&self) -> &str {
-        self.client_auth.client_id()
+    /// Names the client in log messages: the client id, or the token URL without user name, password and query if the client does not authenticate.
+    pub(crate) fn log_name(&self) -> String {
+        self.client_auth.as_ref().map_or_else(
+            || redacted_url(&self.url).to_string(),
+            |client_auth| client_auth.client_id().to_string(),
+        )
     }
 
     /// Whether the host of the token URL is `localhost` or a loopback address.
@@ -181,44 +220,60 @@ impl TokenRequest {
         is_loopback(&self.url)
     }
 
-    /// The form body, with a new assertion for [`ClientAuth::Assertion`].
+    /// The form body, with a new assertion for the JWT bearer grant and for a client assertion.
     async fn form(&self) -> Result<String, AssertionError> {
-        let assertion = match &self.client_auth {
-            ClientAuth::Assertion {
-                client_id, source, ..
-            } => {
-                let context = AssertionContext::new(self.url.clone()).with_client_id(client_id);
-                Some(source.assertion(&context).await?)
-            }
-            ClientAuth::SecretBasic { .. } | ClientAuth::SecretPost { .. } => None,
+        let mut context = AssertionContext::new(self.url.clone());
+        if let Some(client_auth) = &self.client_auth {
+            context = context.with_client_id(client_auth.client_id());
+        }
+        let grant = match &self.grant {
+            Grant::ClientCredentials => GrantForm::ClientCredentials,
+            Grant::JwtBearer(source) => GrantForm::JwtBearer(source.assertion(&context).await?),
         };
-        Ok(self.encode_form(assertion.as_ref()))
+        let client = match &self.client_auth {
+            None | Some(ClientAuth::SecretBasic { .. }) => ClientForm::None,
+            Some(ClientAuth::SecretPost { client_id, secret }) => {
+                ClientForm::Secret { client_id, secret }
+            }
+            Some(ClientAuth::Assertion {
+                client_id,
+                source,
+                send_client_id,
+            }) => ClientForm::Assertion {
+                client_id: send_client_id.then_some(client_id.as_str()),
+                assertion: source.assertion(&context).await?,
+            },
+        };
+        Ok(self.encode_form(&grant, &client))
     }
 
-    /// The form body: `grant_type`, the client credentials in the body, `scope`, then the extra parameters.
-    /// `assertion` is the client assertion for [`ClientAuth::Assertion`].
-    fn encode_form(&self, assertion: Option<&Assertion>) -> String {
+    /// The form body: the grant, the client credentials in the body, `scope`, then the extra parameters.
+    fn encode_form(&self, grant: &GrantForm, client: &ClientForm<'_>) -> String {
         let mut form = url::form_urlencoded::Serializer::new(String::new());
-        form.append_pair("grant_type", "client_credentials");
-        match &self.client_auth {
-            // The credentials are in the `Authorization` header.
-            ClientAuth::SecretBasic { .. } => {}
-            ClientAuth::SecretPost { client_id, secret } => {
+        match grant {
+            GrantForm::ClientCredentials => {
+                form.append_pair("grant_type", "client_credentials");
+            }
+            GrantForm::JwtBearer(assertion) => {
+                form.append_pair("grant_type", JWT_BEARER_GRANT);
+                form.append_pair("assertion", assertion.as_str());
+            }
+        }
+        match client {
+            ClientForm::None => {}
+            ClientForm::Secret { client_id, secret } => {
                 form.append_pair("client_id", client_id);
                 form.append_pair("client_secret", secret.expose());
             }
-            ClientAuth::Assertion {
+            ClientForm::Assertion {
                 client_id,
-                send_client_id,
-                ..
+                assertion,
             } => {
-                if *send_client_id {
+                if let Some(client_id) = client_id {
                     form.append_pair("client_id", client_id);
                 }
                 form.append_pair("client_assertion_type", JWT_BEARER_CLIENT_ASSERTION);
-                if let Some(assertion) = assertion {
-                    form.append_pair("client_assertion", assertion.as_str());
-                }
+                form.append_pair("client_assertion", assertion.as_str());
             }
         }
         if !self.scopes.is_empty() {
@@ -237,6 +292,7 @@ impl fmt::Debug for TokenRequest {
         let param_names: Vec<&str> = self.params.iter().map(|(name, _)| name.as_str()).collect();
         f.debug_struct("TokenRequest")
             .field("url", &redacted_url(&self.url).as_str())
+            .field("grant", &self.grant)
             .field("client_auth", &self.client_auth)
             .field("scopes", &self.scopes)
             .field("param_names", &param_names)
@@ -244,7 +300,7 @@ impl fmt::Debug for TokenRequest {
     }
 }
 
-/// Asks the token endpoint for a token once, with a new client assertion if the client authenticates with one. The caller bounds the request with a timeout.
+/// Asks the token endpoint for a token once, with new assertions for the JWT bearer grant and for a client assertion. The caller bounds the request with a timeout.
 pub(crate) async fn request_token(
     http_client: &reqwest::Client,
     request: &TokenRequest,
@@ -257,16 +313,12 @@ pub(crate) async fn request_token(
             HeaderValue::from_static("application/x-www-form-urlencoded"),
         )
         .body(request.form().await?);
-    match &request.client_auth {
-        ClientAuth::SecretBasic { client_id, secret } => {
-            // reqwest Base64-encodes `id:secret` and marks the header sensitive.
-            builder = builder.basic_auth(
-                form_urlencode(client_id),
-                Some(form_urlencode(secret.expose())),
-            );
-        }
-        // The credentials are in the form body.
-        ClientAuth::SecretPost { .. } | ClientAuth::Assertion { .. } => {}
+    if let Some(ClientAuth::SecretBasic { client_id, secret }) = &request.client_auth {
+        // reqwest Base64-encodes `id:secret` and marks the header sensitive.
+        builder = builder.basic_auth(
+            form_urlencode(client_id),
+            Some(form_urlencode(secret.expose())),
+        );
     }
     let response = builder
         .send()
@@ -347,16 +399,39 @@ mod tests {
     fn request(scopes: &[&str], params: &[(&str, &str)]) -> Result<TokenRequest, ConfigError> {
         TokenRequest::new(
             "https://idp.example.com/token".parse().unwrap(),
-            ClientAuth::SecretBasic {
+            Grant::ClientCredentials,
+            Some(ClientAuth::SecretBasic {
                 client_id: "c".to_string(),
                 secret: Secret::new("s"),
-            },
+            }),
             &scopes.iter().map(ToString::to_string).collect::<Vec<_>>(),
             params
                 .iter()
                 .map(|(name, value)| ((*name).to_string(), (*value).to_string())),
             false,
         )
+    }
+
+    #[test]
+    fn test_the_log_name_is_the_client_id_or_the_token_url_without_its_query() {
+        let url: Url = "https://idp.example.com/token?key=SECRET".parse().unwrap();
+        let without_client =
+            TokenRequest::new(url.clone(), Grant::ClientCredentials, None, &[], [], false).unwrap();
+        let with_client = TokenRequest::new(
+            url,
+            Grant::ClientCredentials,
+            Some(ClientAuth::SecretBasic {
+                client_id: "my-client".to_string(),
+                secret: Secret::new("s"),
+            }),
+            &[],
+            [],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(without_client.log_name(), "https://idp.example.com/token");
+        assert_eq!(with_client.log_name(), "my-client");
     }
 
     fn check_url(url: &str, allow_http: bool) -> Result<(), ConfigError> {
@@ -419,7 +494,9 @@ mod tests {
     #[test]
     fn test_a_request_without_scopes_sends_no_scope() {
         assert_eq!(
-            request(&[], &[]).unwrap().encode_form(None),
+            request(&[], &[])
+                .unwrap()
+                .encode_form(&GrantForm::ClientCredentials, &ClientForm::None),
             "grant_type=client_credentials"
         );
     }
@@ -429,7 +506,7 @@ mod tests {
         assert_eq!(
             request(&["a", "b:c", "https://api.example.com/.default"], &[])
                 .unwrap()
-                .encode_form(None),
+                .encode_form(&GrantForm::ClientCredentials, &ClientForm::None),
             "grant_type=client_credentials&scope=a+b%3Ac+https%3A%2F%2Fapi.example.com%2F.default"
         );
     }
@@ -439,7 +516,7 @@ mod tests {
         assert_eq!(
             request(&[], &[("resource", "a"), ("resource", "b")])
                 .unwrap()
-                .encode_form(None),
+                .encode_form(&GrantForm::ClientCredentials, &ClientForm::None),
             "grant_type=client_credentials&resource=a&resource=b"
         );
     }

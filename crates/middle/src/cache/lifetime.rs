@@ -46,7 +46,7 @@ pub(super) fn lifetime(
 /// The `exp` claim of a JWT in seconds since 1970, read without checking the signature.
 /// `None` if the token is not a JWS with a numeric `exp`: three base64url parts, a header that is a JSON object with `alg` (RFC 7515, sections 4.1.1 and 7.1),
 /// and a signature that is empty only for `alg` `none` (RFC 7519, section 6.1).
-fn jwt_exp(token: &str) -> Option<f64> {
+pub(crate) fn jwt_exp(token: &str) -> Option<f64> {
     let mut parts = token.split('.');
     let (Some(header), Some(payload), Some(signature), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())

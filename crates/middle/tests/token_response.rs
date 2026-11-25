@@ -5,12 +5,12 @@ mod support;
 use std::{error::Error as _, time::Duration};
 
 use http::StatusCode;
-use middle::{Authorizer as _, Error, ErrorCode, ResponseProblem};
+use middle::{Error, ErrorCode, ResponseProblem};
 use serde_json::json;
 use support::{FakeIdp, Reply};
 
-fn builder(token_url: url::Url) -> middle::ClientCredentialAuthorizerBuilder {
-    middle::ClientCredentialAuthorizer::builder(
+fn builder(token_url: url::Url) -> middle::AuthorizerBuilder {
+    middle::Authorizer::client_credentials(
         token_url,
         middle::ClientAuthentication::client_secret_basic("my-client", "SECRET-CLIENT-SECRET"),
     )
@@ -20,7 +20,7 @@ fn builder(token_url: url::Url) -> middle::ClientCredentialAuthorizerBuilder {
 async fn build_error(reply: Reply, max_retries: u32) -> (Error, usize) {
     let idp = FakeIdp::start(move |_| reply.clone()).await;
     let error = builder(idp.token_url())
-        .set_max_retries(max_retries)
+        .max_retries(max_retries)
         .build()
         .await
         .expect_err("build must fail");
@@ -39,7 +39,7 @@ async fn eventually(mut condition: impl FnMut() -> bool) -> bool {
     condition()
 }
 
-fn header(authorizer: &middle::ClientCredentialAuthorizer) -> Option<String> {
+fn header(authorizer: &middle::Authorizer) -> Option<String> {
     authorizer
         .authorization_header()
         .ok()
@@ -182,7 +182,7 @@ async fn test_a_proxy_error_page_keeps_the_status_and_is_retried() {
     let idp = FakeIdp::start(move |_| reply.clone()).await;
 
     let error = builder(idp.token_url())
-        .set_max_retries(1)
+        .max_retries(1)
         .build()
         .await
         .expect_err("build must fail");
@@ -262,7 +262,10 @@ async fn test_expires_in_may_be_a_string_of_digits() {
 
     let authorizer = builder(idp.token_url()).build().await.unwrap();
 
-    assert!(authorizer.refresh_task().is_some());
+    assert_eq!(
+        authorizer.authorization_header().unwrap().to_str().unwrap(),
+        "Bearer t"
+    );
 }
 
 #[tokio::test]
@@ -455,7 +458,7 @@ async fn test_a_token_request_without_an_answer_times_out() {
         Duration::from_secs(5),
         builder(idp.token_url())
             .timeout(Duration::from_millis(200))
-            .set_max_retries(0)
+            .max_retries(0)
             .build(),
     )
     .await
@@ -476,7 +479,7 @@ async fn test_a_refresh_without_an_answer_does_not_stop_refreshing() {
     .await;
     let authorizer = builder(idp.token_url())
         .timeout(Duration::from_millis(200))
-        .set_max_retries(0)
+        .max_retries(0)
         .refresh_tolerance(Duration::from_secs(1))
         .build()
         .await
@@ -506,7 +509,7 @@ async fn test_a_connection_error_keeps_its_cause() {
     let token_url = format!("http://127.0.0.1:{port}/token").parse().unwrap();
 
     let error = builder(token_url)
-        .set_max_retries(0)
+        .max_retries(0)
         .build()
         .await
         .expect_err("nothing listens on the port");
@@ -532,7 +535,7 @@ async fn test_a_transport_error_does_not_show_the_query_of_the_token_url() {
         .unwrap();
 
     let error = builder(token_url)
-        .set_max_retries(0)
+        .max_retries(0)
         .build()
         .await
         .expect_err("nothing listens on the port");
@@ -558,7 +561,7 @@ async fn test_redirects_are_not_followed() {
     .await;
 
     let error = builder(idp.token_url())
-        .set_max_retries(0)
+        .max_retries(0)
         .build()
         .await
         .expect_err("a redirect is not a token");
@@ -581,8 +584,8 @@ async fn test_a_redirect_followed_by_the_callers_client_is_refused() {
     .await;
 
     let error = builder(idp.token_url())
-        .set_http_client(reqwest::Client::new())
-        .set_max_retries(0)
+        .danger_http_client(reqwest::Client::new())
+        .max_retries(0)
         .build()
         .await
         .expect_err("a token from another URL is refused");
@@ -605,8 +608,8 @@ async fn test_a_redirect_loop_of_the_callers_client_is_not_retried() {
     .await;
 
     let error = builder(idp.token_url())
-        .set_http_client(reqwest::Client::new())
-        .set_max_retries(3)
+        .danger_http_client(reqwest::Client::new())
+        .max_retries(3)
         .build()
         .await
         .expect_err("a redirect loop fails");

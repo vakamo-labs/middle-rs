@@ -2,15 +2,12 @@
 
 mod support;
 
-use middle::{
-    Authorizer as _, ClientAuthentication, ClientCredentialAuthorizer,
-    ClientCredentialAuthorizerBuilder, ConfigError, Error,
-};
+use middle::{Authorizer, AuthorizerBuilder, ClientAuthentication, ConfigError, Error};
 use support::{FakeIdp, Reply};
 
 /// A builder with `client_secret_basic`.
-fn builder(token_url: url::Url) -> ClientCredentialAuthorizerBuilder {
-    ClientCredentialAuthorizer::builder(
+fn builder(token_url: url::Url) -> AuthorizerBuilder {
+    Authorizer::client_credentials(
         token_url,
         ClientAuthentication::client_secret_basic("c", "s"),
     )
@@ -21,7 +18,7 @@ fn builder(token_url: url::Url) -> ClientCredentialAuthorizerBuilder {
 async fn test_client_credentials_with_basic_authentication() {
     let idp = FakeIdp::start(|_| Reply::token("issued-token", Some(3600))).await;
 
-    let authorizer = ClientCredentialAuthorizer::builder(
+    let authorizer = Authorizer::client_credentials(
         idp.token_url(),
         ClientAuthentication::client_secret_basic("my client", "s3cr3t/+~:"),
     )
@@ -61,7 +58,7 @@ async fn test_client_credentials_with_basic_authentication() {
 async fn test_client_credentials_with_post_authentication() {
     let idp = FakeIdp::start(|_| Reply::token("issued-token", Some(3600))).await;
 
-    ClientCredentialAuthorizer::builder(
+    Authorizer::client_credentials(
         idp.token_url(),
         ClientAuthentication::client_secret_post("my client", "s3cr3t/+~:"),
     )
@@ -230,7 +227,7 @@ async fn test_danger_allow_http_allows_an_http_token_url_with_any_host() {
         .unwrap();
     let host = format!("idp.example.com:{}", address.port());
     let builder =
-        builder(format!("http://{host}/token").parse().unwrap()).set_http_client(http_client);
+        builder(format!("http://{host}/token").parse().unwrap()).danger_http_client(http_client);
 
     let error = builder
         .clone()
@@ -255,16 +252,27 @@ async fn test_debug_output_hides_secrets() {
     let mut token_url = idp.token_url();
     token_url.set_query(Some("key=SECRET-QUERY"));
     for builder in [
-        ClientCredentialAuthorizer::builder(
+        Authorizer::client_credentials(
             token_url.clone(),
             ClientAuthentication::client_secret_basic("my-client", "SECRET-CLIENT-SECRET"),
         ),
-        ClientCredentialAuthorizer::builder(
+        Authorizer::client_credentials(
             token_url.clone(),
             ClientAuthentication::client_secret_post("my-client", "SECRET-CLIENT-SECRET"),
         ),
     ] {
-        let builder = builder.append_param("audience", "SECRET-PARAMETER-VALUE");
+        // A custom client whose default header holds a secret.
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-api-key", "SECRET-HEADER".parse().unwrap());
+        let http_client = reqwest::Client::builder()
+            .default_headers(headers)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .unwrap();
+        let builder = builder
+            .append_param("audience", "SECRET-PARAMETER-VALUE")
+            .danger_http_client(http_client);
 
         let builder_debug = format!("{builder:?}");
         let authorizer = builder.build().await.unwrap();

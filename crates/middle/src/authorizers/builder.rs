@@ -9,16 +9,14 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use http::HeaderValue;
-
-use super::Authorizer;
+use super::{Authorizer, Kind, TokenHeader};
 #[cfg(feature = "jwt")]
 use crate::jwt::{Audience, ClientAuthenticationJwt, SigningAlgorithm, SigningKey};
 use crate::{
     AssertionSource,
-    cache::{BoxFuture, CacheConfig, Token, TokenCache, TokenId, TokenSource},
+    cache::{BoxFuture, CacheConfig, Token, TokenCache, TokenSource},
     error::{ConfigError, Error},
-    token_endpoint::{self, ClientAuth, Secret, TokenRequest, TokenResponse},
+    token_endpoint::{self, ClientAuth, Grant, Secret, TokenRequest, TokenResponse},
 };
 
 /// How long one token request may take, reading the answer included.
@@ -39,68 +37,37 @@ const MIN_DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(2);
 /// How often `build()` retries the first token request.
 const DEFAULT_MAX_RETRIES: u32 = 3;
 
-#[derive(Debug, Clone)]
-/// Authenticate with an `OAuth2` server using client credentials.
-///
-/// [`ClientCredentialAuthorizerBuilder::build`] fetches a token from the token endpoint of the identity provider.
-/// A background task refreshes it at a random point in a window, which [`ClientCredentialAuthorizerBuilder::refresh_tolerance`] describes.
-/// If a refresh fails, the current token stays in use while it is valid, and the task retries with a backoff,
-/// at the latest after half the time the token has left.
-/// If the token endpoint sends no `expires_in`, the token lives until the `exp` of the access token if it is a JWT,
-/// or else for [`ClientCredentialAuthorizerBuilder::default_token_lifetime`].
-///
-/// [`Authorizer::authorization_header`] and [`Self::token_header`] never wait. [`Self::wait_for_header`] waits for a refresh if the token has expired,
-/// and [`Self::invalidate`] drops a token that a server rejected.
-///
-/// A handle to the refresh task is returned by [`ClientCredentialAuthorizer::refresh_task`].
-/// When the last clone of the `ClientCredentialAuthorizer` is dropped, the refresh task is aborted.
-/// If the task ends for another reason, such as its runtime shutting down, the authorizer answers with
-/// [`Error::RefreshStopped`] once the token has expired.
-///
-/// Uses `Arc` internally for cheap cloning.
-///
-/// ## Tonic
-/// If the `tonic` feature is enabled, [`tonic::service::Interceptor`] is implemented for
-/// [`ClientCredentialAuthorizer`]. The interceptor does not insert the access token if the intercepted call
-/// already has an `Authorization` header. The request fails with an `unauthenticated` status if no valid token
-/// is available.
-///
-pub struct ClientCredentialAuthorizer {
-    inner: Arc<Inner>,
-    refresh_task: Option<Arc<RefreshTask>>,
-}
-
-// The authorizer is shared between threads and tasks.
-const _: () = {
-    const fn assert_send_sync_static<T: Send + Sync + 'static>() {}
-    assert_send_sync_static::<ClientCredentialAuthorizer>();
-};
-
-#[derive(Debug)]
-pub struct RefreshTask {
-    #[cfg(feature = "runtime-tokio")]
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl RefreshTask {
-    /// Get a reference to the task.
-    #[cfg(feature = "runtime-tokio")]
+impl Authorizer {
+    /// A builder for the client credentials grant (RFC 6749, section 4.4) at the token endpoint `token_url`, with the client authentication the grant requires.
     #[must_use]
-    pub fn task(&self) -> &tokio::task::JoinHandle<()> {
-        &self.task
+    pub fn client_credentials(
+        token_url: url::Url,
+        client_authentication: ClientAuthentication,
+    ) -> AuthorizerBuilder {
+        AuthorizerBuilder::new(
+            token_url,
+            Grant::ClientCredentials,
+            Some(client_authentication.0),
+        )
+    }
+
+    /// A builder for the JWT bearer grant (RFC 7523, section 2.1) at the token endpoint `token_url`: a JWT from `assertion` is the grant.
+    ///
+    /// middle asks `assertion` for a new JWT for every token request, retries included, such as a `jwt::JwtAssertion` that middle signs or a [`crate::FileAssertion`].
+    /// The grant needs no client authentication. Set one with [`AuthorizerBuilder::client_authentication`] if the authorization server requires it.
+    /// Add parameters such as `resource` (RFC 8707) with [`AuthorizerBuilder::append_param`].
+    #[must_use]
+    pub fn jwt_bearer(token_url: url::Url, assertion: impl AssertionSource) -> AuthorizerBuilder {
+        AuthorizerBuilder::new(token_url, Grant::JwtBearer(Arc::new(assertion)), None)
     }
 }
 
-impl ClientCredentialAuthorizer {
-    /// A builder for the client credentials grant (RFC 6749, section 4.4) at the token endpoint `token_url`, with the client authentication the grant requires.
-    #[must_use]
-    pub fn builder(
-        token_url: url::Url,
-        client_authentication: ClientAuthentication,
-    ) -> ClientCredentialAuthorizerBuilder {
-        ClientCredentialAuthorizerBuilder {
+impl AuthorizerBuilder {
+    fn new(token_url: url::Url, grant: Grant, client_auth: Option<ClientAuth>) -> Self {
+        Self {
             token_url,
-            client_auth: client_authentication.0,
+            grant,
+            client_auth,
             max_retries: None,
             timeout: None,
             http_client: None,
@@ -112,69 +79,56 @@ impl ClientCredentialAuthorizer {
             default_token_lifetime: None,
         }
     }
+}
 
-    #[cfg(feature = "runtime-tokio")]
-    #[must_use]
-    /// Get a reference to the refresh task. `None` if refresh is disabled.
-    pub fn refresh_task(&self) -> Option<&RefreshTask> {
-        self.refresh_task.as_deref()
-    }
+/// A token that middle requests from a token endpoint and refreshes.
+#[derive(Debug, Clone)]
+pub(crate) struct Refreshing {
+    inner: Arc<Inner>,
+}
 
-    /// The header of the valid token, without waiting. Send it, and pass it to [`Self::invalidate`] if the server rejects it.
-    ///
-    /// # Errors
-    ///
-    /// If the token has expired or was invalidated: [`Error::RefreshStopped`] if no refresh task runs, else the error of the last token request,
-    /// else [`Error::TokenExpired`].
-    pub fn token_header(&self) -> Result<TokenHeader, Error> {
+impl Refreshing {
+    pub(crate) fn token_header(&self) -> Result<TokenHeader, Error> {
         self.inner.cache.read(token_header)
     }
 
-    /// The header of a valid token.
-    ///
-    /// If the token has expired or was invalidated, asks the refresh task for a new token and waits for it,
-    /// at most the [`ClientCredentialAuthorizerBuilder::timeout`]. After a failed request or repeated rejections (see [`Self::invalidate`]),
-    /// the refresh task waits before the next request; if that wait ends after the timeout, this method returns at once.
-    ///
-    /// Cancelling the returned future cancels only the wait, never the request for a new token.
-    ///
-    /// # Errors
-    ///
-    /// If no valid token arrives: [`Error::RefreshStopped`] if no refresh task runs, else the error of the last token request,
-    /// else [`Error::TokenExpired`].
-    pub async fn wait_for_header(&self) -> Result<TokenHeader, Error> {
+    pub(crate) async fn wait_for_header(&self) -> Result<TokenHeader, Error> {
         self.inner.cache.wait(token_header).await
     }
 
-    /// Drops the token of `rejected`, for example after a server answered with HTTP 401, and asks the refresh task for a new token.
-    ///
-    /// Does nothing if the authorizer has a newer token already, so concurrent calls for the same rejected token request one new token.
-    /// Does nothing for a header of another authorizer.
-    ///
-    /// The new token is requested 1 s after the rejected one at the earliest. If the server keeps rejecting tokens soon after they arrive,
-    /// for example because of a wrong audience or scope, each further rejection in a row waits longer: 2 s to 4 s after the rejected token was requested,
-    /// then 4 s to 8 s, 8 s to 16 s, and then 15 s to 30 s. While middle waits like this, it logs a warning.
-    /// A rejection counts only while its wait still lies ahead: a token that lasted longer than the wait is replaced at once and starts a new series.
-    /// A token that lasts until its refresh is due ends the series.
-    ///
-    /// The token is dropped for every user of this authorizer and its clones. If one server rejects tokens that another one accepts,
-    /// use one authorizer per server, so that the rejections of one server do not take the token away from the other.
-    pub fn invalidate(&self, rejected: &TokenHeader) {
-        self.inner.cache.invalidate(rejected.token);
+    pub(crate) fn invalidate(&self, rejected: &TokenHeader) -> bool {
+        rejected
+            .token
+            .is_some_and(|token| self.inner.cache.invalidate(token))
+    }
+
+    /// The header as tonic metadata, built with the token, so this only clones it.
+    #[cfg(feature = "tonic")]
+    pub(crate) fn metadata(
+        &self,
+    ) -> Result<tonic::metadata::MetadataValue<tonic::metadata::Ascii>, Error> {
+        self.inner.cache.read(|token| token.metadata().clone())
     }
 }
 
-impl Drop for RefreshTask {
-    fn drop(&mut self) {
-        tracing::debug!("Stopping credential refresh task.");
-        #[cfg(feature = "runtime-tokio")]
-        self.task.abort();
-    }
-}
-
+/// What the clones of an authorizer share.
 struct Inner {
     source: Arc<ClientCredentials>,
     cache: TokenCache,
+    /// The refresh task, `None` if refresh is disabled. Aborted when the last clone of the authorizer is dropped.
+    refresh_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(task) = &self.refresh_task {
+            tracing::debug!(
+                "Stopping the token refresh task of client `{}`",
+                self.source.request.log_name()
+            );
+            task.abort();
+        }
+    }
 }
 
 impl fmt::Debug for Inner {
@@ -182,36 +136,11 @@ impl fmt::Debug for Inner {
         f.debug_struct("Inner")
             .field("request", &self.source.request)
             .field("cache", &self.cache)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
-/// The `Authorization` header of one token, as [`ClientCredentialAuthorizer::token_header`] and [`ClientCredentialAuthorizer::wait_for_header`] return it.
-///
-/// Pass it to [`ClientCredentialAuthorizer::invalidate`] if a server rejects the token.
-#[derive(Clone, veil::Redact)]
-pub struct TokenHeader {
-    #[redact]
-    header: Arc<HeaderValue>,
-    /// The authorizer and the generation of the token.
-    token: TokenId,
-}
-
-impl TokenHeader {
-    /// The header value: `Bearer` and the access token.
-    #[must_use]
-    pub fn header(&self) -> &Arc<HeaderValue> {
-        &self.header
-    }
-
-    /// The header value: `Bearer` and the access token.
-    #[must_use]
-    pub fn into_header(self) -> Arc<HeaderValue> {
-        self.header
-    }
-}
-
-/// The HTTP client for a builder without [`ClientCredentialAuthorizerBuilder::set_http_client`]: no redirects, a connect timeout of 10 s,
+/// The HTTP client for a builder without [`AuthorizerBuilder::danger_http_client`]: no redirects, a connect timeout of 10 s,
 /// and a proxy from the environment, except for a token URL with a loopback host.
 fn default_http_client(request: &TokenRequest) -> Result<reqwest::Client, ConfigError> {
     let builder = reqwest::Client::builder()
@@ -230,8 +159,8 @@ fn default_http_client(request: &TokenRequest) -> Result<reqwest::Client, Config
 
 fn token_header(token: &Token) -> TokenHeader {
     TokenHeader {
-        header: Arc::clone(token.header()),
-        token: token.id(),
+        header: token.header().clone(),
+        token: Some(token.id()),
     }
 }
 
@@ -262,7 +191,7 @@ impl ClientAuthentication {
     ///
     /// The OAuth 2.1 draft (draft-ietf-oauth-v2-1-17, section 2.4.1) requires token endpoints to support it; RFC 6749 (section 2.3.1) makes it optional.
     ///
-    /// The client secret is in the form body. A client set with [`ClientCredentialAuthorizerBuilder::set_http_client`] that follows redirects sends it to the redirect target,
+    /// The client secret is in the form body. A client set with [`AuthorizerBuilder::danger_http_client`] that follows redirects sends it to the redirect target,
     /// also to another host or over `http`.
     #[must_use]
     pub fn client_secret_post(
@@ -347,24 +276,26 @@ impl ClientAuthentication {
     }
 }
 
-/// Builder for [`ClientCredentialAuthorizer`], made with [`ClientCredentialAuthorizer::builder`].
+/// Builder for an [`Authorizer`] with a token from a token endpoint, made with [`Authorizer::client_credentials`] or [`Authorizer::jwt_bearer`].
 ///
-/// The following configurations are available:
-/// * `max_retries`: How often `build()` retries the first token request. Default is 3. Only errors a retry can fix are retried, see [`Error::is_retryable`].
-/// * `timeout`: How long one token request may take, reading the answer included, and how long `build()` may take. Default is 30 seconds.
-/// * `http_client`: Custom `reqwest::Client` to use for token requests. Default is a client with redirects disabled, a connect timeout of 10 seconds, and no proxy for `localhost` and loopback addresses.
-/// * `scopes`: Scopes to request in the token. Empty by default.
-/// * `params`: Further form parameters of the token request, added with [`Self::append_param`]. Empty by default.
-/// * `danger_allow_http`: Whether an `http` token URL may have any host. Default is `false`: `http` works only with `localhost` and loopback addresses.
-/// * `enable_refresh`: Enable automatic token refresh. Default is `true`.
-/// * `refresh_tolerance`: How long before expiry a token is refreshed at the latest. Default is 30 seconds.
-/// * `default_token_lifetime`: The lifetime of a token if the token endpoint does not say. Default is 5 minutes.
+/// The following settings are available:
+/// * [`Self::client_authentication`]: How the client authenticates. The client credentials grant requires it; for the JWT bearer grant it is optional and not set by default.
+/// * [`Self::add_scope`] and [`Self::add_scopes`]: Scopes to request in the token. None by default.
+/// * [`Self::append_param`]: Further form parameters of the token request. None by default.
+/// * [`Self::max_retries`]: How often `build()` retries the first token request. Default is 3. Only errors a retry can fix are retried, see [`Error::is_retryable`].
+/// * [`Self::timeout`]: How long one token request may take, reading the answer included, and how long `build()` may take. Default is 30 seconds.
+/// * [`Self::danger_http_client`]: The `reqwest::Client` for token requests, used as it is. Default is a client with redirects disabled, a connect timeout of 10 seconds, and no proxy for `localhost` and loopback addresses.
+/// * [`Self::danger_allow_http`]: Whether an `http` token URL may have any host. Default is `false`: `http` works only with `localhost` and loopback addresses.
+/// * [`Self::disable_refresh`]: Turns off the refresh task. Refresh is on by default.
+/// * [`Self::refresh_tolerance`]: How long before expiry a token is refreshed at the latest. Default is 30 seconds.
+/// * [`Self::default_token_lifetime`]: The lifetime of a token if the token endpoint does not say. Default is 5 minutes.
 ///
 /// `Debug` shows the names of the parameters, not their values, and never the client secret.
 #[derive(Clone)]
-pub struct ClientCredentialAuthorizerBuilder {
+pub struct AuthorizerBuilder {
     token_url: url::Url,
-    client_auth: ClientAuth,
+    grant: Grant,
+    client_auth: Option<ClientAuth>,
     max_retries: Option<u32>,
     timeout: Option<Duration>,
     http_client: Option<reqwest::Client>,
@@ -376,16 +307,18 @@ pub struct ClientCredentialAuthorizerBuilder {
     default_token_lifetime: Option<Duration>,
 }
 
-impl fmt::Debug for ClientCredentialAuthorizerBuilder {
+impl fmt::Debug for AuthorizerBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let token_url = token_endpoint::redacted_url(&self.token_url);
         let param_names: Vec<&str> = self.params.iter().map(|(name, _)| name.as_str()).collect();
-        f.debug_struct("ClientCredentialAuthorizerBuilder")
+        f.debug_struct("AuthorizerBuilder")
             .field("token_url", &token_url.as_str())
+            .field("grant", &self.grant)
             .field("client_auth", &self.client_auth)
             .field("max_retries", &self.max_retries)
             .field("timeout", &self.timeout)
-            .field("http_client", &self.http_client)
+            // A custom client may carry default headers that hold secrets.
+            .field("http_client", &self.http_client.as_ref().map(|_| "custom"))
             .field("scopes", &self.scopes)
             .field("param_names", &param_names)
             .field("allow_http", &self.allow_http)
@@ -396,12 +329,22 @@ impl fmt::Debug for ClientCredentialAuthorizerBuilder {
     }
 }
 
-impl ClientCredentialAuthorizerBuilder {
-    /// Optionally specify the `reqwest::Client` to use for token requests.
+impl AuthorizerBuilder {
+    /// Sets how the client authenticates at the token endpoint.
     ///
-    /// middle uses the client as it is. If the client follows redirects, which reqwest does by default,
+    /// The client credentials grant requires client authentication, so [`Authorizer::client_credentials`] takes it, and this replaces it.
+    /// For the JWT bearer grant it is optional (RFC 7523, section 2.1): without it, the request carries no client credentials.
+    #[must_use]
+    pub fn client_authentication(mut self, client_authentication: ClientAuthentication) -> Self {
+        self.client_auth = Some(client_authentication.0);
+        self
+    }
+
+    /// Sets the `reqwest::Client` for token requests. middle uses it as it is, so its settings decide where the credentials go.
+    ///
+    /// If the client follows redirects, which reqwest does by default,
     /// a 307 or 308 answer of the token endpoint makes reqwest send the form body again to the URL the answer names, also to another host or over `http`.
-    /// With [`ClientAuthentication::client_secret_post`], that body holds the client secret, and with a client assertion the assertion, which is valid until it expires.
+    /// With [`ClientAuthentication::client_secret_post`], that body holds the client secret, and with the JWT bearer grant or a client assertion the assertion, which is valid until it expires.
     /// reqwest drops the `Authorization` header of
     /// [`ClientAuthentication::client_secret_basic`] when the host, port or scheme changes, and keeps the body.
     /// middle refuses an answer whose final URL is not the token URL, but the other URL has already received the request,
@@ -411,9 +354,9 @@ impl ClientCredentialAuthorizerBuilder {
     /// If not set, middle builds a client with redirects disabled and a connect timeout of 10 seconds.
     /// It uses a proxy from the environment (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY`), except for a token URL with `localhost` or a loopback address.
     ///
-    /// Use this method if you want to set custom headers or timeouts.
+    /// Use it for a client certificate (RFC 8705), for root certificates that the operating system does not have, for extra headers, or for another connect timeout.
     #[must_use]
-    pub fn set_http_client(mut self, client: reqwest::Client) -> Self {
+    pub fn danger_http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = Some(client);
         self
     }
@@ -429,7 +372,7 @@ impl ClientCredentialAuthorizerBuilder {
     /// While the current token is still in use, neither expired nor invalidated, a wait is at most half the time the token has left, but at least 1 s.
     /// A `Retry-After` header of the token endpoint makes a wait longer, up to 5 minutes.
     #[must_use]
-    pub fn set_max_retries(mut self, max_retries: u32) -> Self {
+    pub fn max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = Some(max_retries);
         self
     }
@@ -437,7 +380,7 @@ impl ClientCredentialAuthorizerBuilder {
     /// Optionally set how long one token request may take, reading the answer included.
     /// [`Self::build`] takes at most this long, retries included.
     /// While a token is valid, one refresh request may take at most half of the time the token has left, but at least 1 s.
-    /// This also applies to a client set with [`Self::set_http_client`].
+    /// This also applies to a client set with [`Self::danger_http_client`].
     /// The default is 30 seconds.
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
@@ -473,7 +416,7 @@ impl ClientCredentialAuthorizerBuilder {
     /// RFC 6749 (section 3.2) allows each parameter once, so repeat a name only where its specification allows it,
     /// as RFC 8707 (section 2) does with one `resource` parameter for each resource.
     ///
-    /// [`Self::build`] fails for a parameter middle sets itself: `grant_type`, `scope`, `client_id`, `client_secret`,
+    /// [`Self::build`] fails for a parameter that middle reserves for the grant and the client authentication: `grant_type`, `scope`, `client_id`, `client_secret`,
     /// `client_assertion`, `client_assertion_type` and `assertion`.
     #[must_use]
     pub fn append_param(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
@@ -481,7 +424,7 @@ impl ClientCredentialAuthorizerBuilder {
         self
     }
 
-    /// Whether an `http` token URL may have any host. middle then sends the client credentials without TLS, so allow it only in a network you trust.
+    /// Whether an `http` token URL may have any host. middle then sends the client credentials and the assertion of the JWT bearer grant without TLS, so allow it only in a network you trust.
     ///
     /// The default is `false`: [`Self::build`] fails for an `http` token URL unless its host is `localhost` or a loopback address (`127.0.0.0/8` or `::1`).
     #[must_use]
@@ -522,14 +465,14 @@ impl ClientCredentialAuthorizerBuilder {
         self
     }
 
-    /// Build the [`ClientCredentialAuthorizer`].
+    /// Build the [`Authorizer`].
     /// This triggers an initial token fetch, which takes at most the [`Self::timeout`], retries included.
     ///
     /// # Errors
     ///
     /// - [`Error::Config`] if the token URL, a scope or a parameter is not valid, the default token lifetime is shorter than 2 s, or the HTTP client cannot be built.
     /// - Any error of the initial token fetch.
-    pub async fn build(self) -> Result<ClientCredentialAuthorizer, Error> {
+    pub async fn build(self) -> Result<Authorizer, Error> {
         let default_lifetime = self
             .default_token_lifetime
             .unwrap_or(DEFAULT_TOKEN_LIFETIME);
@@ -538,6 +481,7 @@ impl ClientCredentialAuthorizerBuilder {
         }
         let request = TokenRequest::new(
             self.token_url,
+            self.grant,
             self.client_auth,
             &self.scopes,
             self.params,
@@ -552,7 +496,7 @@ impl ClientCredentialAuthorizerBuilder {
             http_client,
         });
         let config = CacheConfig {
-            client_id: source.request.client_id().to_string(),
+            client_id: source.request.log_name(),
             timeout: self.timeout.unwrap_or(DEFAULT_TIMEOUT),
             tolerance: self.refresh_tolerance.unwrap_or(DEFAULT_REFRESH_TOLERANCE),
             default_lifetime,
@@ -561,12 +505,15 @@ impl ClientCredentialAuthorizerBuilder {
             wall_clock: SystemTime::now,
         };
 
-        let (cache, task) =
+        let (cache, refresh_task) =
             TokenCache::start(Arc::clone(&source) as Arc<dyn TokenSource>, config).await?;
-        Ok(ClientCredentialAuthorizer {
-            inner: Arc::new(Inner { source, cache }),
-            refresh_task: task.map(|task| Arc::new(RefreshTask { task })),
-        })
+        Ok(Authorizer(Kind::Refreshing(Refreshing {
+            inner: Arc::new(Inner {
+                source,
+                cache,
+                refresh_task,
+            }),
+        })))
     }
 }
 
@@ -583,42 +530,6 @@ impl TokenSource for ClientCredentials {
             &self.http_client,
             &self.request,
         ))
-    }
-}
-
-impl Authorizer for ClientCredentialAuthorizer {
-    fn authorization_header(&self) -> Result<Arc<HeaderValue>, Error> {
-        self.inner.cache.read(|token| Arc::clone(token.header()))
-    }
-
-    #[cfg(feature = "tonic")]
-    fn authorization_header_tonic(
-        &self,
-    ) -> std::result::Result<tonic::metadata::MetadataValue<tonic::metadata::Ascii>, tonic::Status>
-    {
-        // The metadata value was built with the token, so this only clones it (cheap, `Bytes`-backed).
-        self.inner
-            .cache
-            .read(|token| token.metadata().clone())
-            .map_err(|error| tonic::Status::unauthenticated(error.to_string()))
-    }
-}
-
-#[cfg(feature = "tonic")]
-impl tonic::service::Interceptor for ClientCredentialAuthorizer {
-    fn call(
-        &mut self,
-        request: tonic::Request<()>,
-    ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
-        let mut request = request;
-        let metadata = request.metadata_mut();
-        if !metadata.contains_key(http::header::AUTHORIZATION.as_str()) {
-            metadata.insert(
-                http::header::AUTHORIZATION.as_str(),
-                self.authorization_header_tonic()?,
-            );
-        }
-        Ok(request)
     }
 }
 
@@ -654,7 +565,7 @@ mod test {
                 .to_string(),
             )
             .create();
-        let authorizer = ClientCredentialAuthorizer::builder(
+        let authorizer = Authorizer::client_credentials(
             format!("{url}/my-tenant/oauth2/token").parse().unwrap(),
             ClientAuthentication::client_secret_basic("my-client", "my-secret"),
         )
@@ -698,7 +609,7 @@ mod test {
             )
             .expect(2)
             .create();
-        let authorizer = ClientCredentialAuthorizer::builder(
+        let authorizer = Authorizer::client_credentials(
             format!("{url}/my-tenant/oauth2/token").parse().unwrap(),
             ClientAuthentication::client_secret_basic("my-client", "my-secret"),
         )
@@ -744,7 +655,7 @@ mod test {
             )
             .expect(3)
             .create();
-        let authorizer = ClientCredentialAuthorizer::builder(
+        let authorizer = Authorizer::client_credentials(
             format!("{url}/my-tenant/oauth2/token").parse().unwrap(),
             ClientAuthentication::client_secret_basic("my-client", "my-secret"),
         )
@@ -789,7 +700,7 @@ mod test {
             )
             .expect(1)
             .create();
-        let authorizer = ClientCredentialAuthorizer::builder(
+        let authorizer = Authorizer::client_credentials(
             format!("{url}/my-tenant/oauth2/token").parse().unwrap(),
             ClientAuthentication::client_secret_basic("my-client", "my-secret"),
         )
@@ -826,7 +737,7 @@ mod test {
             )
             .create_async()
             .await;
-        let authorizer = ClientCredentialAuthorizer::builder(
+        let authorizer = Authorizer::client_credentials(
             format!("{url}/token").parse().unwrap(),
             ClientAuthentication::client_secret_basic("my-client", "my-secret"),
         )

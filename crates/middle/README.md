@@ -6,25 +6,25 @@
 
 This crate provides authentication middleware for clients that need to access secure HTTP and gRPC APIs. Features include:
 
-* Automatic token renewal when expired in a background task
-* Thread-safe token management with interior mutability
-* `reqwest` integration by using a wrapped `HttpClient`
-* `tonic` integration via Interceptors
+* Automatic token renewal before expiry in a background task
+* One `Authorizer` type, cheap to clone and shared between threads
+* `reqwest` integration: take the header of a valid token from the `Authorizer`
+* `tonic` integration through an interceptor
 * Support for OAuth2 Client Credential flow, with the client secret (Basic or form body) or a JWT client assertion (RFC 7523): `private_key_jwt`, `client_secret_jwt`, or an assertion from a file such as a Kubernetes service account token
+* Support for the JWT bearer grant (RFC 7523, section 2.1), with or without client authentication
 * Support for Bearer Token authentication
 * Safe defaults - does not follow redirects and hides sensitive data in Debug
 * More flows coming soon!
 
 # Example
 
-In the following example we create a `middle::HttpClient` that wraps a `reqwest::Client`.
-The token is kept fresh with a background task of the `ClientCredentialAuthorizer`, so that the client always sends authorized requests.
+In the following example, an `Authorizer` requests a token with the client credentials grant and keeps it fresh in a background task. Each request takes the header of a valid token. A token that the server rejects is dropped, and the request is retried once with a new token.
 
 ```rust
 use std::str::FromStr;
 
-use middle::{Authorizer, ClientAuthentication, ClientCredentialAuthorizer};
-use reqwest::Client;
+use middle::{Authorizer, ClientAuthentication, TokenHeader};
+use reqwest::{Client, Response, StatusCode, header::AUTHORIZATION};
 use url::Url;
 
 #[tokio::main]
@@ -34,36 +34,46 @@ async fn main() {
     let token_endpoint = Url::from_str("https://identity.example.com/oauth2/token").unwrap();
 
     // Create a new Authorizer. The Authorizer keeps the token refreshed in the background.
-    let authorizer = ClientCredentialAuthorizer::builder(
+    let authorizer = Authorizer::client_credentials(
         token_endpoint,
         ClientAuthentication::client_secret_basic(client_id, client_secret),
     )
     .add_scope("my-scope")
-    .refresh_tolerance(std::time::Duration::from_secs(30)) // Refresh 30 seconds before expiry
+    .refresh_tolerance(std::time::Duration::from_secs(30)) // Refresh 30 seconds before expiry at the latest, if the token lives at least a minute
     .build()
     .await
     .unwrap();
+    let client = Client::new();
 
-    // The current authorization header. The header is always kept up-to-date.
-    // Returns an error if the last refresh failed.
-    let _header = authorizer.authorization_header().unwrap();
+    // The header of a valid token. If the token has expired, this waits for the refresh.
+    let header = authorizer.wait_for_header().await.unwrap();
+    let mut response = get_data(&client, &header).await;
 
-    // Generate a new reqwest Client and wrap it with `HttpClient`.
-    let reqwest_client = Client::new();
-    let client = middle::HttpClient::new(authorizer).set_client(reqwest_client);
+    // If the server rejects the token, drop it. If another token can come, retry once with it.
+    if response.status() == StatusCode::UNAUTHORIZED && authorizer.invalidate(&header) {
+        let header = authorizer.wait_for_header().await.unwrap();
+        response = get_data(&client, &header).await;
+    }
+    println!("{}", response.status());
+}
 
-    // Start using the client - the authorization header is automatically added.
-    let request = client.get("https://api.example.com/data").unwrap();
-    let _response = request.send().await.unwrap();
+async fn get_data(client: &Client, header: &TokenHeader) -> Response {
+    client
+        .get("https://api.example.com/data")
+        .header(AUTHORIZATION, header.header().clone())
+        .send()
+        .await
+        .unwrap()
 }
 ```
 
 ## Tonic Integration
-ALl Authorizers implemented by the `middle` crate, implement `tonic::service::Interceptor` if the `tonic` feature is enabled.
+
+With the `tonic` feature, `Authorizer::interceptor` returns an interceptor that puts the authorization header on every request.
 
 ```rust
-use hello_world::{greeter_service_client::GreeterServiceClient, SayHelloRequest};
-use middle::BearerTokenAuthorizer;
+use hello_world::{SayHelloRequest, greeter_service_client::GreeterServiceClient};
+use middle::Authorizer;
 use tonic::transport::Endpoint;
 
 pub mod hello_world {
@@ -72,16 +82,14 @@ pub mod hello_world {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // All authorizers provided by the `middle` crate implement the `tonic::Interceptor` trait.
-    let authorizer = BearerTokenAuthorizer::new("my-super-secret-token")?;
+    let authorizer = Authorizer::bearer("my-super-secret-token")?;
 
     let channel = Endpoint::from_static("http://service.example.com:50051")
         .connect()
         .await?;
-    // Use the authorizer as an interceptor.
-    let mut client = GreeterServiceClient::with_interceptor(channel, authorizer);
+    // The interceptor puts the authorization header on every request.
+    let mut client = GreeterServiceClient::with_interceptor(channel, authorizer.interceptor()?);
 
-    // All following requests include the authorization header.
     let request = tonic::Request::new(SayHelloRequest {
         name: "Tonic".into(),
     });
@@ -99,9 +107,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **all**: Includes `rustls-tls`, `tonic`, `client-credentials`, `runtime-tokio`, `jwt`, and `aws-lc-rs`.
 - **default**: Includes `rustls-tls`, `client-credentials`, and `runtime-tokio`.
 - **rustls-tls**: Enables reqwest's `rustls` feature: TLS with rustls and aws-lc-rs, checking certificates against the root certificates of the operating system. A container image needs them installed, for example with the `ca-certificates` package.
-- **tonic**: Implement `tonic::service::Interceptor` for all Authorizers
-- **runtime-tokio**: Enables the `tokio` runtime (currently the only supported async runtime). Some Authorizers depend on an async runtime to spawn refresh tasks.
-- **client-credentials**: Enables the `ClientCredentialAuthorizer` for the OAuth2 Client Credential flow
+- **tonic**: `Authorizer::interceptor`, a `tonic::service::Interceptor`
+- **runtime-tokio**: Enables the `tokio` runtime (currently the only supported async runtime), which refreshes requested tokens in a background task.
+- **client-credentials**: Tokens from a token endpoint, such as `Authorizer::client_credentials` for the OAuth2 client credentials grant
 - **jwt**: Signs JWT assertions (RFC 7523) with `middle::jwt`. Enable `jwt` with exactly one of these crypto backends:
     - **aws-lc-rs**: aws-lc-rs.
     - **rust-crypto**: the RustCrypto crates.

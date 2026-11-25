@@ -10,17 +10,17 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use middle::{Authorizer as _, ConfigError, Error};
+use middle::{ConfigError, Error};
 use support::{FakeIdp, Reply, wait_until};
 
-fn builder(token_url: url::Url) -> middle::ClientCredentialAuthorizerBuilder {
-    middle::ClientCredentialAuthorizer::builder(
+fn builder(token_url: url::Url) -> middle::AuthorizerBuilder {
+    middle::Authorizer::client_credentials(
         token_url,
         middle::ClientAuthentication::client_secret_basic("my-client", "SECRET-CLIENT-SECRET"),
     )
 }
 
-fn header(authorizer: &middle::ClientCredentialAuthorizer) -> Option<String> {
+fn header(authorizer: &middle::Authorizer) -> Option<String> {
     authorizer
         .authorization_header()
         .ok()
@@ -124,6 +124,7 @@ fn test_readers_get_a_final_error_once_the_runtime_has_shut_down() {
         let authorizer = builder(idp.token_url()).build().await.unwrap();
         (idp, authorizer)
     });
+    let sent = authorizer.token_header().unwrap();
 
     drop(runtime);
 
@@ -140,8 +141,39 @@ fn test_readers_get_a_final_error_once_the_runtime_has_shut_down() {
         !error.is_retryable(),
         "no refresh will come, so a retry cannot help"
     );
-    assert!(authorizer.refresh_task().unwrap().task().is_finished());
+    assert!(
+        !authorizer.invalidate(&sent),
+        "no refresh will come, so no other token comes"
+    );
     assert_eq!(idp.count(), 1);
+}
+
+#[test]
+fn test_invalidate_is_true_while_a_newer_token_is_valid_after_the_runtime_has_shut_down() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (authorizer, first) = runtime.block_on(async {
+        let idp = FakeIdp::start(|number| match number {
+            1 => Reply::token("token-1", Some(2)),
+            _ => Reply::token(&format!("token-{number}"), Some(3600)),
+        })
+        .await;
+        let authorizer = builder(idp.token_url()).build().await.unwrap();
+        let first = authorizer.token_header().unwrap();
+        assert!(
+            wait_until(Duration::from_secs(3), || header(&authorizer).as_deref()
+                == Some("Bearer token-2"))
+            .await
+        );
+        (authorizer, first)
+    });
+
+    drop(runtime);
+
+    // A retry gets the second token, which is still valid.
+    assert!(authorizer.invalidate(&first));
+    assert_eq!(header(&authorizer).as_deref(), Some("Bearer token-2"));
+    // No token after the second one comes.
+    assert!(!authorizer.invalidate(&authorizer.token_header().unwrap()));
 }
 
 #[tokio::test]
@@ -167,7 +199,7 @@ async fn test_dropping_the_last_clone_stops_refreshing() {
 async fn test_refresh_continues_after_a_token_without_expires_in() {
     let idp = FakeIdp::start(|number| match number {
         1 => Reply::token("t", Some(2)),
-        _ => Reply::token("t2", None),
+        _ => Reply::token(&format!("t{number}"), None),
     })
     .await;
     let authorizer = builder(idp.token_url()).build().await.unwrap();
@@ -177,10 +209,10 @@ async fn test_refresh_continues_after_a_token_without_expires_in() {
             == Some("Bearer t2"))
         .await
     );
-    assert!(
-        !authorizer.refresh_task().unwrap().task().is_finished(),
-        "the refresh task keeps running"
-    );
+    // The refresh task keeps running: it replaces a rejected token.
+    assert!(authorizer.invalidate(&authorizer.token_header().unwrap()));
+    let replaced = authorizer.wait_for_header().await.unwrap();
+    assert_eq!(replaced.header().to_str().unwrap(), "Bearer t3");
 }
 
 #[tokio::test]
@@ -278,10 +310,20 @@ async fn test_a_rejected_token_is_replaced_once() {
     let authorizer = builder(idp.token_url()).build().await.unwrap();
     let rejected = authorizer.wait_for_header().await.unwrap();
     assert_eq!(rejected.header().to_str().unwrap(), "Bearer token-1");
+    // Sensitive headers stay out of `Debug` output and out of the HTTP/2 header compression.
+    assert!(rejected.header().is_sensitive());
+    assert!(authorizer.authorization_header().unwrap().is_sensitive());
+    assert!(
+        authorizer
+            .token_header()
+            .unwrap()
+            .into_header()
+            .is_sensitive()
+    );
 
     // Two calls failed with the same token, and both report it.
-    authorizer.invalidate(&rejected);
-    authorizer.invalidate(&rejected);
+    assert!(authorizer.invalidate(&rejected));
+    assert!(authorizer.invalidate(&rejected));
     assert!(matches!(
         authorizer.authorization_header(),
         Err(Error::TokenExpired)
@@ -289,10 +331,34 @@ async fn test_a_rejected_token_is_replaced_once() {
     let replaced = authorizer.wait_for_header().await.unwrap();
     assert_eq!(replaced.header().to_str().unwrap(), "Bearer token-2");
 
-    // A late report about the first token keeps the second.
-    authorizer.invalidate(&rejected);
+    // A late report about the first token keeps the second, which a retry gets.
+    assert!(authorizer.invalidate(&rejected));
     assert_eq!(header(&authorizer).as_deref(), Some("Bearer token-2"));
     assert_eq!(idp.count(), 2);
+}
+
+#[tokio::test]
+async fn test_invalidate_is_false_when_no_other_token_will_come() {
+    let idp = counting_idp().await;
+    let authorizer = builder(idp.token_url()).build().await.unwrap();
+    let other = builder(idp.token_url()).build().await.unwrap();
+    let without_refresh = builder(idp.token_url())
+        .disable_refresh()
+        .build()
+        .await
+        .unwrap();
+    let bearer = middle::Authorizer::bearer("t").unwrap();
+
+    assert!(!authorizer.invalidate(&other.token_header().unwrap()));
+    assert!(!authorizer.invalidate(&bearer.token_header().unwrap()));
+    assert!(!bearer.invalidate(&bearer.token_header().unwrap()));
+    assert!(!without_refresh.invalidate(&without_refresh.token_header().unwrap()));
+    assert!(matches!(
+        without_refresh.token_header(),
+        Err(Error::RefreshStopped)
+    ));
+    assert_eq!(header(&authorizer).as_deref(), Some("Bearer token-1"));
+    assert_eq!(header(&other).as_deref(), Some("Bearer token-2"));
 }
 
 #[tokio::test]

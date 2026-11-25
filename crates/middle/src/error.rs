@@ -49,9 +49,6 @@ pub enum Error {
         "the token had expired when the answer arrived: it lives {0:?} from the request, and the request took longer"
     )]
     ExpiredOnArrival(Duration),
-    /// A request sent through [`crate::HttpClient`] failed.
-    #[error("Request failed: {0}")]
-    ReqwestFailed(#[from] Arc<reqwest::Error>),
     /// An assertion could not be created, for example because signing failed or an assertion file cannot be read.
     #[error(transparent)]
     Assertion(#[from] AssertionError),
@@ -85,8 +82,7 @@ impl Error {
     /// The OAuth errors `server_error` and `temporarily_unavailable` are retryable with any status.
     /// [`Error::TokenExpired`] is retryable, because a refresh is due. [`Error::ExpiredOnArrival`] is retryable, because a faster answer brings a usable token.
     /// [`Error::Assertion`] is retryable unless [`AssertionError::permanent`] marks it: middle creates the assertion before it sends the request, so a retry costs the token endpoint nothing, and an assertion file or a signing service can recover.
-    /// Not retryable are other OAuth errors with another status, such as `invalid_client` with HTTP 401, redirect errors of the HTTP client, answers middle cannot use, configuration errors, a panicked token request, and [`Error::RefreshStopped`].
-    /// Requests sent through [`crate::HttpClient`] are not retryable, because middle cannot know whether they are safe to repeat.
+    /// Not retryable are other OAuth errors with another status, such as `invalid_client` with HTTP 401 or `invalid_grant` with HTTP 400, redirect errors of the HTTP client, answers middle cannot use, configuration errors, a panicked token request, and [`Error::RefreshStopped`].
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -104,7 +100,6 @@ impl Error {
             Self::InvalidResponse(_)
             | Self::Config(_)
             | Self::InvalidHeaderValue
-            | Self::ReqwestFailed(_)
             | Self::RefreshStopped
             | Self::TokenRequestPanicked => false,
         }
@@ -513,7 +508,7 @@ impl std::error::Error for TransportError {
 pub enum ConfigError {
     /// The scope is not valid (RFC 6749, section 3.3).
     InvalidScope(String),
-    /// middle sets this form parameter itself.
+    /// middle reserves this form parameter for the grant and the client authentication.
     ReservedParameter(String),
     /// A form parameter has an empty name.
     EmptyParameterName,
@@ -571,7 +566,10 @@ impl fmt::Display for ConfigError {
                 "`{scope}` is not a valid scope: a scope has one or more visible ASCII characters other than `\"` and `\\`, and no space (RFC 6749, section 3.3)"
             ),
             Self::ReservedParameter(name) => {
-                write!(f, "middle sets the form parameter `{name}` itself")
+                write!(
+                    f,
+                    "middle reserves the form parameter `{name}` for the grant and the client authentication"
+                )
             }
             Self::EmptyParameterName => f.write_str("a form parameter needs a name"),
             Self::TokenUrlScheme(scheme) => {
@@ -579,7 +577,7 @@ impl fmt::Display for ConfigError {
             }
             Self::HttpTokenUrl(host) => write!(
                 f,
-                "the token URL uses http with the host `{host}`, which sends the client credentials without TLS: use https, or allow http with `danger_allow_http`"
+                "the token URL uses http with the host `{host}`, which sends the client credentials or the assertion of the JWT bearer grant without TLS: use https, or allow http with `danger_allow_http`"
             ),
             Self::TokenUrlWithFragment => {
                 f.write_str("the token URL must not have a fragment (RFC 6749, section 3.2)")
@@ -715,22 +713,6 @@ mod tests {
         assert!(!oauth(StatusCode::UNAUTHORIZED, "invalid_client").is_retryable());
         assert!(!oauth(StatusCode::BAD_REQUEST, "invalid_request").is_retryable());
         assert!(!oauth(StatusCode::BAD_REQUEST, "account_locked").is_retryable());
-    }
-
-    #[tokio::test]
-    async fn test_a_failed_request_through_the_http_client_is_not_retryable() {
-        // A port nothing listens on, so that the connection is refused.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
-        let error = reqwest::Client::new()
-            .get(format!("http://{address}/"))
-            .send()
-            .await
-            .expect_err("nothing listens");
-        assert!(error.is_connect(), "{error:?}");
-
-        assert!(!Error::ReqwestFailed(Arc::new(error)).is_retryable());
     }
 
     #[test]
