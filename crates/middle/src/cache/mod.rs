@@ -31,6 +31,7 @@ use std::{
 };
 
 use http::HeaderValue;
+pub(crate) use lifetime::jwt_exp;
 use tokio::{
     sync::{Notify, watch},
     task::JoinHandle,
@@ -98,7 +99,7 @@ impl CacheConfig {
 #[derive(Clone, veil::Redact)]
 pub(crate) struct Token {
     #[redact]
-    header: Arc<HeaderValue>,
+    header: HeaderValue,
     /// The header as tonic metadata, built once so that the interceptor only clones it.
     #[cfg(feature = "tonic")]
     #[redact]
@@ -142,7 +143,7 @@ impl Token {
         })
     }
 
-    pub(crate) fn header(&self) -> &Arc<HeaderValue> {
+    pub(crate) fn header(&self) -> &HeaderValue {
         &self.header
     }
 
@@ -405,13 +406,14 @@ impl TokenCache {
         }
     }
 
-    /// Stops using the token `token` and wakes the refresh task.
+    /// Stops using the token `token` and wakes the refresh task. Returns whether a token newer than `token` can come: the refresh task runs,
+    /// or the cache holds a newer token that is still usable.
     ///
     /// A token of a later generation stays in use, so a late call for an old token does not discard a newer one.
-    /// A token of another cache changes nothing.
-    pub(crate) fn invalidate(&self, token: TokenId) {
+    /// A token of another cache changes nothing and returns `false`.
+    pub(crate) fn invalidate(&self, token: TokenId) -> bool {
         if token.cache != self.id {
-            return;
+            return false;
         }
         if self
             .shared
@@ -420,6 +422,10 @@ impl TokenCache {
             < token.generation
         {
             self.shared.wake_task();
+        }
+        is_refreshing(&self.state) || {
+            let state = self.state.borrow();
+            state.token.id.generation > token.generation && state.token.is_usable(&self.shared)
         }
     }
 }

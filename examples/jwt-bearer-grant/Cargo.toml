@@ -1,0 +1,15 @@
+[package]
+name = "middle-example-jwt-bearer-grant"
+resolver = "2"
+version = "0.0.0"
+edition = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+
+[dependencies]
+middle = { path = "../../crates/middle", features = ["jwt", "aws-lc-rs"] }
+reqwest = { version = "0.13" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+url = { workspace = true }

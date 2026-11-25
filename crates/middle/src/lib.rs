@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(
     missing_debug_implementations,
     rust_2018_idioms,
@@ -11,7 +13,6 @@ mod assertion;
 mod authorizers;
 #[cfg(feature = "client-credentials")]
 mod cache;
-mod client;
 pub mod error;
 #[cfg(feature = "jwt")]
 pub mod jwt;
@@ -22,7 +23,6 @@ pub use assertion::SignedJwt;
 #[cfg(feature = "client-credentials")]
 pub use assertion::{Assertion, AssertionContext, AssertionFuture, AssertionSource, FileAssertion};
 pub use authorizers::*;
-pub use client::*;
 pub use error::{
     AssertionError, ConfigError, Error, ErrorCode, HttpError, InvalidResponse, OAuthError,
     ResponseProblem, Result, TransportError,

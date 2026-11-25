@@ -9,7 +9,7 @@ use jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER as PROVIDER;
 use jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER as PROVIDER;
 use jsonwebtoken::{Algorithm, DecodingKey};
 use middle::{
-    ClientAuthentication, ClientCredentialAuthorizer, ConfigError,
+    Authorizer, ClientAuthentication, ConfigError,
     jwt::{Audience, JwtAssertion, SigningAlgorithm, SigningKey},
 };
 use serde_json::{Value, json};
@@ -112,7 +112,7 @@ async fn test_private_key_jwt_signs_a_typed_assertion_for_the_issuer() {
     let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
 
     let before = now();
-    ClientCredentialAuthorizer::builder(
+    Authorizer::client_credentials(
         idp.token_url(),
         ClientAuthentication::private_key_jwt("my-client", ec_key().with_key_id("key-1"), issuer()),
     )
@@ -135,7 +135,7 @@ async fn test_client_secret_jwt_signs_with_the_secret_and_does_not_send_it() {
     let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
 
     let before = now();
-    ClientCredentialAuthorizer::builder(
+    Authorizer::client_credentials(
         idp.token_url(),
         ClientAuthentication::client_secret_jwt("my-client", CLIENT_SECRET, issuer()).unwrap(),
     )
@@ -183,7 +183,7 @@ async fn test_private_key_jwt_for_the_token_endpoint_signs_an_untyped_jwt_for_it
     token_url.set_query(Some("tenant=t1"));
 
     let before = now();
-    ClientCredentialAuthorizer::builder(
+    Authorizer::client_credentials(
         token_url.clone(),
         ClientAuthentication::private_key_jwt("my-client", ec_key(), Audience::TokenEndpoint),
     )
@@ -206,7 +206,7 @@ async fn test_a_jwt_assertion_is_a_source_that_sends_its_own_header() {
     let assertion = JwtAssertion::new(ec_key(), "my-client", "my-client", ISSUER);
 
     let before = now();
-    ClientCredentialAuthorizer::builder(
+    Authorizer::client_credentials(
         idp.token_url(),
         ClientAuthentication::client_assertion("my-client", assertion),
     )

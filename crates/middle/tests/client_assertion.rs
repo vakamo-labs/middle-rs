@@ -7,12 +7,13 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use middle::{
-    Assertion, AssertionContext, AssertionError, AssertionSource, ClientAuthentication,
-    ClientCredentialAuthorizer, Error, FileAssertion, SignedJwt,
+    Assertion, AssertionContext, AssertionError, AssertionSource, Authorizer, ClientAuthentication,
+    Error, FileAssertion, SignedJwt,
 };
 use support::{FakeIdp, Reply};
 
@@ -118,7 +119,7 @@ async fn test_a_client_assertion_is_sent_with_the_client_id() {
     let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
     let source = CountingSource::default();
 
-    ClientCredentialAuthorizer::builder(
+    Authorizer::client_credentials(
         idp.token_url(),
         ClientAuthentication::client_assertion("my client", source.clone()),
     )
@@ -151,7 +152,7 @@ async fn test_the_client_id_parameter_can_be_left_out() {
     let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
     let source = CountingSource::default();
 
-    ClientCredentialAuthorizer::builder(
+    Authorizer::client_credentials(
         idp.token_url(),
         ClientAuthentication::client_assertion("my-client", source.clone())
             .without_client_id_parameter(),
@@ -178,7 +179,7 @@ async fn test_the_client_id_parameter_can_be_left_out() {
 async fn test_an_encrypted_jwt_is_sent_as_it_is() {
     let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
 
-    ClientCredentialAuthorizer::builder(
+    Authorizer::client_credentials(
         idp.token_url(),
         ClientAuthentication::client_assertion("c", EncryptedJwtSource),
     )
@@ -203,7 +204,7 @@ async fn test_one_source_can_serve_several_authorizers() {
         ClientAuthentication::client_assertion("c", Arc::clone(&shared)),
         ClientAuthentication::client_assertion("c", boxed),
     ] {
-        ClientCredentialAuthorizer::builder(idp.token_url(), authentication)
+        Authorizer::client_credentials(idp.token_url(), authentication)
             .build()
             .await
             .unwrap();
@@ -240,7 +241,7 @@ async fn test_a_permanent_assertion_error_fails_build_at_once() {
         ..CountingSource::default()
     };
 
-    let error = ClientCredentialAuthorizer::builder(
+    let error = Authorizer::client_credentials(
         idp.token_url(),
         ClientAuthentication::client_assertion("c", source.clone()),
     )
@@ -263,7 +264,7 @@ async fn test_each_attempt_gets_a_new_assertion() {
     .await;
     let source = CountingSource::default();
 
-    ClientCredentialAuthorizer::builder(
+    Authorizer::client_credentials(
         idp.token_url(),
         ClientAuthentication::client_assertion("c", source.clone()),
     )
@@ -293,7 +294,7 @@ async fn test_a_failed_assertion_is_retried_without_a_request() {
         ..CountingSource::default()
     };
 
-    ClientCredentialAuthorizer::builder(
+    Authorizer::client_credentials(
         idp.token_url(),
         ClientAuthentication::client_assertion("c", source.clone()),
     )
@@ -316,11 +317,11 @@ async fn test_a_source_that_does_not_answer_is_bounded_by_the_timeout() {
         hanging: vec![1],
         ..CountingSource::default()
     };
-    let build = ClientCredentialAuthorizer::builder(
+    let build = Authorizer::client_credentials(
         idp.token_url(),
         ClientAuthentication::client_assertion("c", source.clone()),
     )
-    .set_max_retries(0)
+    .max_retries(0)
     .timeout(Duration::from_millis(200))
     .build();
 
@@ -375,7 +376,7 @@ async fn test_a_file_assertion_is_sent() {
     let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
     let file = TempFile::new("sent", "aGVhZGVy.cGF5bG9hZA.c2ln");
 
-    ClientCredentialAuthorizer::builder(
+    Authorizer::client_credentials(
         idp.token_url(),
         ClientAuthentication::client_assertion("c", FileAssertion::new(&file.0)),
     )
@@ -433,6 +434,82 @@ async fn test_a_file_that_is_not_a_jwt_is_an_assertion_error_without_its_content
         assert!(message.contains("is not a signed JWT"), "{name}: {message}");
         assert!(!message.contains("SECRET"), "{name}: {message}");
     }
+}
+
+/// A JWT with the payload `claims` and a signature that is never checked.
+fn jwt_with_claims(claims: &serde_json::Value) -> String {
+    format!(
+        "eyJhbGciOiJSUzI1NiJ9.{}.c2ln",
+        URL_SAFE_NO_PAD.encode(claims.to_string())
+    )
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+#[tokio::test]
+async fn test_a_file_with_an_expired_jwt_is_a_retryable_error_that_names_the_file() {
+    let exp = now() - 10;
+    let file = TempFile::new(
+        "expired",
+        jwt_with_claims(&serde_json::json!({"sub": "SECRET", "exp": exp})),
+    );
+
+    let error = FileAssertion::new(&file.0)
+        .assertion(&context())
+        .await
+        .expect_err("the JWT has expired");
+
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "the JWT in the assertion file `{}` has expired: its `exp` is {exp}",
+            file.0.display()
+        )
+    );
+    assert!(Error::from(error).is_retryable());
+}
+
+#[tokio::test]
+async fn test_a_file_with_a_jwt_that_has_not_expired_is_sent_as_it_is() {
+    let context = context();
+    for (name, claims) in [
+        ("exp-ahead", serde_json::json!({"exp": now() + 60})),
+        ("no-exp", serde_json::json!({"sub": "s"})),
+        ("exp-not-a-number", serde_json::json!({"exp": "1"})),
+    ] {
+        let jwt = jwt_with_claims(&claims);
+        let file = TempFile::new(name, &jwt);
+
+        let assertion = FileAssertion::new(&file.0).assertion(&context).await;
+
+        assert_eq!(assertion.unwrap().as_str(), jwt, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn test_an_expired_jwt_in_the_file_is_not_sent() {
+    let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
+    let file = TempFile::new(
+        "expired-not-sent",
+        jwt_with_claims(&serde_json::json!({"exp": now() - 10})),
+    );
+
+    let error = Authorizer::client_credentials(
+        idp.token_url(),
+        ClientAuthentication::client_assertion("c", FileAssertion::new(&file.0)),
+    )
+    .max_retries(0)
+    .build()
+    .await
+    .expect_err("the JWT has expired");
+
+    assert!(matches!(error, Error::Assertion(_)), "{error:?}");
+    assert!(idp.requests().is_empty());
 }
 
 #[tokio::test]
@@ -540,7 +617,7 @@ fn test_a_signed_jwt_has_three_base64url_parts() {
 async fn test_debug_output_shows_the_client_id_and_the_source() {
     let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
     let file = TempFile::new("debug", "aGVhZGVy.cGF5bG9hZA.U0VDUkVU");
-    let builder = ClientCredentialAuthorizer::builder(
+    let builder = Authorizer::client_credentials(
         idp.token_url(),
         ClientAuthentication::client_assertion("my-client", FileAssertion::new(&file.0)),
     );

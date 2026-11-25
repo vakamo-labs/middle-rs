@@ -44,7 +44,8 @@ const DEFAULT_LIFETIME: Duration = Duration::from_secs(60);
 const MIN_LIFETIME: Duration = Duration::from_secs(10);
 
 /// The longest lifetime [`JwtAssertion::with_lifetime`] accepts: one hour.
-/// Some servers refuse an assertion whose `exp` lies more than one hour after its `iat`. An assertion can be replayed until it expires.
+/// Some servers refuse an assertion whose `exp` lies more than one hour after its `iat`, or more than one hour in the future.
+/// With `iat` 5 seconds before the signing, one hour meets both. An assertion can be replayed until it expires.
 const MAX_LIFETIME: Duration = Duration::from_secs(3600);
 
 /// How many seconds `iat` lies before the signing, so that a server whose clock is slightly behind accepts the assertion.
@@ -491,7 +492,7 @@ impl JwtAssertion {
     ///
     /// # Errors
     ///
-    /// [`ConfigError::AssertionLifetime`] for a lifetime shorter than 10 seconds or longer than one hour. Some servers refuse an assertion whose `exp` lies more than one hour after its `iat`, and an assertion can be replayed until it expires.
+    /// [`ConfigError::AssertionLifetime`] for a lifetime shorter than 10 seconds or longer than one hour. Some servers refuse an assertion whose `exp` lies more than one hour after its `iat` or more than one hour in the future, and an assertion can be replayed until it expires.
     pub fn with_lifetime(mut self, lifetime: Duration) -> Result<Self, ConfigError> {
         if !(MIN_LIFETIME..=MAX_LIFETIME).contains(&lifetime) {
             return Err(ConfigError::AssertionLifetime(lifetime));

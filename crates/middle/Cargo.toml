@@ -96,8 +96,16 @@ name = "client_assertion"
 required-features = ["client-credentials"]
 
 [[test]]
+name = "interceptor"
+required-features = ["client-credentials", "tonic"]
+
+[[test]]
 name = "jwt"
 required-features = ["jwt"]
+
+[[test]]
+name = "jwt_bearer_grant"
+required-features = ["client-credentials"]
 
 [[test]]
 name = "jwt_client_authentication"

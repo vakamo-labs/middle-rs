@@ -1,5 +1,5 @@
 use hello_world::{SayHelloRequest, greeter_service_client::GreeterServiceClient};
-use middle::BearerTokenAuthorizer;
+use middle::Authorizer;
 use tonic::transport::Endpoint;
 
 pub mod hello_world {
@@ -8,16 +8,14 @@ pub mod hello_world {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // All authorizers provided by the `middle` crate implement the `tonic::Interceptor` trait.
-    let authorizer = BearerTokenAuthorizer::new("my-super-secret-token")?;
+    let authorizer = Authorizer::bearer("my-super-secret-token")?;
 
     let channel = Endpoint::from_static("http://service.example.com:50051")
         .connect()
         .await?;
-    // Use the authorizer as an interceptor.
-    let mut client = GreeterServiceClient::with_interceptor(channel, authorizer);
+    // The interceptor puts the authorization header on every request.
+    let mut client = GreeterServiceClient::with_interceptor(channel, authorizer.interceptor());
 
-    // All following requests include the authorization header.
     let request = tonic::Request::new(SayHelloRequest {
         name: "Tonic".into(),
     });
