@@ -424,10 +424,10 @@ impl ClientCredentialAuthorizerBuilder {
     ///
     /// The refresh task retries until a request succeeds.
     ///
-    /// After a failed token request, middle waits between 1 s and 2 s, doubling with each further failure up to 30 s,
-    /// and longer if the token endpoint sends a `Retry-After` header.
-    /// After an error a retry cannot fix, the refresh task waits at most half the time the current token has left while it is valid,
-    /// and about 5 minutes once it expired or was invalidated.
+    /// After a failed token request, middle waits between 1 s and 2 s, doubling with each further failure up to 30 s.
+    /// After an error a retry cannot fix, the refresh task waits about 5 minutes.
+    /// While the current token is still in use, neither expired nor invalidated, a wait is at most half the time the token has left.
+    /// A `Retry-After` header of the token endpoint makes a wait longer, up to 5 minutes.
     #[must_use]
     pub fn set_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = Some(max_retries);
