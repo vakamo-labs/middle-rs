@@ -252,21 +252,63 @@ async fn test_a_token_shorter_than_twice_the_tolerance_refreshes_in_a_window_end
 }
 
 #[tokio::test(start_paused = true)]
-async fn test_a_token_that_expires_at_once_is_requested_once_per_second() {
-    let started = start(config(), |_| Step::Token("t", Some(0))).await;
+async fn test_a_token_shorter_than_a_second_is_requested_once_per_second() {
+    // Each token expires 500 ms after its request, and its refresh comes 1 s after its request at the earliest.
+    let started = start(config(), |_| Step::Lasting("t", Duration::from_millis(500))).await;
     let begin = Instant::now();
 
-    // Every failed read wakes the refresh task.
-    let mut reads = 0;
+    // A read after expiry wakes the refresh task, which still waits for the second to pass.
+    let mut expired_reads = 0;
     while begin.elapsed() < secs(10.5) {
-        assert!(matches!(header(&started.cache), Err(Error::TokenExpired)));
-        reads += 1;
+        if matches!(header(&started.cache), Err(Error::TokenExpired)) {
+            expired_reads += 1;
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    assert_eq!(reads, 1050);
+    assert!(expired_reads >= 500, "{expired_reads}");
     let expected: Vec<Duration> = (0..=10).map(Duration::from_secs).collect();
     assert_eq!(started.source.request_times(), expected);
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_a_first_token_that_arrives_expired_fails_start_after_the_retries() {
+    // Each answer takes 2 s, longer than the token lives.
+    let (result, source) = try_start(config(), |_| Step::Slow(secs(2.0), "t", Some(1))).await;
+
+    let error = result.unwrap_err();
+    assert!(
+        matches!(&error, Error::ExpiredOnArrival(lifetime) if *lifetime == secs(1.0)),
+        "{error:?}"
+    );
+    assert!(error.is_retryable());
+    // The first request and its three retries.
+    assert_eq!(source.count(), 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_a_refreshed_token_that_arrives_expired_keeps_the_old_token() {
+    let started = start(config(), |number| match number {
+        1 => Step::Token("first", Some(100)),
+        // The answer takes 2 s, longer than the token lives.
+        2 => Step::Slow(secs(2.0), "late", Some(1)),
+        // The answer takes 500 ms, so readers would see an expired token in the meantime.
+        _ => Step::Slow(secs(0.5), "third", Some(100)),
+    })
+    .await;
+    let begin = Instant::now();
+
+    // The refresh between 60 s and 70 s gets a token that had expired when it arrived. Readers keep the first token until the retry, 1 s to 2 s later, brings the third.
+    while begin.elapsed() < secs(80.0) {
+        let current = header(&started.cache).unwrap();
+        assert_ne!(current, "Bearer late");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(header(&started.cache).unwrap(), "Bearer third");
+    let gaps = started.source.gaps();
+    assert_eq!(gaps.len(), 2, "{gaps:?}");
+    assert_between(gaps[1], 3.0, 4.0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -307,7 +349,8 @@ async fn test_an_error_a_retry_cannot_fix_is_retried_at_half_the_time_left_then_
     })
     .await;
 
-    tokio::time::sleep(secs(60.0 + 3.0 * 330.0)).await;
+    // The first request after expiry comes before 61 s, so three gaps of at most 330 s end before 1051 s, and a fourth gap of at least 270 s after 1140 s.
+    tokio::time::sleep(secs(1100.0)).await;
 
     // The refresh between 24 s and 30 s fails. While the token is valid, each retry waits half the time it has left, at least 1 s.
     let times = started.source.request_times();

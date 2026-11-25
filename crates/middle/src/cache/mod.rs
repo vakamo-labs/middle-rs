@@ -455,12 +455,7 @@ impl Refresher {
                 || failures > self.config.first_token_retries
                 || Instant::now() + wait >= deadline
             {
-                tracing::error!(
-                    "Failed to fetch a token for client `{}`: {}",
-                    self.config.client_id,
-                    DisplayChain(&error)
-                );
-                return Err(error);
+                return Err(self.give_up(error));
             }
             tracing::debug!(
                 "Failed to fetch a token for client `{}`: {}. Retrying in {wait:?}",
@@ -468,8 +463,22 @@ impl Refresher {
                 DisplayChain(&error)
             );
             tokio::time::sleep(wait).await;
+            // The runtime may resume this task after the deadline, for example under load.
             timeout = deadline.saturating_duration_since(Instant::now());
+            if timeout.is_zero() {
+                return Err(self.give_up(error));
+            }
         }
+    }
+
+    /// Logs the error that ends [`Self::first_token`] and returns it.
+    fn give_up(&self, error: Error) -> Error {
+        tracing::error!(
+            "Failed to fetch a token for client `{}`: {}",
+            self.config.client_id,
+            DisplayChain(&error)
+        );
+        error
     }
 
     /// Refreshes the token until every reader is gone.
@@ -538,6 +547,8 @@ impl Refresher {
     }
 
     /// One request, in a task of its own so that a panic ends only this request.
+    ///
+    /// The lifetime counts from the request. A token that had expired when the answer arrived is an error, so that it never replaces a token readers can use.
     async fn request(&mut self, timeout: Duration) -> Result<Token, Error> {
         let requested_at = (Instant::now(), (self.config.wall_clock)());
         let source = Arc::clone(&self.source);
@@ -557,6 +568,9 @@ impl Refresher {
             generation: self.generation + 1,
         };
         let token = Token::new(&response, id, requested_at, lifetime, self.config.tolerance)?;
+        if token.is_expired_at(Instant::now(), (self.config.wall_clock)()) {
+            return Err(Error::ExpiredOnArrival(lifetime));
+        }
         self.generation = id.generation;
         self.log_missing_expires_in(origin, lifetime);
         tracing::debug!(

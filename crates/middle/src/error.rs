@@ -44,6 +44,11 @@ pub enum Error {
     /// The token request panicked.
     #[error("the token request panicked")]
     TokenRequestPanicked,
+    /// The token had expired when the answer arrived: the request took longer than the token lives, counted from the request. The value is that lifetime.
+    #[error(
+        "the token had expired when the answer arrived: it lives {0:?} from the request, and the request took longer"
+    )]
+    ExpiredOnArrival(Duration),
     /// A request sent through [`crate::HttpClient`] failed.
     #[error("Request failed: {0}")]
     ReqwestFailed(#[from] Arc<reqwest::Error>),
@@ -78,7 +83,7 @@ impl Error {
     ///
     /// Retryable are transport errors, timeouts, and answers with HTTP 408, 429 or 5xx, whatever OAuth error they carry. These statuses ask for a later attempt, and a 5xx comes from a server that failed, so its code is not reliable.
     /// The OAuth errors `server_error` and `temporarily_unavailable` are retryable with any status.
-    /// [`Error::TokenExpired`] is retryable, because a refresh is due.
+    /// [`Error::TokenExpired`] is retryable, because a refresh is due. [`Error::ExpiredOnArrival`] is retryable, because a faster answer brings a usable token.
     /// Not retryable are other OAuth errors with another status, such as `invalid_client` with HTTP 401, redirect errors of the HTTP client, answers middle cannot use, configuration errors, assertions that cannot be created, a panicked token request, and [`Error::RefreshStopped`].
     /// Requests sent through [`crate::HttpClient`] are not retryable, because middle cannot know whether they are safe to repeat.
     #[must_use]
@@ -93,7 +98,7 @@ impl Error {
             }
             Self::Http(error) => is_retryable_status(error.status()),
             Self::Transport(TransportError(error)) => !error.is_builder() && !error.is_redirect(),
-            Self::Timeout(_) | Self::TokenExpired => true,
+            Self::Timeout(_) | Self::TokenExpired | Self::ExpiredOnArrival(_) => true,
             Self::InvalidResponse(_)
             | Self::Config(_)
             | Self::InvalidHeaderValue

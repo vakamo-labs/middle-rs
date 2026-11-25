@@ -297,6 +297,32 @@ async fn test_a_rejected_token_is_replaced_once() {
 }
 
 #[tokio::test]
+async fn test_a_token_shorter_than_the_tolerance_is_replaced_before_it_expires() {
+    let idp = FakeIdp::start(|number| Reply::token(&format!("token-{number}"), Some(2))).await;
+    let authorizer = builder(idp.token_url())
+        .refresh_tolerance(Duration::from_secs(10))
+        .build()
+        .await
+        .unwrap();
+
+    // The token lives 2 s, shorter than twice the tolerance, so it is refreshed 1 s after its request, the earliest refresh.
+    // Every read finds a valid token: the first one until the second arrives.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let current = header(&authorizer).expect("a valid token at every read");
+        if current == "Bearer token-2" {
+            break;
+        }
+        assert_eq!(current, "Bearer token-1");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no refresh within 3 s"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
 async fn test_a_header_read_without_waiting_can_invalidate_its_token() {
     let idp = counting_idp().await;
     let authorizer = builder(idp.token_url()).build().await.unwrap();

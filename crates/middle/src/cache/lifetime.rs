@@ -44,14 +44,18 @@ pub(super) fn lifetime(
 }
 
 /// The `exp` claim of a JWT in seconds since 1970, read without checking the signature.
-/// `None` if the token is not a JWS with a numeric `exp`.
+/// `None` if the token is not a JWS with a numeric `exp`: three base64url parts, and a header that is a JSON object with `alg` (RFC 7515, sections 4.1.1 and 7.1).
 fn jwt_exp(token: &str) -> Option<f64> {
     let mut parts = token.split('.');
-    let (Some(_header), Some(payload), Some(_signature), None) =
+    let (Some(header), Some(payload), Some(signature), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
     else {
         return None;
     };
+    let header: serde_json::Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header).ok()?).ok()?;
+    header.get("alg")?.as_str()?;
+    URL_SAFE_NO_PAD.decode(signature).ok()?;
     let payload = URL_SAFE_NO_PAD.decode(payload).ok()?;
     let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
     claims.get("exp")?.as_f64().filter(|exp| exp.is_finite())
@@ -145,7 +149,22 @@ mod tests {
     }
 
     #[test]
+    fn test_an_unsecured_jwt_without_signature_is_read() {
+        // RFC 7519, section 6.1: `alg` is `none` and the signature is empty.
+        let token = format!(
+            "{}.{}.",
+            encode(&serde_json::json!({"alg": "none"})),
+            encode(&serde_json::json!({"exp": 2_000_000_100_u64}))
+        );
+        assert_eq!(
+            lifetime(&response(&token, None), at(2_000_000_000), DEFAULT),
+            (Duration::from_secs(100), Origin::JwtExp)
+        );
+    }
+
+    #[test]
     fn test_a_token_that_is_not_a_jwt_with_exp_gives_the_default() {
+        let claims = encode(&serde_json::json!({"exp": 2_000_000_100_u64}));
         let tokens = [
             "opaque-token".to_string(),
             "a.b".to_string(),
@@ -153,6 +172,16 @@ mod tests {
             format!(
                 "a.{}.c",
                 encode(&serde_json::json!(["exp", 2_000_000_100_u64]))
+            ),
+            // Claims with `exp` between parts that are not a JWS header and signature.
+            format!("a.{claims}.c"),
+            format!(
+                "{}.{claims}.c2lnbmF0dXJl",
+                encode(&serde_json::json!({"typ": "JWT"}))
+            ),
+            format!(
+                "{}.{claims}.!!",
+                encode(&serde_json::json!({"alg": "RS256"}))
             ),
             jwt(&serde_json::json!({"sub": "c"})),
             jwt(&serde_json::json!({"exp": "2000000100"})),

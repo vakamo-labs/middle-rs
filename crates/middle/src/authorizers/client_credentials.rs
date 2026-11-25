@@ -41,8 +41,10 @@ const DEFAULT_MAX_RETRIES: u32 = 3;
 /// Authenticate with an `OAuth2` server using client credentials.
 ///
 /// [`ClientCredentialAuthorizerBuilder::build`] fetches a token from the token endpoint of the identity provider.
-/// A background task refreshes it before it expires: at a random point between 75 % and 85 % of its lifetime,
-/// but at least [`ClientCredentialAuthorizerBuilder::refresh_tolerance`] before expiry, and not before half its lifetime.
+/// A background task refreshes it at a random point between 75 % and 85 % of its lifetime,
+/// but at least [`ClientCredentialAuthorizerBuilder::refresh_tolerance`] before expiry.
+/// For a token shorter than twice the tolerance, the window ends at half its lifetime.
+/// A refresh never comes sooner than 1 s after the request, so a token that lives 1 s or less expires before its refresh.
 /// If a refresh fails, the current token stays in use while it is valid, and the task retries with a backoff,
 /// at the latest after half the time the token has left.
 /// If the token endpoint sends no `expires_in`, the token lives until the `exp` of the access token if it is a JWT,
@@ -681,50 +683,6 @@ mod test {
 
         let header = authorizer.authorization_header().unwrap();
         assert_eq!(header.to_str().unwrap(), "Bearer my-issued-token");
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_short_lived_token_refreshes_before_expiry() {
-        let mut oauth_server = mockito::Server::new_async().await;
-        let url = oauth_server.url();
-        // The token lifetime (2s) is shorter than the refresh tolerance (10s), so
-        // the token is refreshed at half its lifetime, every second.
-        let mock = oauth_server
-            .mock("POST", "/token")
-            .with_status(200)
-            .with_header(CONTENT_TYPE.as_str(), "application/json")
-            .with_body(
-                serde_json::json!({
-                    "access_token": "tok",
-                    "token_type": "bearer",
-                    "expires_in": 2
-                })
-                .to_string(),
-            )
-            .expect_at_least(2)
-            .create_async()
-            .await;
-
-        let authorizer = BasicClientCredentialAuthorizerBuilder::new(
-            "my-client",
-            "my-secret",
-            format!("{url}/token").parse().unwrap(),
-        )
-        .refresh_tolerance(Duration::from_secs(10))
-        .build()
-        .await
-        .unwrap();
-
-        // The refresh comes 1 s after the first request. The wait is bounded, so that a slow machine does not fail the test.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while !(mock.matched_async().await && authorizer.authorization_header().is_ok())
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        mock.assert_async().await;
-        assert!(authorizer.authorization_header().is_ok());
     }
 
     #[tokio::test]
