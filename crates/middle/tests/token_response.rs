@@ -483,7 +483,7 @@ async fn test_a_refresh_without_an_answer_does_not_stop_refreshing() {
         .await
         .unwrap();
 
-    // The first refresh starts after 1 s and times out after 200 ms. The next one starts 1 s to 2 s later.
+    // The first refresh starts after 1 s and times out after 200 ms. The token has less than 2 s left, so the next one starts 1 s later.
     assert!(
         eventually(|| header(&authorizer).as_deref() == Some("Bearer third")).await,
         "requests: {:?} ms",

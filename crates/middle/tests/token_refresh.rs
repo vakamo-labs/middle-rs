@@ -109,8 +109,12 @@ async fn test_a_refresh_answer_that_expires_at_once_is_not_used() {
     let error = authorizer.authorization_header().unwrap_err();
     assert!(matches!(error, Error::InvalidResponse(_)), "{error:?}");
     assert!(!error.is_retryable());
-    // A retry cannot fix the answer, so the next request comes in about 5 minutes.
-    assert_eq!(idp.count(), 2);
+    // A retry cannot fix the answer. While the token was valid, the task retried at half the time it had left, at least 1 s later,
+    // so the last retry came at most 1 s after expiry. After that, the next request comes in about 5 minutes.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let requests = idp.count();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(idp.count(), requests);
 }
 
 #[test]

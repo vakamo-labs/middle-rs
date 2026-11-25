@@ -316,10 +316,11 @@ async fn test_an_error_a_retry_cannot_fix_is_retried_at_half_the_time_left_then_
         .iter()
         .position(|time| *time >= secs(60.0))
         .expect("a request after expiry");
-    for pair in times[1..=expired].windows(2) {
-        let half_left = ((secs(60.0) - pair[0]) / 2).max(secs(1.0));
+    let gaps = started.source.gaps();
+    for index in 1..expired {
+        let half_left = (secs(60.0).saturating_sub(times[index]) / 2).max(secs(1.0));
         assert_between(
-            pair[1] - pair[0],
+            gaps[index],
             half_left.as_secs_f64(),
             half_left.as_secs_f64(),
         );
@@ -327,8 +328,8 @@ async fn test_an_error_a_retry_cannot_fix_is_retried_at_half_the_time_left_then_
     assert!(expired <= 8, "{times:?}");
     // After expiry, about every five minutes.
     assert_eq!(times.len(), expired + 4, "{times:?}");
-    for pair in times[expired..].windows(2) {
-        assert_between(pair[1] - pair[0], 270.0, 330.0);
+    for gap in &gaps[expired..] {
+        assert_between(*gap, 270.0, 330.0);
     }
     let error = header(&started.cache).unwrap_err();
     assert!(
