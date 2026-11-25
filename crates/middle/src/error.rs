@@ -41,6 +41,9 @@ pub enum Error {
     /// A request sent through [`crate::HttpClient`] failed.
     #[error("Request failed: {0}")]
     ReqwestFailed(#[from] Arc<reqwest::Error>),
+    /// An assertion could not be created, for example because signing failed.
+    #[error(transparent)]
+    Assertion(#[from] AssertionError),
 }
 
 impl Error {
@@ -69,7 +72,7 @@ impl Error {
     ///
     /// Retryable are transport errors, timeouts, and answers with HTTP 408, 429 or 5xx, whatever OAuth error they carry. These statuses ask for a later attempt, and a 5xx comes from a server that failed, so its code is not reliable.
     /// The OAuth errors `server_error` and `temporarily_unavailable` are retryable with any status.
-    /// Not retryable are other OAuth errors with another status, such as `invalid_client` with HTTP 401, redirect errors of the HTTP client, answers middle cannot use, and configuration errors.
+    /// Not retryable are other OAuth errors with another status, such as `invalid_client` with HTTP 401, redirect errors of the HTTP client, answers middle cannot use, configuration errors, and assertions that cannot be created.
     /// Requests sent through [`crate::HttpClient`] are not retryable, because middle cannot know whether they are safe to repeat.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
@@ -87,7 +90,8 @@ impl Error {
             Self::InvalidResponse(_)
             | Self::Config(_)
             | Self::InvalidHeaderValue
-            | Self::ReqwestFailed(_) => false,
+            | Self::ReqwestFailed(_)
+            | Self::Assertion(_) => false,
         }
     }
 }
@@ -393,6 +397,35 @@ impl fmt::Display for ResponseProblem {
     }
 }
 
+/// An assertion that could not be created. [`std::error::Error::source`] is the cause.
+#[derive(Debug, Clone)]
+pub struct AssertionError {
+    message: &'static str,
+    source: Arc<dyn std::error::Error + Send + Sync>,
+}
+
+impl AssertionError {
+    #[cfg(feature = "jwt")]
+    pub(crate) fn new(
+        message: &'static str,
+        source: Arc<dyn std::error::Error + Send + Sync>,
+    ) -> Self {
+        Self { message, source }
+    }
+}
+
+impl fmt::Display for AssertionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.message)
+    }
+}
+
+impl std::error::Error for AssertionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.source)
+    }
+}
+
 /// A token request that did not complete, for example because the connection failed.
 ///
 /// [`std::error::Error::source`] is the [`reqwest::Error`].
@@ -441,6 +474,37 @@ pub enum ConfigError {
     TokenUrlWithUserInfo,
     /// reqwest cannot build the HTTP client. [`std::error::Error::source`] is the [`reqwest::Error`].
     HttpClient(Arc<reqwest::Error>),
+    /// The name is not an `alg` value middle signs with. `alg` values are case-sensitive, for example `RS256` or `EdDSA`.
+    #[cfg(feature = "jwt")]
+    UnknownSigningAlgorithm(String),
+    /// The signing key does not fit its algorithm, is not in a form middle reads, or cannot sign.
+    #[cfg(feature = "jwt")]
+    InvalidSigningKey(String),
+    /// The signing key is shorter than RFC 7518, section 3, requires for its algorithm.
+    #[cfg(feature = "jwt")]
+    WeakSigningKey {
+        /// The algorithm of the key.
+        algorithm: crate::jwt::SigningAlgorithm,
+        /// The length of the key in bits.
+        bits: usize,
+        /// The shortest length the algorithm allows, in bits.
+        minimum: usize,
+    },
+    /// middle sets this claim itself.
+    #[cfg(feature = "jwt")]
+    ReservedClaim(String),
+    /// An assertion lifetime shorter than one second or longer than one hour.
+    #[cfg(feature = "jwt")]
+    AssertionLifetime(std::time::Duration),
+    /// The certificate is not an X.509 certificate in the form given: PEM with the label `CERTIFICATE`, or DER.
+    #[cfg(feature = "jwt")]
+    InvalidCertificate,
+    /// The public key of the certificate does not belong to the signing key. A shared secret for `HS*` has no certificate.
+    #[cfg(feature = "jwt")]
+    CertificateKeyMismatch,
+    /// The public key of the certificate has an algorithm middle does not sign with, such as RSA-PSS. The value is the OID of the algorithm, such as `1.2.840.113549.1.1.10`.
+    #[cfg(feature = "jwt")]
+    UnsupportedCertificateKey(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -466,6 +530,42 @@ impl fmt::Display for ConfigError {
             Self::HttpClient(_) => {
                 f.write_str("the HTTP client for the token endpoint cannot be built")
             }
+            #[cfg(feature = "jwt")]
+            Self::UnknownSigningAlgorithm(name) => write!(
+                f,
+                "unknown signing algorithm `{name}`; expected a case-sensitive `alg` value such as `RS256` or `EdDSA`"
+            ),
+            #[cfg(feature = "jwt")]
+            Self::InvalidSigningKey(reason) => write!(f, "invalid signing key: {reason}"),
+            #[cfg(feature = "jwt")]
+            Self::WeakSigningKey {
+                algorithm,
+                bits,
+                minimum,
+            } => write!(
+                f,
+                "the signing key has {bits} bits, but {algorithm} needs at least {minimum} (RFC 7518, section 3)"
+            ),
+            #[cfg(feature = "jwt")]
+            Self::ReservedClaim(name) => write!(f, "middle sets the claim `{name}` itself"),
+            #[cfg(feature = "jwt")]
+            Self::AssertionLifetime(lifetime) => write!(
+                f,
+                "an assertion lifetime must be from one second to one hour, not {lifetime:?}"
+            ),
+            #[cfg(feature = "jwt")]
+            Self::InvalidCertificate => {
+                f.write_str("the certificate cannot be read as an X.509 certificate")
+            }
+            #[cfg(feature = "jwt")]
+            Self::CertificateKeyMismatch => {
+                f.write_str("the public key of the certificate does not belong to the signing key")
+            }
+            #[cfg(feature = "jwt")]
+            Self::UnsupportedCertificateKey(algorithm) => write!(
+                f,
+                "the public key of the certificate has the algorithm {algorithm}, which middle does not sign with"
+            ),
         }
     }
 }
@@ -480,10 +580,10 @@ impl std::error::Error for ConfigError {
 }
 
 /// Displays an error with all its causes, separated by `: `.
-#[cfg(feature = "client-credentials")]
+#[cfg(any(feature = "client-credentials", feature = "jwt"))]
 pub(crate) struct DisplayChain<'a>(pub(crate) &'a (dyn std::error::Error + 'static));
 
-#[cfg(feature = "client-credentials")]
+#[cfg(any(feature = "client-credentials", feature = "jwt"))]
 impl fmt::Display for DisplayChain<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)?;

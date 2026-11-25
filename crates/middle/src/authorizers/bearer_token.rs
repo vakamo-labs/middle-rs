@@ -75,11 +75,10 @@ impl Interceptor for BearerTokenAuthorizer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tonic"))]
 mod tests {
     use super::*;
 
-    #[cfg(feature = "tonic")]
     mod tonic_tests {
         use tonic::service::Interceptor;
 

@@ -9,11 +9,13 @@
 mod authorizers;
 mod client;
 pub mod error;
+#[cfg(feature = "jwt")]
+pub mod jwt;
 #[cfg(feature = "client-credentials")]
 mod token_endpoint;
 pub use authorizers::*;
 pub use client::*;
 pub use error::{
-    ConfigError, Error, ErrorCode, HttpError, InvalidResponse, OAuthError, ResponseProblem, Result,
-    TransportError,
+    AssertionError, ConfigError, Error, ErrorCode, HttpError, InvalidResponse, OAuthError,
+    ResponseProblem, Result, TransportError,
 };

@@ -94,9 +94,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 # Feature Flags
 
-- **all**: Includes `rustls-tls`, `tonic`, `client-credentials`, and `runtime-tokio`.
+- **all**: Includes `rustls-tls`, `tonic`, `client-credentials`, `runtime-tokio`, `jwt`, and `aws-lc-rs`.
 - **default**: Includes `rustls-tls`, `client-credentials`, and `runtime-tokio`.
 - **rustls-tls**: Enables reqwest's `rustls` feature: TLS with rustls and aws-lc-rs, checking certificates against the root certificates of the operating system. A container image needs them installed, for example with the `ca-certificates` package.
 - **tonic**: Implement `tonic::service::Interceptor` for all Authorizers
 - **runtime-tokio**: Enables the `tokio` runtime (currently the only supported async runtime). Some Authorizers depend on an async runtime to spawn refresh tasks.
 - **client-credentials**: Enables the `ClientCredentialAuthorizer` for the OAuth2 Client Credential flow
+- **jwt**: Signs JWT assertions (RFC 7523) with `middle::jwt`. Enable `jwt` with exactly one of these crypto backends:
+    - **aws-lc-rs**: aws-lc-rs.
+    - **rust-crypto**: the RustCrypto crates.
+
+    If your application also uses jsonwebtoken 12, choose the backend your jsonwebtoken uses: `aws-lc-rs` in middle with `aws_lc_rs` in jsonwebtoken, or `rust-crypto` with `rust_crypto`. Without a backend, middle does not compile.
+
+    The backends differ for RSA keys whose two primes differ in length: aws-lc-rs signs with them, and rust-crypto refuses them. middle signs once when it loads a key, so `SigningKey::from_pem` returns the error.
+
+    middle passes its backend to every jsonwebtoken call, so it works whatever process-wide default jsonwebtoken has. With both backends in one build, for example with `--all-features`, middle signs with aws-lc-rs, and jsonwebtoken has no default backend: your own `jsonwebtoken::encode` and `jsonwebtoken::decode` calls panic unless your application calls `jsonwebtoken::crypto::CryptoProvider::install_default` at startup.

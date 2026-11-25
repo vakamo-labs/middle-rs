@@ -13,17 +13,53 @@ Client Authorization Middleware for APIs secured via OAuth2 or Bearer Tokens. To
 """
 
 [features]
-all = ["rustls-tls", "tonic", "client-credentials", "runtime-tokio"]
+all = [
+    "rustls-tls",
+    "tonic",
+    "client-credentials",
+    "runtime-tokio",
+    "jwt",
+    "aws-lc-rs",
+]
 default = ["rustls-tls", "client-credentials", "runtime-tokio"]
 rustls-tls = ["reqwest/rustls"]
 tonic = ["dep:tonic"]
 runtime-tokio = ["tokio"]
 client-credentials = []
+# Signs JWT assertions (RFC 7523). Enable it with exactly one crypto backend, `aws-lc-rs` or `rust-crypto`. If the application uses jsonwebtoken 12, choose the backend it uses. Without a backend, middle does not compile.
+jwt = [
+    "dep:base64",
+    "dep:der",
+    "dep:getrandom",
+    "dep:jsonwebtoken",
+    "dep:pem",
+    "dep:pkcs1",
+    "dep:pkcs8",
+    "dep:sec1",
+    "dep:spki",
+    "dep:strum",
+]
+# Crypto backends for `jwt`. They change nothing without `jwt`.
+# With both enabled, as with `--all-features`, middle uses aws-lc-rs, and jsonwebtoken has no default provider: the application's own `jsonwebtoken::encode` and `decode` calls panic unless it calls `jsonwebtoken::crypto::CryptoProvider::install_default` at startup. middle passes its provider to every call and is not affected.
+aws-lc-rs = ["jsonwebtoken?/aws_lc_rs"]
+rust-crypto = ["jsonwebtoken?/rust_crypto"]
 
 [dependencies]
+base64 = { version = "0.23", optional = true }
+der = { version = "0.8.3", features = ["alloc", "oid"], optional = true }
+getrandom = { version = "0.4", optional = true }
 http = "1"
+jsonwebtoken = { version = "12.0", default-features = false, optional = true }
+pem = { version = "4", optional = true }
+pkcs1 = { version = "0.8.0", features = ["alloc"], optional = true }
+pkcs8 = { version = "0.11.0", optional = true }
 reqwest = { version = "0.13", default-features = false }
+sec1 = { version = "0.8.1", default-features = false, features = [
+    "der",
+], optional = true }
 serde_json = "1.0"
+spki = { version = "0.8.1", optional = true }
+strum = { version = "0.27", features = ["derive"], optional = true }
 thiserror = { version = "2.0" }
 tokio = { workspace = true, optional = true, features = ["rt", "time"] }
 tonic = { workspace = true, optional = true }
@@ -34,6 +70,10 @@ url = { workspace = true, features = ["serde"] }
 veil = "0.3"
 
 [dev-dependencies]
+base64 = "0.23"
+jsonwebtoken = { version = "12.0", default-features = false, features = [
+    "use_pem",
+] }
 mockito = "1.7"
 pretty_assertions = "1.4"
 serde_json = "1.0"
@@ -45,6 +85,10 @@ tokio = { version = "1.43", features = [
     "time",
 ] }
 tracing-test = "0.2.5"
+
+[[test]]
+name = "jwt"
+required-features = ["jwt"]
 
 [[test]]
 name = "token_request"
