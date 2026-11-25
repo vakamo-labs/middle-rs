@@ -51,9 +51,9 @@ pub enum Error {
         "the token had expired when the answer arrived: it lives {0:?} from the request, and the request took longer"
     )]
     ExpiredOnArrival(Duration),
-    /// An assertion could not be created, for example because signing failed or an assertion file cannot be read.
+    /// A token source or an assertion source failed, for example because signing failed, an assertion file cannot be read, or a service did not answer.
     #[error(transparent)]
-    Assertion(#[from] AssertionError),
+    Source(#[from] SourceError),
 }
 
 impl Error {
@@ -68,12 +68,14 @@ impl Error {
         }
     }
 
-    /// How long the token endpoint asked to wait before the next request, from a `Retry-After` header in seconds, at most one day.
+    /// How long to wait before the next request: from a `Retry-After` header of the token endpoint in seconds, at most one day,
+    /// or from [`SourceError::with_retry_after`].
     #[must_use]
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::OAuth(error) => error.retry_after(),
             Self::Http(error) => error.retry_after(),
+            Self::Source(error) => error.retry_after,
             _ => None,
         }
     }
@@ -83,7 +85,7 @@ impl Error {
     /// Retryable are transport errors, timeouts, and answers with HTTP 408, 429 or 5xx, whatever OAuth error they carry. These statuses ask for a later attempt, and a 5xx comes from a server that failed, so its code is not reliable.
     /// The OAuth errors `server_error` and `temporarily_unavailable` are retryable with any status.
     /// [`Error::TokenExpired`] is retryable, because a refresh is due. [`Error::ExpiredOnArrival`] is retryable, because a faster answer brings a usable token.
-    /// [`Error::Assertion`] is retryable unless [`AssertionError::permanent`] marks it: middle creates the assertion before it sends the request, so a retry costs the token endpoint nothing, and an assertion file or a signing service can recover.
+    /// [`Error::Source`] is retryable unless [`SourceError::permanent`] marks it: a token source or an assertion file or signing service can recover, and a failed assertion costs the token endpoint nothing, because middle creates it before it sends the request.
     /// Not retryable are other OAuth errors with another status, such as `invalid_client` with HTTP 401 or `invalid_grant` with HTTP 400, redirect errors of the HTTP client, answers middle cannot use, configuration errors, a panicked token request, and [`Error::RefreshStopped`].
     #[must_use]
     pub fn is_retryable(&self) -> bool {
@@ -98,7 +100,7 @@ impl Error {
             Self::Http(error) => is_retryable_status(error.status()),
             Self::Transport(TransportError(error)) => !error.is_builder() && !error.is_redirect(),
             Self::Timeout(_) | Self::TokenExpired | Self::ExpiredOnArrival(_) => true,
-            Self::Assertion(error) => !error.permanent,
+            Self::Source(error) => !error.permanent,
             Self::InvalidResponse(_)
             | Self::Config(_)
             | Self::InvalidHeaderValue
@@ -409,25 +411,27 @@ impl fmt::Display for ResponseProblem {
     }
 }
 
-/// An assertion that could not be created, for example because signing failed or an assertion file cannot be read.
+/// The error of a token source or an assertion source, for example because signing failed, an assertion file cannot be read, or a service did not answer.
 /// [`std::error::Error::source`] is the cause, if there is one.
 ///
-/// A retry may fix it, unless it is marked with [`AssertionError::permanent`].
+/// A retry may fix it, unless it is marked with [`SourceError::permanent`].
 #[derive(Debug, Clone)]
-pub struct AssertionError {
+pub struct SourceError {
     message: Cow<'static, str>,
     source: Option<Arc<dyn std::error::Error + Send + Sync>>,
     permanent: bool,
+    retry_after: Option<Duration>,
 }
 
-impl AssertionError {
-    /// An error with a message that says what failed. The message is shown and logged, so it must not hold the assertion or a key.
+impl SourceError {
+    /// An error with a message that says what failed. The message and the cause are shown and logged, so they must not hold a token, an assertion, a key or another secret.
     #[must_use]
     pub fn new(message: impl Into<Cow<'static, str>>) -> Self {
         Self {
             message: message.into(),
             source: None,
             permanent: false,
+            retry_after: None,
         }
     }
 
@@ -437,6 +441,14 @@ impl AssertionError {
     #[must_use]
     pub fn permanent(mut self) -> Self {
         self.permanent = true;
+        self
+    }
+
+    /// Asks middle to wait at least this long before the next request, as a `Retry-After` header of a token endpoint does, for example for a service that limits its rate.
+    /// middle waits at most 5 minutes.
+    #[must_use]
+    pub fn with_retry_after(mut self, wait: Duration) -> Self {
+        self.retry_after = Some(wait);
         self
     }
 
@@ -460,13 +472,13 @@ impl AssertionError {
     }
 }
 
-impl fmt::Display for AssertionError {
+impl fmt::Display for SourceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.message)
     }
 }
 
-impl std::error::Error for AssertionError {
+impl std::error::Error for SourceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.source
             .as_deref()

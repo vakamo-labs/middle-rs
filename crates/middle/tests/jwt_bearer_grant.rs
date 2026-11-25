@@ -10,8 +10,8 @@ use std::{
 };
 
 use middle::{
-    Assertion, AssertionContext, AssertionError, AssertionSource, Authorizer, ClientAuthentication,
-    Error,
+    Assertion, AssertionContext, AssertionSource, Authorizer, ClientAuthentication, Error,
+    SourceError,
 };
 use support::{FakeIdp, Reply};
 
@@ -47,7 +47,7 @@ impl AssertionSource for CountingSource {
     fn assertion<'a>(
         &'a self,
         context: &'a AssertionContext,
-    ) -> Pin<Box<dyn Future<Output = Result<Assertion, AssertionError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Assertion, SourceError>> + Send + 'a>> {
         Box::pin(async move {
             let number = {
                 let mut client_ids = self.client_ids.lock().unwrap();
@@ -173,7 +173,7 @@ impl AssertionSource for HangingSource {
     fn assertion<'a>(
         &'a self,
         _context: &'a AssertionContext,
-    ) -> Pin<Box<dyn Future<Output = Result<Assertion, AssertionError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Assertion, SourceError>> + Send + 'a>> {
         Box::pin(std::future::pending())
     }
 }

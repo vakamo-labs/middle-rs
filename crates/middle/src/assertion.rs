@@ -14,7 +14,7 @@ use std::{
 #[cfg(feature = "client-credentials")]
 use url::Url;
 
-use crate::error::AssertionError;
+use crate::error::SourceError;
 
 /// The largest assertion file [`FileAssertion`] reads, in bytes.
 #[cfg(feature = "client-credentials")]
@@ -31,13 +31,13 @@ impl SignedJwt {
     ///
     /// # Errors
     ///
-    /// [`AssertionError`] unless `jwt` is three base64url parts separated by dots, none of them empty. The message does not show `jwt`.
-    pub fn new(jwt: impl Into<String>) -> Result<Self, AssertionError> {
+    /// [`SourceError`] unless `jwt` is three base64url parts separated by dots, none of them empty. The message does not show `jwt`.
+    pub fn new(jwt: impl Into<String>) -> Result<Self, SourceError> {
         let jwt = jwt.into();
         if is_compact_jws(&jwt) {
             Ok(Self(jwt))
         } else {
-            Err(AssertionError::new(format!(
+            Err(SourceError::new(format!(
                 "the assertion {NOT_A_SIGNED_JWT}"
             )))
         }
@@ -93,13 +93,13 @@ impl Assertion {
     ///
     /// # Errors
     ///
-    /// [`AssertionError`] if `value` is empty or holds a character other than visible ASCII, such as a space or a line break. The message does not show `value`.
-    pub fn new(value: impl Into<String>) -> Result<Self, AssertionError> {
+    /// [`SourceError`] if `value` is empty or holds a character other than visible ASCII, such as a space or a line break. The message does not show `value`.
+    pub fn new(value: impl Into<String>) -> Result<Self, SourceError> {
         let value = value.into();
         if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_graphic()) {
             Ok(Self(value))
         } else {
-            Err(AssertionError::new(
+            Err(SourceError::new(
                 "the assertion is empty or holds a character other than visible ASCII",
             ))
         }
@@ -135,7 +135,7 @@ impl fmt::Debug for Assertion {
 /// The future of [`AssertionSource::assertion`].
 #[cfg(feature = "client-credentials")]
 pub type AssertionFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Assertion, AssertionError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<Assertion, SourceError>> + Send + 'a>>;
 
 /// Supplies the assertion for the JWT bearer grant ([`crate::Authorizer::jwt_bearer`]) or for JWT client authentication ([`crate::ClientAuthentication::client_assertion`]).
 ///
@@ -143,7 +143,7 @@ pub type AssertionFuture<'a> =
 /// `Arc<S>` and `Box<S>` are sources too, so one source can serve several authorizers.
 ///
 /// middle asks for a new assertion for every token request, retries included, within the timeout of that request.
-/// An error fails the request, and middle retries it, see [`crate::Error::is_retryable`] and [`AssertionError::permanent`].
+/// An error fails the request, and middle retries it, see [`crate::Error::is_retryable`] and [`SourceError::permanent`].
 ///
 /// middle shows the `Debug` output of a source in its own `Debug` output, which may end up in logs, so it must not show secrets, keys or assertions.
 #[cfg(feature = "client-credentials")]
@@ -227,7 +227,7 @@ impl fmt::Debug for AssertionContext {
 /// middle sends the JWT of the file with every token request until the writer replaces it. Some servers accept an assertion only once, by its `jti`;
 /// with them, a JWT from a file works for one token request, and the next one fails with `invalid_grant`.
 ///
-/// If the payload of the JWT has an `exp` (RFC 7519, section 4.1.4) that has passed, middle does not send it. The token request then fails with an [`AssertionError`]
+/// If the payload of the JWT has an `exp` (RFC 7519, section 4.1.4) that has passed, middle does not send it. The token request then fails with a [`SourceError`]
 /// that names the file, and middle retries the request. When the file holds a new JWT, the next retry sends it.
 #[cfg(feature = "client-credentials")]
 #[derive(Debug, Clone)]
@@ -252,7 +252,7 @@ impl AssertionSource for FileAssertion {
             tokio::task::spawn_blocking(move || read_assertion(&path))
                 .await
                 .map_err(|error| {
-                    AssertionError::new("reading the assertion file failed").with_source(error)
+                    SourceError::new("reading the assertion file failed").with_source(error)
                 })?
         })
     }
@@ -277,16 +277,16 @@ fn open_for_reading(path: &Path) -> std::io::Result<std::fs::File> {
 
 /// Reads the assertion file at `path`. The errors name the file, never its content.
 #[cfg(feature = "client-credentials")]
-fn read_assertion(path: &Path) -> Result<Assertion, AssertionError> {
+fn read_assertion(path: &Path) -> Result<Assertion, SourceError> {
     let cannot_read = |error: std::io::Error| {
-        AssertionError::new(format!(
+        SourceError::new(format!(
             "cannot read the assertion file `{}`",
             path.display()
         ))
         .with_source(error)
     };
     let not_regular = || {
-        AssertionError::new(format!(
+        SourceError::new(format!(
             "the assertion file `{}` is not a regular file",
             path.display()
         ))
@@ -305,7 +305,7 @@ fn read_assertion(path: &Path) -> Result<Assertion, AssertionError> {
         .read_to_end(&mut content)
         .map_err(cannot_read)?;
     if content.len() as u64 > MAX_FILE_BYTES {
-        return Err(AssertionError::new(format!(
+        return Err(SourceError::new(format!(
             "the assertion file `{}` is larger than 64 KiB",
             path.display()
         )));
@@ -314,13 +314,13 @@ fn read_assertion(path: &Path) -> Result<Assertion, AssertionError> {
         .ok()
         .and_then(|jwt| SignedJwt::new(jwt).ok())
         .ok_or_else(|| {
-            AssertionError::new(format!(
+            SourceError::new(format!(
                 "the assertion file `{}` {NOT_A_SIGNED_JWT}",
                 path.display()
             ))
         })?;
     if let Some(exp) = crate::cache::jwt_exp(jwt.as_str()).filter(|exp| has_passed(*exp)) {
-        return Err(AssertionError::new(format!(
+        return Err(SourceError::new(format!(
             "the JWT in the assertion file `{}` has expired: its `exp` is {exp}",
             path.display()
         )));

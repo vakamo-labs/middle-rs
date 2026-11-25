@@ -5,14 +5,12 @@ mod response;
 use std::{fmt, sync::Arc, time::Duration};
 
 use http::{HeaderMap, HeaderValue, StatusCode, header};
-#[cfg(test)]
-pub(crate) use response::AccessToken;
-pub(crate) use response::{MAX_EXPIRES_IN, TokenResponse};
+pub(crate) use response::{MAX_EXPIRES_IN, TokenResponse, TokenValue};
 use url::Url;
 
 use crate::{
     assertion::{Assertion, AssertionContext, AssertionSource},
-    error::{AssertionError, ConfigError, Error, InvalidResponse, ResponseProblem, TransportError},
+    error::{ConfigError, Error, InvalidResponse, ResponseProblem, SourceError, TransportError},
 };
 
 /// The largest answer middle reads from a token endpoint, in bytes.
@@ -221,7 +219,7 @@ impl TokenRequest {
     }
 
     /// The form body, with a new assertion for the JWT bearer grant and for a client assertion.
-    async fn form(&self) -> Result<String, AssertionError> {
+    async fn form(&self) -> Result<String, SourceError> {
         let mut context = AssertionContext::new(self.url.clone());
         if let Some(client_auth) = &self.client_auth {
             context = context.with_client_id(client_auth.client_id());

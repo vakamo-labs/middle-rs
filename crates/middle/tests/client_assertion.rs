@@ -12,8 +12,8 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use middle::{
-    Assertion, AssertionContext, AssertionError, AssertionSource, Authorizer, ClientAuthentication,
-    Error, FileAssertion, SignedJwt,
+    Assertion, AssertionContext, AssertionSource, Authorizer, ClientAuthentication, Error,
+    FileAssertion, SignedJwt, SourceError,
 };
 use support::{FakeIdp, Reply};
 
@@ -48,7 +48,7 @@ impl AssertionSource for CountingSource {
     fn assertion<'a>(
         &'a self,
         context: &'a AssertionContext,
-    ) -> Pin<Box<dyn Future<Output = Result<Assertion, AssertionError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Assertion, SourceError>> + Send + 'a>> {
         Box::pin(async move {
             let number = {
                 let mut calls = self.calls.lock().unwrap();
@@ -62,7 +62,7 @@ impl AssertionSource for CountingSource {
                 std::future::pending::<()>().await;
             }
             if self.failing.contains(&number) {
-                let error = AssertionError::new("the signer is not ready");
+                let error = SourceError::new("the signer is not ready");
                 return Err(if self.permanent {
                     error.permanent()
                 } else {
@@ -85,7 +85,7 @@ impl AssertionSource for EncryptedJwtSource {
     fn assertion<'a>(
         &'a self,
         _context: &'a AssertionContext,
-    ) -> Pin<Box<dyn Future<Output = Result<Assertion, AssertionError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Assertion, SourceError>> + Send + 'a>> {
         Box::pin(async { Assertion::new(ENCRYPTED_JWT) })
     }
 }
@@ -249,7 +249,7 @@ async fn test_a_permanent_assertion_error_fails_build_at_once() {
     .await
     .expect_err("a retry cannot fix the error");
 
-    assert!(matches!(&error, Error::Assertion(_)), "{error:?}");
+    assert!(matches!(&error, Error::Source(_)), "{error:?}");
     assert!(!error.is_retryable());
     assert_eq!(source.calls().len(), 1);
     assert_eq!(idp.count(), 0);
@@ -341,7 +341,7 @@ async fn test_a_source_that_does_not_answer_is_bounded_by_the_timeout() {
 #[tokio::test]
 async fn test_an_assertion_error_is_retryable_and_names_its_cause() {
     let error = Error::from(
-        AssertionError::new("the signer is not ready")
+        SourceError::new("the signer is not ready")
             .with_source(std::io::Error::other("connection refused")),
     );
 
@@ -508,7 +508,7 @@ async fn test_an_expired_jwt_in_the_file_is_not_sent() {
     .await
     .expect_err("the JWT has expired");
 
-    assert!(matches!(error, Error::Assertion(_)), "{error:?}");
+    assert!(matches!(error, Error::Source(_)), "{error:?}");
     assert!(idp.requests().is_empty());
 }
 

@@ -5,7 +5,8 @@
 //! The task builds each value before it sends it, so the lock of the channel is held only to swap values, and that lock ignores poisoning.
 //! The task sleeps until the refresh point on the monotonic clock. A reader wakes it when it finds no usable token, or when the wall clock has passed
 //! the refresh point, as after the machine slept; [`TokenCache::invalidate`] wakes it for a rejected token. The task then requests a token,
-//! at the earliest one second after the last one, unless it waits after a failure.
+//! at the earliest one second after the last one, unless it waits after a failure. A refresh with the reason `Refresh` that brings back the current token
+//! keeps its id, so that an invalidation with a header taken before or during the refresh drops it. An answer to the reason `Rejected` gets a new id.
 //!
 //! If the server rejects tokens before their refresh point again and again, each further rejection in a row waits longer before the next request,
 //! counted from the request of the rejected token. A rejection counts only while that wait still lies ahead, so a token that lasted longer than
@@ -42,6 +43,7 @@ use tracing::Instrument as _;
 use crate::{
     error::{DisplayChain, Error},
     token_endpoint::{MAX_EXPIRES_IN, TokenResponse},
+    token_source::{TokenContext, TokenReason},
 };
 
 /// The shortest timeout of one request, and the shortest wait after a failed one, while the old token is still valid.
@@ -57,20 +59,23 @@ pub(crate) struct TokenId {
     generation: u64,
 }
 
-/// A boxed future, so that [`TokenSource`] can be used as a trait object.
+/// A boxed future, so that [`Fetch`] can be used as a trait object.
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Where the cache gets its tokens from, such as a token endpoint with one grant.
-pub(crate) trait TokenSource: fmt::Debug + Send + Sync + 'static {
+pub(crate) trait Fetch: fmt::Debug + Send + Sync + 'static {
     /// Requests one token. The cache runs the request in a task of its own, bounds it with a timeout and retries failures.
-    fn fetch(&self) -> BoxFuture<'_, Result<TokenResponse, Error>>;
+    fn fetch<'a>(
+        &'a self,
+        context: &'a TokenContext,
+    ) -> BoxFuture<'a, Result<TokenResponse, Error>>;
 }
 
 /// How the cache requests and refreshes tokens.
 #[derive(Debug, Clone)]
 pub(crate) struct CacheConfig {
-    /// Names the client in log messages.
-    pub(crate) client_id: String,
+    /// Names the source in log messages, such as "client `my-client`".
+    pub(crate) name: String,
     /// The longest time one request may take. [`TokenCache::start`] and [`TokenCache::wait`] take at most this long too.
     pub(crate) timeout: Duration,
     /// How long before expiry a refresh comes at the latest.
@@ -292,7 +297,7 @@ impl TokenCache {
     ///
     /// The error of the last request.
     pub(crate) async fn start(
-        source: Arc<dyn TokenSource>,
+        source: Arc<dyn Fetch>,
         config: CacheConfig,
     ) -> Result<(Self, Option<JoinHandle<()>>), Error> {
         let id = NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed);
@@ -311,7 +316,7 @@ impl TokenCache {
         let task = if refresher.config.refresh {
             let span = tracing::debug_span!(
                 "token_refresh",
-                client_id = %refresher.config.client_id
+                source = %refresher.config.name
             );
             let shared = Arc::clone(&shared);
             Some(tokio::spawn(
@@ -432,7 +437,7 @@ impl TokenCache {
 
 /// Requests tokens: the first one for [`TokenCache::start`], then the refreshes in the task.
 struct Refresher {
-    source: Arc<dyn TokenSource>,
+    source: Arc<dyn Fetch>,
     config: CacheConfig,
     /// The id of the cache.
     cache: u64,
@@ -451,7 +456,7 @@ impl Refresher {
         let mut timeout = self.config.timeout;
         let mut failures: u32 = 0;
         loop {
-            let error = match self.request(timeout).await {
+            let error = match self.request(timeout, TokenReason::First).await {
                 Ok(token) => return Ok(token),
                 Err(error) => error,
             };
@@ -464,8 +469,8 @@ impl Refresher {
                 return Err(self.give_up(error));
             }
             tracing::debug!(
-                "Failed to fetch a token for client `{}`: {}. Retrying in {wait:?}",
-                self.config.client_id,
+                "Failed to fetch a token for {}: {}. Retrying in {wait:?}",
+                self.config.name,
                 DisplayChain(&error)
             );
             tokio::time::sleep(wait).await;
@@ -480,8 +485,8 @@ impl Refresher {
     /// Logs the error that ends [`Self::first_token`] and returns it.
     fn give_up(&self, error: Error) -> Error {
         tracing::error!(
-            "Failed to fetch a token for client `{}`: {}",
-            self.config.client_id,
+            "Failed to fetch a token for {}: {}",
+            self.config.name,
             DisplayChain(&error)
         );
         error
@@ -499,8 +504,8 @@ impl Refresher {
             }
         }
         tracing::debug!(
-            "Every reader of the token of client `{}` is gone, so the refresh task ends",
-            self.config.client_id
+            "Every reader of the token of {} is gone, so the refresh task ends",
+            self.config.name
         );
     }
 
@@ -512,10 +517,24 @@ impl Refresher {
         shared: &Shared,
     ) -> Result<(), ReadersGone> {
         let mut failures: u32 = 0;
+        let mut reason = TokenReason::Refresh;
         loop {
+            // Once the current token is invalidated, every attempt asks for a token other than the rejected one.
+            if sender.borrow().token.is_invalidated(shared) {
+                reason = TokenReason::Rejected;
+            }
             let timeout = attempt_timeout(&sender.borrow().token, shared, self.config.timeout);
-            let error = match until_readers_gone(sender, self.request(timeout)).await? {
-                Ok(token) => {
+            let error = match until_readers_gone(sender, self.request(timeout, reason)).await? {
+                Ok(mut token) => {
+                    {
+                        let current = &sender.borrow().token;
+                        // A refresh may bring back the current token, as a source that caches does. It keeps its id, so that `invalidate`
+                        // with a header taken before or during the refresh drops it, and the next attempt has the reason `Rejected`.
+                        if reason != TokenReason::Rejected && current.header() == token.header() {
+                            token.id = current.id;
+                            self.generation = current.id.generation;
+                        }
+                    }
                     drop(sender.send_replace(State::new(token)));
                     return Ok(());
                 }
@@ -531,14 +550,14 @@ impl Refresher {
             );
             if token.is_usable(shared) {
                 tracing::warn!(
-                    "Failed to refresh the token for client `{}`: {}. The current token stays in use while it is valid. Retrying in {wait:?}",
-                    self.config.client_id,
+                    "Failed to refresh the token for {}: {}. The current token stays in use while it is valid. Retrying in {wait:?}",
+                    self.config.name,
                     DisplayChain(&error)
                 );
             } else {
                 tracing::error!(
-                    "Failed to refresh the token for client `{}`, which has no valid token: {}. Retrying in {wait:?}",
-                    self.config.client_id,
+                    "Failed to refresh the token for {}, which has no valid token: {}. Retrying in {wait:?}",
+                    self.config.name,
                     DisplayChain(&error)
                 );
             }
@@ -555,10 +574,11 @@ impl Refresher {
     /// One request, in a task of its own so that a panic ends only this request.
     ///
     /// The lifetime counts from the request. A token that had expired when the answer arrived is an error, so that it never replaces a token readers can use.
-    async fn request(&mut self, timeout: Duration) -> Result<Token, Error> {
+    async fn request(&mut self, timeout: Duration, reason: TokenReason) -> Result<Token, Error> {
         let requested_at = (Instant::now(), (self.config.wall_clock)());
         let source = Arc::clone(&self.source);
-        let mut task = AbortOnDrop(tokio::spawn(async move { source.fetch().await }));
+        let context = TokenContext::new(reason);
+        let mut task = AbortOnDrop(tokio::spawn(async move { source.fetch(&context).await }));
         let response = match tokio::time::timeout(timeout, &mut task.0).await {
             Ok(Ok(response)) => response?,
             Ok(Err(error)) if error.is_panic() => return Err(Error::TokenRequestPanicked),
@@ -580,8 +600,8 @@ impl Refresher {
         self.generation = id.generation;
         self.log_missing_expires_in(origin, lifetime);
         tracing::debug!(
-            "Fetched a token for client `{}`. It is valid for {lifetime:?}",
-            self.config.client_id
+            "Fetched a token for {}. It is valid for {lifetime:?}",
+            self.config.name
         );
         Ok(token)
     }
@@ -593,12 +613,12 @@ impl Refresher {
         match origin {
             lifetime::Origin::ExpiresIn => return,
             lifetime::Origin::JwtExp => tracing::info!(
-                "The token endpoint sent no `expires_in` for client `{}`. middle uses the `exp` of the JWT access token, which is {lifetime:?} after the request",
-                self.config.client_id
+                "The token of {} has no `expires_in`. middle uses the `exp` of the JWT access token, which is {lifetime:?} after the request",
+                self.config.name
             ),
             lifetime::Origin::Default => tracing::warn!(
-                "The token endpoint sent no `expires_in` for client `{}`. middle uses the default lifetime of {lifetime:?}",
-                self.config.client_id
+                "The token of {} has no `expires_in`. middle uses the default lifetime of {lifetime:?}",
+                self.config.name
             ),
         }
         self.logged_missing_expires_in = true;
@@ -673,8 +693,8 @@ impl Refresher {
         self.fresh_rejections = rejections;
         if rejections >= 2 {
             tracing::warn!(
-                "The server rejected {rejections} fresh tokens of client `{}` in a row; the next token is requested in {:.1?}",
-                self.config.client_id,
+                "The server rejected {rejections} fresh tokens of {} in a row; the next token is requested in {:.1?}",
+                self.config.name,
                 next.saturating_duration_since(now)
             );
         }

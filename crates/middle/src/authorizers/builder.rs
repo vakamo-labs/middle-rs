@@ -13,8 +13,8 @@ use super::{Authorizer, Kind, TokenHeader};
 #[cfg(feature = "jwt")]
 use crate::jwt::{Audience, ClientAuthenticationJwt, SigningAlgorithm, SigningKey};
 use crate::{
-    AssertionSource,
-    cache::{BoxFuture, CacheConfig, Token, TokenCache, TokenSource},
+    AccessToken, AssertionSource, TokenContext, TokenSource,
+    cache::{BoxFuture, CacheConfig, Fetch, Token, TokenCache},
     error::{ConfigError, Error},
     token_endpoint::{self, ClientAuth, Grant, Secret, TokenRequest, TokenResponse},
 };
@@ -62,23 +62,34 @@ impl Authorizer {
     pub fn jwt_bearer(token_url: url::Url, assertion: impl AssertionSource) -> AuthorizerBuilder {
         AuthorizerBuilder::new(token_url, Grant::JwtBearer(Arc::new(assertion)), None)
     }
+
+    /// A builder for a token from `source`, a token source of your own, see [`TokenSource`].
+    /// middle keeps the token, asks the source for a new one before it expires, and retries failures, as for a token from a token endpoint.
+    #[must_use]
+    pub fn from_source<S: TokenSource>(source: S) -> AuthorizerBuilder<FromSource> {
+        AuthorizerBuilder {
+            source: FromSource {
+                source: Arc::new(source),
+                name: std::any::type_name::<S>(),
+            },
+            settings: Settings::default(),
+        }
+    }
 }
 
-impl AuthorizerBuilder {
+impl AuthorizerBuilder<FromTokenEndpoint> {
     fn new(token_url: url::Url, grant: Grant, client_auth: Option<ClientAuth>) -> Self {
         Self {
-            token_url,
-            grant,
-            client_auth,
-            max_retries: None,
-            timeout: None,
-            http_client: None,
-            scopes: Vec::new(),
-            params: Vec::new(),
-            allow_http: false,
-            enable_refresh: true,
-            refresh_tolerance: None,
-            default_token_lifetime: None,
+            source: FromTokenEndpoint {
+                token_url,
+                grant,
+                client_auth,
+                http_client: None,
+                scopes: Vec::new(),
+                params: Vec::new(),
+                allow_http: false,
+            },
+            settings: Settings::default(),
         }
     }
 }
@@ -115,7 +126,9 @@ impl Refreshing {
 
 /// What the clones of an authorizer share.
 struct Inner {
-    source: Arc<ClientCredentials>,
+    source: Arc<dyn Fetch>,
+    /// Names the source in log messages, such as "client `my-client`".
+    name: String,
     cache: TokenCache,
     /// The refresh task, `None` if refresh is disabled. Aborted when the last clone of the authorizer is dropped.
     refresh_task: Option<tokio::task::JoinHandle<()>>,
@@ -124,10 +137,7 @@ struct Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         if let Some(task) = &self.refresh_task {
-            tracing::debug!(
-                "Stopping the token refresh task of client `{}`",
-                self.source.request.log_name()
-            );
+            tracing::debug!("Stopping the token refresh task of {}", self.name);
             task.abort();
         }
     }
@@ -136,7 +146,7 @@ impl Drop for Inner {
 impl fmt::Debug for Inner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Inner")
-            .field("request", &self.source.request)
+            .field("source", &self.source)
             .field("cache", &self.cache)
             .finish_non_exhaustive()
     }
@@ -279,67 +289,260 @@ impl ClientAuthentication {
     }
 }
 
-/// Builder for an [`Authorizer`] with a token from a token endpoint, made with [`Authorizer::client_credentials`] or [`Authorizer::jwt_bearer`].
+/// Builder for an [`Authorizer`] with a token that middle requests and refreshes: from a token endpoint, made with [`Authorizer::client_credentials`]
+/// or [`Authorizer::jwt_bearer`], or from a token source of your own, made with [`Authorizer::from_source`].
 ///
-/// The following settings are available:
+/// The settings of every builder:
+/// * [`Self::max_retries`]: How often `build()` retries the first token request. Default is 3. Only errors a retry can fix are retried, see [`Error::is_retryable`].
+/// * [`Self::timeout`]: How long one token request may take, reading the answer included, and how long `build()` may take. Default is 30 seconds.
+/// * [`Self::disable_refresh`]: Turns off the refresh task. Refresh is on by default.
+/// * [`Self::refresh_tolerance`]: How long before expiry a token is refreshed at the latest. Default is 30 seconds.
+/// * [`Self::default_token_lifetime`]: The lifetime of a token whose lifetime is not known. Default is 5 minutes.
+///
+/// The settings of a builder for a token endpoint, `AuthorizerBuilder<FromTokenEndpoint>`:
 /// * [`Self::client_authentication`]: How the client authenticates. The client credentials grant requires it; for the JWT bearer grant it is optional and not set by default.
 /// * [`Self::add_scope`] and [`Self::add_scopes`]: Scopes to request in the token. None by default.
 /// * [`Self::append_param`]: Further form parameters of the token request. None by default.
-/// * [`Self::max_retries`]: How often `build()` retries the first token request. Default is 3. Only errors a retry can fix are retried, see [`Error::is_retryable`].
-/// * [`Self::timeout`]: How long one token request may take, reading the answer included, and how long `build()` may take. Default is 30 seconds.
 /// * [`Self::danger_http_client`]: The `reqwest::Client` for token requests, used as it is. Default is a client with redirects disabled, a connect timeout of 10 seconds, and no proxy for `localhost` and loopback addresses.
 /// * [`Self::danger_allow_http`]: Whether an `http` token URL may have any host. Default is `false`: `http` works only with `localhost` and loopback addresses.
-/// * [`Self::disable_refresh`]: Turns off the refresh task. Refresh is on by default.
-/// * [`Self::refresh_tolerance`]: How long before expiry a token is refreshed at the latest. Default is 30 seconds.
-/// * [`Self::default_token_lifetime`]: The lifetime of a token if the token endpoint does not say. Default is 5 minutes.
 ///
 /// `Debug` shows the names of the parameters, not their values, and never the client secret.
 #[derive(Clone)]
-pub struct AuthorizerBuilder {
+pub struct AuthorizerBuilder<S = FromTokenEndpoint> {
+    source: S,
+    settings: Settings,
+}
+
+impl<S: fmt::Debug> fmt::Debug for AuthorizerBuilder<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthorizerBuilder")
+            .field("source", &self.source)
+            .field("settings", &self.settings)
+            .finish()
+    }
+}
+
+/// The token endpoint of an [`AuthorizerBuilder`] made with [`Authorizer::client_credentials`] or [`Authorizer::jwt_bearer`].
+#[derive(Clone)]
+pub struct FromTokenEndpoint {
     token_url: url::Url,
     grant: Grant,
     client_auth: Option<ClientAuth>,
-    max_retries: Option<u32>,
-    timeout: Option<Duration>,
     http_client: Option<reqwest::Client>,
     scopes: Vec<String>,
     params: Vec<(String, String)>,
     allow_http: bool,
-    enable_refresh: bool,
-    refresh_tolerance: Option<Duration>,
-    default_token_lifetime: Option<Duration>,
 }
 
-impl fmt::Debug for AuthorizerBuilder {
+impl fmt::Debug for FromTokenEndpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let token_url = token_endpoint::redacted_url(&self.token_url);
         let param_names: Vec<&str> = self.params.iter().map(|(name, _)| name.as_str()).collect();
-        f.debug_struct("AuthorizerBuilder")
+        f.debug_struct("FromTokenEndpoint")
             .field("token_url", &token_url.as_str())
             .field("grant", &self.grant)
             .field("client_auth", &self.client_auth)
-            .field("max_retries", &self.max_retries)
-            .field("timeout", &self.timeout)
             // A custom client may carry default headers that hold secrets.
             .field("http_client", &self.http_client.as_ref().map(|_| "custom"))
             .field("scopes", &self.scopes)
             .field("param_names", &param_names)
             .field("allow_http", &self.allow_http)
-            .field("enable_refresh", &self.enable_refresh)
-            .field("refresh_tolerance", &self.refresh_tolerance)
-            .field("default_token_lifetime", &self.default_token_lifetime)
             .finish()
     }
 }
 
-impl AuthorizerBuilder {
+/// The token source of an [`AuthorizerBuilder`] made with [`Authorizer::from_source`]. `Debug` shows the `Debug` output of the source.
+#[derive(Clone)]
+pub struct FromSource {
+    source: Arc<dyn TokenSource>,
+    /// The type name of the source, which names it in log messages.
+    name: &'static str,
+}
+
+impl fmt::Debug for FromSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("FromSource").field(&self.source).finish()
+    }
+}
+
+impl Fetch for FromSource {
+    fn fetch<'a>(
+        &'a self,
+        context: &'a TokenContext,
+    ) -> BoxFuture<'a, Result<TokenResponse, Error>> {
+        Box::pin(async move {
+            self.source
+                .token(context)
+                .await
+                .map(AccessToken::into_response)
+                .map_err(Error::Source)
+        })
+    }
+}
+
+/// The settings of every [`AuthorizerBuilder`].
+#[derive(Clone, Debug)]
+struct Settings {
+    max_retries: Option<u32>,
+    timeout: Option<Duration>,
+    enable_refresh: bool,
+    refresh_tolerance: Option<Duration>,
+    default_token_lifetime: Option<Duration>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            max_retries: None,
+            timeout: None,
+            enable_refresh: true,
+            refresh_tolerance: None,
+            default_token_lifetime: None,
+        }
+    }
+}
+
+impl Settings {
+    /// The default token lifetime, at least [`MIN_DEFAULT_TOKEN_LIFETIME`].
+    fn default_lifetime(&self) -> Result<Duration, Error> {
+        let lifetime = self
+            .default_token_lifetime
+            .unwrap_or(DEFAULT_TOKEN_LIFETIME);
+        if lifetime < MIN_DEFAULT_TOKEN_LIFETIME {
+            return Err(ConfigError::DefaultTokenLifetimeTooShort(lifetime).into());
+        }
+        Ok(lifetime)
+    }
+
+    /// Requests the first token from `source` and starts the refresh task. `name` names the source in log messages.
+    async fn start(self, source: Arc<dyn Fetch>, name: String) -> Result<Authorizer, Error> {
+        let config = CacheConfig {
+            name: name.clone(),
+            timeout: self.timeout.unwrap_or(DEFAULT_TIMEOUT),
+            tolerance: self.refresh_tolerance.unwrap_or(DEFAULT_REFRESH_TOLERANCE),
+            default_lifetime: self.default_lifetime()?,
+            first_token_retries: self.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
+            refresh: self.enable_refresh,
+            wall_clock: SystemTime::now,
+        };
+        let (cache, refresh_task) = TokenCache::start(Arc::clone(&source), config).await?;
+        Ok(Authorizer(Kind::Refreshing(Refreshing {
+            inner: Arc::new(Inner {
+                source,
+                name,
+                cache,
+                refresh_task,
+            }),
+        })))
+    }
+}
+
+impl<S> AuthorizerBuilder<S> {
+    /// Optionally set how often [`Self::build`] retries the first token request, within the [`Self::timeout`].
+    /// Only errors a retry can fix are retried, see [`Error::is_retryable`].
+    /// The default is 3.
+    ///
+    /// The refresh task retries until a request succeeds.
+    ///
+    /// After a failed token request, middle waits between 1 s and 2 s, doubling with each further failure up to 30 s.
+    /// After an error a retry cannot fix, the refresh task waits about 5 minutes.
+    /// While the current token is still in use, neither expired nor invalidated, a wait is at most half the time the token has left, but at least 1 s.
+    /// A `Retry-After` header of the token endpoint, or [`crate::SourceError::with_retry_after`] of a token source, makes a wait longer, up to 5 minutes.
+    #[must_use]
+    pub fn max_retries(mut self, max_retries: u32) -> Self {
+        self.settings.max_retries = Some(max_retries);
+        self
+    }
+
+    /// Optionally set how long one token request may take, reading the answer included.
+    /// [`Self::build`] takes at most this long, retries included.
+    /// While a token is valid, one refresh request may take at most half of the time the token has left, but at least 1 s.
+    /// For a token endpoint, this also applies to a client set with `danger_http_client`.
+    /// The default is 30 seconds.
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.settings.timeout = Some(timeout);
+        self
+    }
+
+    /// Disable automatic token refresh.
+    /// Once the first token has expired, the authorizer answers with [`Error::RefreshStopped`].
+    #[must_use]
+    pub fn disable_refresh(mut self) -> Self {
+        self.settings.enable_refresh = false;
+        self
+    }
+
+    /// Set the refresh tolerance: how long before expiry the refresh window ends at the latest.
+    ///
+    /// A token is refreshed at a random point in a window that is 10 % of its lifetime wide and ends at 85 % of it.
+    /// If that end is less than `tolerance` before expiry, the window moves earlier, so that it ends `tolerance` before expiry, but not before half the lifetime.
+    /// For example, a token of 120 s with a tolerance of 30 s is refreshed between 78 s and 90 s, and a token shorter than twice the tolerance between 40 % and 50 % of its lifetime.
+    /// A refresh never comes sooner than 1 s after the request, also when that is less than `tolerance` before expiry, so a token that lives 1 s or less expires before its refresh.
+    /// Default is 30 seconds.
+    #[must_use]
+    pub fn refresh_tolerance(mut self, tolerance: Duration) -> Self {
+        self.settings.refresh_tolerance = Some(tolerance);
+        self
+    }
+
+    /// Set how long a token lives if its lifetime is not known: the token endpoint sends no `expires_in`, or the token source sets none with [`AccessToken::with_expires_in`],
+    /// and the access token is not a JWT with an `exp` in the future.
+    /// Longer lifetimes are shortened to one year.
+    /// Default is 5 minutes.
+    ///
+    /// [`Self::build`] fails for a lifetime shorter than 2 s: a token is refreshed 1 s after its request at the earliest, so a lifetime of at least 2 s makes the refresh come before the token expires.
+    #[must_use]
+    pub fn default_token_lifetime(mut self, lifetime: Duration) -> Self {
+        self.settings.default_token_lifetime = Some(lifetime);
+        self
+    }
+}
+
+impl AuthorizerBuilder<FromTokenEndpoint> {
     /// Sets how the client authenticates at the token endpoint.
     ///
     /// The client credentials grant requires client authentication, so [`Authorizer::client_credentials`] takes it, and this replaces it.
     /// For the JWT bearer grant it is optional (RFC 7523, section 2.1): without it, the request carries no client credentials.
     #[must_use]
     pub fn client_authentication(mut self, client_authentication: ClientAuthentication) -> Self {
-        self.client_auth = Some(client_authentication.0);
+        self.source.client_auth = Some(client_authentication.0);
+        self
+    }
+
+    /// Add a scope to the token request. An empty scope is skipped.
+    /// [`Self::build`] fails if the scope is not valid (RFC 6749, section 3.3), for example if it contains a space.
+    #[must_use]
+    pub fn add_scope(self, scope: &str) -> Self {
+        self.add_scopes(&[scope])
+    }
+
+    /// Add multiple scopes to the token request. Empty scopes are skipped, so a setting split on single spaces works with doubled or trailing spaces.
+    /// [`Self::build`] fails if a scope is not valid (RFC 6749, section 3.3), for example if it contains a space.
+    #[must_use]
+    pub fn add_scopes<I>(mut self, scopes: &[I]) -> Self
+    where
+        I: AsRef<str>,
+    {
+        self.source.scopes.extend(
+            scopes
+                .iter()
+                .map(AsRef::as_ref)
+                .filter(|scope| !scope.is_empty())
+                .map(str::to_string),
+        );
+        self
+    }
+
+    /// Appends a form parameter to the token request, after the scope. Each call adds one more parameter.
+    /// RFC 6749 (section 3.2) allows each parameter once, so repeat a name only where its specification allows it,
+    /// as RFC 8707 (section 2) does with one `resource` parameter for each resource.
+    ///
+    /// [`Self::build`] fails for a parameter that middle reserves for the grant and the client authentication: `grant_type`, `scope`, `client_id`, `client_secret`,
+    /// `client_assertion`, `client_assertion_type` and `assertion`.
+    #[must_use]
+    pub fn append_param(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.source.params.push((name.into(), value.into()));
         self
     }
 
@@ -360,70 +563,7 @@ impl AuthorizerBuilder {
     /// Use it for a client certificate (RFC 8705), for root certificates that the operating system does not have, for extra headers, or for another connect timeout.
     #[must_use]
     pub fn danger_http_client(mut self, client: reqwest::Client) -> Self {
-        self.http_client = Some(client);
-        self
-    }
-
-    /// Optionally set how often [`Self::build`] retries the first token request, within the [`Self::timeout`].
-    /// Only errors a retry can fix are retried, see [`Error::is_retryable`].
-    /// The default is 3.
-    ///
-    /// The refresh task retries until a request succeeds.
-    ///
-    /// After a failed token request, middle waits between 1 s and 2 s, doubling with each further failure up to 30 s.
-    /// After an error a retry cannot fix, the refresh task waits about 5 minutes.
-    /// While the current token is still in use, neither expired nor invalidated, a wait is at most half the time the token has left, but at least 1 s.
-    /// A `Retry-After` header of the token endpoint makes a wait longer, up to 5 minutes.
-    #[must_use]
-    pub fn max_retries(mut self, max_retries: u32) -> Self {
-        self.max_retries = Some(max_retries);
-        self
-    }
-
-    /// Optionally set how long one token request may take, reading the answer included.
-    /// [`Self::build`] takes at most this long, retries included.
-    /// While a token is valid, one refresh request may take at most half of the time the token has left, but at least 1 s.
-    /// This also applies to a client set with [`Self::danger_http_client`].
-    /// The default is 30 seconds.
-    #[must_use]
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
-        self
-    }
-
-    /// Add a scope to the token request. An empty scope is skipped.
-    /// [`Self::build`] fails if the scope is not valid (RFC 6749, section 3.3), for example if it contains a space.
-    #[must_use]
-    pub fn add_scope(self, scope: &str) -> Self {
-        self.add_scopes(&[scope])
-    }
-
-    /// Add multiple scopes to the token request. Empty scopes are skipped, so a setting split on single spaces works with doubled or trailing spaces.
-    /// [`Self::build`] fails if a scope is not valid (RFC 6749, section 3.3), for example if it contains a space.
-    #[must_use]
-    pub fn add_scopes<I>(mut self, scopes: &[I]) -> Self
-    where
-        I: AsRef<str>,
-    {
-        self.scopes.extend(
-            scopes
-                .iter()
-                .map(AsRef::as_ref)
-                .filter(|scope| !scope.is_empty())
-                .map(str::to_string),
-        );
-        self
-    }
-
-    /// Appends a form parameter to the token request, after the scope. Each call adds one more parameter.
-    /// RFC 6749 (section 3.2) allows each parameter once, so repeat a name only where its specification allows it,
-    /// as RFC 8707 (section 2) does with one `resource` parameter for each resource.
-    ///
-    /// [`Self::build`] fails for a parameter that middle reserves for the grant and the client authentication: `grant_type`, `scope`, `client_id`, `client_secret`,
-    /// `client_assertion`, `client_assertion_type` and `assertion`.
-    #[must_use]
-    pub fn append_param(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.params.push((name.into(), value.into()));
+        self.source.http_client = Some(client);
         self
     }
 
@@ -432,39 +572,7 @@ impl AuthorizerBuilder {
     /// The default is `false`: [`Self::build`] fails for an `http` token URL unless its host is `localhost` or a loopback address (`127.0.0.0/8` or `::1`).
     #[must_use]
     pub fn danger_allow_http(mut self, allow: bool) -> Self {
-        self.allow_http = allow;
-        self
-    }
-
-    /// Disable automatic token refresh.
-    /// Once the first token has expired, the authorizer answers with [`Error::RefreshStopped`].
-    #[must_use]
-    pub fn disable_refresh(mut self) -> Self {
-        self.enable_refresh = false;
-        self
-    }
-
-    /// Set the refresh tolerance: how long before expiry the refresh window ends at the latest.
-    ///
-    /// A token is refreshed at a random point in a window that is 10 % of its lifetime wide and ends at 85 % of it.
-    /// If that end is less than `tolerance` before expiry, the window moves earlier, so that it ends `tolerance` before expiry, but not before half the lifetime.
-    /// For example, a token of 120 s with a tolerance of 30 s is refreshed between 78 s and 90 s, and a token shorter than twice the tolerance between 40 % and 50 % of its lifetime.
-    /// A refresh never comes sooner than 1 s after the request, also when that is less than `tolerance` before expiry, so a token that lives 1 s or less expires before its refresh.
-    /// Default is 30 seconds.
-    #[must_use]
-    pub fn refresh_tolerance(mut self, tolerance: Duration) -> Self {
-        self.refresh_tolerance = Some(tolerance);
-        self
-    }
-
-    /// Set how long a token lives if the token endpoint sends no `expires_in` and the access token is not a JWT with an `exp` in the future.
-    /// Longer lifetimes are shortened to one year.
-    /// Default is 5 minutes.
-    ///
-    /// [`Self::build`] fails for a lifetime shorter than 2 s: a token is refreshed 1 s after its request at the earliest, so a lifetime of at least 2 s makes the refresh come before the token expires.
-    #[must_use]
-    pub fn default_token_lifetime(mut self, lifetime: Duration) -> Self {
-        self.default_token_lifetime = Some(lifetime);
+        self.source.allow_http = allow;
         self
     }
 
@@ -484,59 +592,72 @@ impl AuthorizerBuilder {
     /// - [`Error::TokenRequestPanicked`] in a runtime without IO (`enable_io`).
     /// - Any error of the initial token fetch.
     pub async fn build(self) -> Result<Authorizer, Error> {
-        let default_lifetime = self
-            .default_token_lifetime
-            .unwrap_or(DEFAULT_TOKEN_LIFETIME);
-        if default_lifetime < MIN_DEFAULT_TOKEN_LIFETIME {
-            return Err(ConfigError::DefaultTokenLifetimeTooShort(default_lifetime).into());
-        }
-        let request = TokenRequest::new(
-            self.token_url,
-            self.grant,
-            self.client_auth,
-            &self.scopes,
-            self.params,
-            self.allow_http,
-        )?;
-        let http_client = match self.http_client {
+        self.settings.default_lifetime()?;
+        let FromTokenEndpoint {
+            token_url,
+            grant,
+            client_auth,
+            http_client,
+            scopes,
+            params,
+            allow_http,
+        } = self.source;
+        let request =
+            TokenRequest::new(token_url, grant, client_auth, &scopes, params, allow_http)?;
+        let http_client = match http_client {
             Some(http_client) => http_client,
             None => default_http_client(&request)?,
         };
+        let name = format!("client `{}`", request.log_name());
         let source = Arc::new(ClientCredentials {
             request,
             http_client,
         });
-        let config = CacheConfig {
-            client_id: source.request.log_name(),
-            timeout: self.timeout.unwrap_or(DEFAULT_TIMEOUT),
-            tolerance: self.refresh_tolerance.unwrap_or(DEFAULT_REFRESH_TOLERANCE),
-            default_lifetime,
-            first_token_retries: self.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
-            refresh: self.enable_refresh,
-            wall_clock: SystemTime::now,
-        };
-
-        let (cache, refresh_task) =
-            TokenCache::start(Arc::clone(&source) as Arc<dyn TokenSource>, config).await?;
-        Ok(Authorizer(Kind::Refreshing(Refreshing {
-            inner: Arc::new(Inner {
-                source,
-                cache,
-                refresh_task,
-            }),
-        })))
+        self.settings.start(source, name).await
     }
 }
 
-/// The client credentials grant (RFC 6749, section 4.4).
-#[derive(Debug)]
+impl AuthorizerBuilder<FromSource> {
+    /// Build the [`Authorizer`].
+    /// This asks the source for the first token, which takes at most the [`Self::timeout`], retries included.
+    ///
+    /// Call it inside a Tokio runtime with timers enabled, and IO if the source needs it, such as the one `#[tokio::main]` starts. The refresh task runs on that runtime
+    /// and stops when the runtime shuts down; the authorizer then answers with [`Error::RefreshStopped`] once the token has expired.
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime, or in a runtime without timers (`enable_time`).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Config`] if the default token lifetime is shorter than 2 s.
+    /// - Any error of the first token request, such as [`Error::Source`].
+    pub async fn build(self) -> Result<Authorizer, Error> {
+        let name = format!("token source `{}`", self.source.name);
+        self.settings.start(Arc::new(self.source), name).await
+    }
+}
+
+/// A token endpoint with its request.
 struct ClientCredentials {
     request: TokenRequest,
     http_client: reqwest::Client,
 }
 
-impl TokenSource for ClientCredentials {
-    fn fetch(&self) -> BoxFuture<'_, Result<TokenResponse, Error>> {
+impl fmt::Debug for ClientCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // A custom client may carry default headers that hold secrets.
+        f.debug_struct("TokenEndpoint")
+            .field("request", &self.request)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Fetch for ClientCredentials {
+    fn fetch<'a>(
+        &'a self,
+        _context: &'a TokenContext,
+    ) -> BoxFuture<'a, Result<TokenResponse, Error>> {
         Box::pin(token_endpoint::request_token(
             &self.http_client,
             &self.request,
