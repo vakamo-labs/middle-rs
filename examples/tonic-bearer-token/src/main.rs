@@ -14,7 +14,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect()
         .await?;
     // The interceptor puts the authorization header on every request.
-    let mut client = GreeterServiceClient::with_interceptor(channel, authorizer.interceptor()?);
+    let mut client = GreeterServiceClient::with_interceptor(channel, authorizer.interceptor());
 
     let request = tonic::Request::new(SayHelloRequest {
         name: "Tonic".into(),

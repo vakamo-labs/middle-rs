@@ -142,14 +142,10 @@ impl Authorizer {
     ///
     /// The interceptor does not learn which token a server rejected. To replace a rejected token, put the header of `wait_for_header` on the request yourself,
     /// which the interceptor keeps. If the server answers `unauthenticated`, pass that header to `invalidate`, and retry once if it returns `true`.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the header of the authorizer depends on the URL of the request, which an interceptor does not see.
-    /// A bearer token does not depend on it, so no authorizer of middle fails here.
     #[cfg(feature = "tonic")]
-    pub fn interceptor(&self) -> Result<Interceptor> {
-        Ok(Interceptor(self.clone()))
+    #[must_use]
+    pub fn interceptor(&self) -> Interceptor {
+        Interceptor(self.clone())
     }
 }
 
@@ -302,10 +298,7 @@ mod tests {
     fn test_the_interceptor_adds_the_header() {
         use tonic::service::Interceptor as _;
 
-        let mut interceptor = Authorizer::bearer("my-token")
-            .unwrap()
-            .interceptor()
-            .unwrap();
+        let mut interceptor = Authorizer::bearer("my-token").unwrap().interceptor();
 
         let request = interceptor.call(tonic::Request::new(())).unwrap();
 
@@ -332,10 +325,7 @@ mod tests {
     fn test_the_interceptor_keeps_an_existing_authorization_header() {
         use tonic::service::Interceptor as _;
 
-        let mut interceptor = Authorizer::bearer("my-token")
-            .unwrap()
-            .interceptor()
-            .unwrap();
+        let mut interceptor = Authorizer::bearer("my-token").unwrap().interceptor();
         let mut request = tonic::Request::new(());
         request
             .metadata_mut()

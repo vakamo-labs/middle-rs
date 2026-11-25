@@ -33,7 +33,7 @@ async fn test_the_interceptor_keeps_refreshing_after_the_authorizer_is_dropped()
     // A token that lives 2 seconds is refreshed after about 1 second.
     let idp = FakeIdp::start(|number| Reply::token(&format!("token-{number}"), Some(2))).await;
     let authorizer = authorizer(&idp).await;
-    let mut interceptor = authorizer.interceptor().unwrap();
+    let mut interceptor = authorizer.interceptor();
     drop(authorizer);
 
     assert_eq!(intercept(&mut interceptor).unwrap(), "Bearer token-1");
@@ -51,7 +51,7 @@ async fn test_the_interceptor_fails_with_unauthenticated_without_a_valid_token()
         _ => Reply::oauth_error(400, "invalid_client", "the client is disabled"),
     })
     .await;
-    let mut interceptor = authorizer(&idp).await.interceptor().unwrap();
+    let mut interceptor = authorizer(&idp).await.interceptor();
 
     let failed = wait_until(Duration::from_secs(10), || {
         intercept(&mut interceptor).is_err()
@@ -72,7 +72,7 @@ async fn test_the_interceptor_fails_with_unavailable_while_a_retry_can_help() {
         _ => Reply::oauth_error(503, "temporarily_unavailable", "the server is busy"),
     })
     .await;
-    let mut interceptor = authorizer(&idp).await.interceptor().unwrap();
+    let mut interceptor = authorizer(&idp).await.interceptor();
 
     let failed = wait_until(Duration::from_secs(10), || {
         intercept(&mut interceptor).is_err()
