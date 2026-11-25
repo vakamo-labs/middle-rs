@@ -88,8 +88,16 @@ tokio = { version = "1.43", features = [
 tracing-test = "0.2.5"
 
 [[test]]
+name = "client_assertion"
+required-features = ["client-credentials"]
+
+[[test]]
 name = "jwt"
 required-features = ["jwt"]
+
+[[test]]
+name = "jwt_client_authentication"
+required-features = ["jwt", "client-credentials"]
 
 [[test]]
 name = "proxy"

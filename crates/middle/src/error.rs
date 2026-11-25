@@ -1,6 +1,6 @@
 //! The errors of middle.
 
-use std::{fmt, sync::Arc, time::Duration};
+use std::{borrow::Cow, fmt, sync::Arc, time::Duration};
 
 use http::StatusCode;
 
@@ -52,7 +52,7 @@ pub enum Error {
     /// A request sent through [`crate::HttpClient`] failed.
     #[error("Request failed: {0}")]
     ReqwestFailed(#[from] Arc<reqwest::Error>),
-    /// An assertion could not be created, for example because signing failed.
+    /// An assertion could not be created, for example because signing failed or an assertion file cannot be read.
     #[error(transparent)]
     Assertion(#[from] AssertionError),
 }
@@ -84,7 +84,8 @@ impl Error {
     /// Retryable are transport errors, timeouts, and answers with HTTP 408, 429 or 5xx, whatever OAuth error they carry. These statuses ask for a later attempt, and a 5xx comes from a server that failed, so its code is not reliable.
     /// The OAuth errors `server_error` and `temporarily_unavailable` are retryable with any status.
     /// [`Error::TokenExpired`] is retryable, because a refresh is due. [`Error::ExpiredOnArrival`] is retryable, because a faster answer brings a usable token.
-    /// Not retryable are other OAuth errors with another status, such as `invalid_client` with HTTP 401, redirect errors of the HTTP client, answers middle cannot use, configuration errors, assertions that cannot be created, a panicked token request, and [`Error::RefreshStopped`].
+    /// [`Error::Assertion`] is retryable unless [`AssertionError::permanent`] marks it: middle creates the assertion before it sends the request, so a retry costs the token endpoint nothing, and an assertion file or a signing service can recover.
+    /// Not retryable are other OAuth errors with another status, such as `invalid_client` with HTTP 401, redirect errors of the HTTP client, answers middle cannot use, configuration errors, a panicked token request, and [`Error::RefreshStopped`].
     /// Requests sent through [`crate::HttpClient`] are not retryable, because middle cannot know whether they are safe to repeat.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
@@ -99,11 +100,11 @@ impl Error {
             Self::Http(error) => is_retryable_status(error.status()),
             Self::Transport(TransportError(error)) => !error.is_builder() && !error.is_redirect(),
             Self::Timeout(_) | Self::TokenExpired | Self::ExpiredOnArrival(_) => true,
+            Self::Assertion(error) => !error.permanent,
             Self::InvalidResponse(_)
             | Self::Config(_)
             | Self::InvalidHeaderValue
             | Self::ReqwestFailed(_)
-            | Self::Assertion(_)
             | Self::RefreshStopped
             | Self::TokenRequestPanicked => false,
         }
@@ -411,32 +412,67 @@ impl fmt::Display for ResponseProblem {
     }
 }
 
-/// An assertion that could not be created. [`std::error::Error::source`] is the cause.
+/// An assertion that could not be created, for example because signing failed or an assertion file cannot be read.
+/// [`std::error::Error::source`] is the cause, if there is one.
+///
+/// A retry may fix it, unless it is marked with [`AssertionError::permanent`].
 #[derive(Debug, Clone)]
 pub struct AssertionError {
-    message: &'static str,
-    source: Arc<dyn std::error::Error + Send + Sync>,
+    message: Cow<'static, str>,
+    source: Option<Arc<dyn std::error::Error + Send + Sync>>,
+    permanent: bool,
 }
 
 impl AssertionError {
+    /// An error with a message that says what failed. The message is shown and logged, so it must not hold the assertion or a key.
+    #[must_use]
+    pub fn new(message: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            message: message.into(),
+            source: None,
+            permanent: false,
+        }
+    }
+
+    /// Marks the error as one a retry cannot fix, such as a signing service that denies access.
+    /// Building an authorizer then fails at once, and its refresh task retries only about every 5 minutes.
+    #[must_use]
+    pub fn permanent(mut self) -> Self {
+        self.permanent = true;
+        self
+    }
+
+    /// Sets the cause, which [`std::error::Error::source`] returns.
+    #[must_use]
+    pub fn with_source(
+        mut self,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
+        self.source = Some(Arc::from(source.into()));
+        self
+    }
+
     #[cfg(feature = "jwt")]
-    pub(crate) fn new(
-        message: &'static str,
+    pub(crate) fn with_shared_source(
+        mut self,
         source: Arc<dyn std::error::Error + Send + Sync>,
     ) -> Self {
-        Self { message, source }
+        self.source = Some(source);
+        self
     }
 }
 
 impl fmt::Display for AssertionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.message)
+        f.write_str(&self.message)
     }
 }
 
 impl std::error::Error for AssertionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&*self.source)
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
     }
 }
 

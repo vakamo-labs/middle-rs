@@ -29,7 +29,10 @@ use sec1::{EcParameters, EcPrivateKey};
 use serde_json::{Map, Value};
 use spki::{AlgorithmIdentifierRef, SubjectPublicKeyInfoRef};
 
-use crate::error::{AssertionError, ConfigError, DisplayChain, Error};
+use crate::{
+    SignedJwt,
+    error::{AssertionError, ConfigError, DisplayChain},
+};
 
 /// Registered claims middle sets itself (RFC 7519, section 4.1).
 const REGISTERED_CLAIMS: [&str; 6] = ["iss", "sub", "aud", "exp", "iat", "jti"];
@@ -40,8 +43,15 @@ const DEFAULT_LIFETIME: Duration = Duration::from_secs(60);
 /// The shortest lifetime [`JwtAssertion::with_lifetime`] accepts.
 const MIN_LIFETIME: Duration = Duration::from_secs(1);
 
-/// The longest lifetime [`JwtAssertion::with_lifetime`] accepts. Servers such as Okta refuse client assertions that live longer, and an assertion can be replayed until it expires.
+/// The longest lifetime [`JwtAssertion::with_lifetime`] accepts. Some servers refuse client assertions that live longer, and an assertion can be replayed until it expires.
 const MAX_LIFETIME: Duration = Duration::from_secs(3600);
+
+/// How many seconds `iat` lies before the signing, so that a server whose clock is slightly behind accepts the assertion.
+const IAT_BEFORE_SIGNING: u64 = 5;
+
+/// The `typ` header of a client authentication JWT for the issuer (RFC 10070, section 4).
+#[cfg(feature = "client-credentials")]
+const CLIENT_AUTHENTICATION_JWT_TYPE: &str = "client-authentication+jwt";
 
 /// RFC 7518, section 3.3: RSA keys have at least 2048 bits.
 const MIN_RSA_BITS: usize = 2048;
@@ -455,7 +465,8 @@ pub struct JwtAssertion {
 impl JwtAssertion {
     /// An assertion from `issuer` about `subject` for `audience`, valid for 60 seconds, with the header `typ: JWT`. `aud` is `audience` as a single string.
     ///
-    /// For JWT client authentication, `issuer` and `subject` are both the client id (RFC 7523, section 3), and `audience` is the issuer identifier of the authorization server (RFC 10070). Some providers, such as Entra ID and Okta, document their token endpoint URL as the audience: pass what the provider expects.
+    /// For JWT client authentication, `issuer` and `subject` are both the client id (RFC 7523, section 3). `ClientAuthentication::private_key_jwt` builds that assertion with an [`Audience`].
+    /// Pass a `JwtAssertion` to `ClientAuthentication::client_assertion` for other claims or another header, for example for an authorization server that refuses the type `client-authentication+jwt`.
     #[must_use]
     pub fn new(
         key: SigningKey,
@@ -474,11 +485,11 @@ impl JwtAssertion {
         }
     }
 
-    /// Sets how long an assertion is valid, from one second to one hour. `exp` is `iat` plus the whole seconds of the lifetime, so a fraction of a second is cut off.
+    /// Sets how long an assertion is valid, from one second to one hour. `exp` is the time of signing plus the whole seconds of the lifetime, so a fraction of a second is cut off.
     ///
     /// # Errors
     ///
-    /// [`ConfigError::AssertionLifetime`] for a lifetime shorter than one second or longer than one hour. Servers such as Okta refuse client assertions that live longer, and an assertion can be replayed until it expires.
+    /// [`ConfigError::AssertionLifetime`] for a lifetime shorter than one second or longer than one hour. Some servers refuse client assertions that live longer, and an assertion can be replayed until it expires.
     pub fn with_lifetime(mut self, lifetime: Duration) -> Result<Self, ConfigError> {
         if !(MIN_LIFETIME..=MAX_LIFETIME).contains(&lifetime) {
             return Err(ConfigError::AssertionLifetime(lifetime));
@@ -521,21 +532,26 @@ impl JwtAssertion {
         Ok(self)
     }
 
-    /// Signs a new assertion: `iat` is now, `exp` is now plus the lifetime, and `jti` is 16 random bytes.
+    /// Signs a new assertion: `iat` is 5 seconds before now, so that a server whose clock is slightly behind accepts it, `exp` is now plus the lifetime, and `jti` is 16 random bytes.
     ///
     /// # Errors
     ///
-    /// [`Error::Assertion`] if the system clock is before 1970, the system has no randomness, or signing fails.
-    pub fn sign(&self) -> Result<SignedJwt, Error> {
+    /// [`AssertionError`] if the system clock is before 1970, the system has no randomness, or signing fails.
+    pub fn sign(&self) -> Result<SignedJwt, AssertionError> {
+        self.sign_for(&self.audience)
+    }
+
+    /// Signs a new assertion for `audience`.
+    fn sign_for(&self, audience: &str) -> Result<SignedJwt, AssertionError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| {
-                AssertionError::new("the system clock is before 1970", Arc::new(error))
+                AssertionError::new("the system clock is before 1970").with_source(error)
             })?
             .as_secs();
         let mut jti = [0u8; 16];
         getrandom::fill(&mut jti).map_err(|error| {
-            AssertionError::new("the system has no randomness for `jti`", Arc::new(error))
+            AssertionError::new("the system has no randomness for `jti`").with_source(error)
         })?;
 
         let mut header = Map::new();
@@ -553,8 +569,11 @@ impl JwtAssertion {
         let mut claims = self.claims.clone();
         claims.insert("iss".to_string(), self.issuer.as_str().into());
         claims.insert("sub".to_string(), self.subject.as_str().into());
-        claims.insert("aud".to_string(), self.audience.as_str().into());
-        claims.insert("iat".to_string(), now.into());
+        claims.insert("aud".to_string(), audience.into());
+        claims.insert(
+            "iat".to_string(),
+            now.saturating_sub(IAT_BEFORE_SIGNING).into(),
+        );
         claims.insert(
             "exp".to_string(),
             now.saturating_add(self.lifetime.as_secs()).into(),
@@ -570,12 +589,82 @@ impl JwtAssertion {
             .key
             .sign_bytes(message.as_bytes())
             .map_err(|SignError(error)| {
-                AssertionError::new("signing the assertion failed", error)
+                AssertionError::new("signing the assertion failed").with_shared_source(error)
             })?;
-        Ok(SignedJwt(format!(
+        Ok(SignedJwt::from_signed(format!(
             "{message}.{}",
             URL_SAFE_NO_PAD.encode(signature)
         )))
+    }
+}
+
+/// Signs a new assertion for every token request.
+#[cfg(feature = "client-credentials")]
+impl crate::AssertionSource for JwtAssertion {
+    fn assertion<'a>(
+        &'a self,
+        _context: &'a crate::AssertionContext,
+    ) -> crate::AssertionFuture<'a> {
+        Box::pin(std::future::ready(self.sign().map(crate::Assertion::from)))
+    }
+}
+
+/// The audience of a client authentication JWT, see `ClientAuthentication::private_key_jwt`.
+///
+/// RFC 10070 (section 4) requires the issuer, while OpenID Connect Core 1.0 (section 9) names the token endpoint URL.
+/// Authorization servers differ in which one they accept, so the caller chooses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Audience {
+    /// The issuer identifier of the authorization server, exactly as its metadata names it (RFC 8414, section 2), including a trailing slash if it has one:
+    /// RFC 10070 requires that servers compare it as a simple string. The header `typ` is `client-authentication+jwt`, which RFC 10070 recommends.
+    Issuer(String),
+    /// The URL of the token endpoint the request goes to. The header `typ` is `JWT`.
+    TokenEndpoint,
+}
+
+/// The assertion of `private_key_jwt` and `client_secret_jwt`: `iss` and `sub` are the client id, `aud` and `typ` follow the [`Audience`].
+#[cfg(feature = "client-credentials")]
+pub(crate) struct ClientAuthenticationJwt {
+    assertion: JwtAssertion,
+    audience: Audience,
+}
+
+#[cfg(feature = "client-credentials")]
+impl ClientAuthenticationJwt {
+    pub(crate) fn new(key: SigningKey, client_id: &str, audience: Audience) -> Self {
+        let (aud, token_type) = match &audience {
+            Audience::Issuer(issuer) => (issuer.clone(), CLIENT_AUTHENTICATION_JWT_TYPE),
+            // `assertion` signs for the token URL it gets with each request.
+            Audience::TokenEndpoint => (String::new(), "JWT"),
+        };
+        Self {
+            assertion: JwtAssertion::new(key, client_id, client_id, aud).with_type(token_type),
+            audience,
+        }
+    }
+}
+
+#[cfg(feature = "client-credentials")]
+impl crate::AssertionSource for ClientAuthenticationJwt {
+    fn assertion<'a>(&'a self, context: &'a crate::AssertionContext) -> crate::AssertionFuture<'a> {
+        let signed = match &self.audience {
+            Audience::Issuer(issuer) => self.assertion.sign_for(issuer),
+            Audience::TokenEndpoint => self.assertion.sign_for(context.token_url().as_str()),
+        };
+        Box::pin(std::future::ready(signed.map(crate::Assertion::from)))
+    }
+}
+
+#[cfg(feature = "client-credentials")]
+impl fmt::Debug for ClientAuthenticationJwt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientAuthenticationJwt")
+            .field("key", &self.assertion.key)
+            .field("client_id", &self.assertion.issuer)
+            .field("audience", &self.audience)
+            .field("lifetime", &self.assertion.lifetime)
+            .finish()
     }
 }
 
@@ -591,30 +680,6 @@ impl fmt::Debug for JwtAssertion {
             .field("token_type", &self.token_type)
             .field("claim_names", &claim_names)
             .finish()
-    }
-}
-
-/// A signed JWT in compact form. `Debug` never shows it.
-#[derive(Clone)]
-pub struct SignedJwt(String);
-
-impl SignedJwt {
-    /// The JWT in compact form.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// The JWT in compact form.
-    #[must_use]
-    pub fn into_string(self) -> String {
-        self.0
-    }
-}
-
-impl fmt::Debug for SignedJwt {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("SignedJwt([redacted])")
     }
 }
 
