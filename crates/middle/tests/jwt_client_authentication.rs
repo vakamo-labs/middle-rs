@@ -87,7 +87,13 @@ fn client_assertion(request: &Request, client_id: &str) -> String {
 }
 
 /// Checks the claims RFC 7523 (section 3) and RFC 10070 require of a client authentication JWT from `client_id` for `audience`.
-fn assert_client_claims(claims: &serde_json::Map<String, Value>, client_id: &str, audience: &str) {
+/// `signed_after` is a time before the request.
+fn assert_client_claims(
+    claims: &serde_json::Map<String, Value>,
+    client_id: &str,
+    audience: &str,
+    signed_after: u64,
+) {
     let mut names: Vec<&str> = claims.keys().map(String::as_str).collect();
     names.sort_unstable();
     assert_eq!(names, ["aud", "exp", "iat", "iss", "jti", "sub"]);
@@ -97,7 +103,7 @@ fn assert_client_claims(claims: &serde_json::Map<String, Value>, client_id: &str
     // `iat` lies 5 seconds before the signing, and `exp` 60 seconds after it.
     let iat = claims["iat"].as_u64().unwrap();
     let signed_at = iat + 5;
-    assert!((now() - 2..=now()).contains(&signed_at), "iat {iat}");
+    assert!((signed_after..=now()).contains(&signed_at), "iat {iat}");
     assert_eq!(claims["exp"].as_u64().unwrap(), signed_at + 60);
     assert_eq!(claims["jti"].as_str().unwrap().len(), 22);
 }
@@ -106,6 +112,7 @@ fn assert_client_claims(claims: &serde_json::Map<String, Value>, client_id: &str
 async fn test_private_key_jwt_signs_a_typed_assertion_for_the_issuer() {
     let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
 
+    let before = now();
     ClientCredentialAuthorizer::builder(
         idp.token_url(),
         ClientAuthentication::private_key_jwt("my-client", ec_key().with_key_id("key-1"), issuer()),
@@ -121,13 +128,14 @@ async fn test_private_key_jwt_signs_a_typed_assertion_for_the_issuer() {
         jwt.header,
         json!({"alg": "ES256", "typ": "client-authentication+jwt", "kid": "key-1"})
     );
-    assert_client_claims(&jwt.claims, "my-client", ISSUER);
+    assert_client_claims(&jwt.claims, "my-client", ISSUER, before);
 }
 
 #[tokio::test]
 async fn test_client_secret_jwt_signs_with_the_secret_and_does_not_send_it() {
     let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
 
+    let before = now();
     ClientCredentialAuthorizer::builder(
         idp.token_url(),
         ClientAuthentication::client_secret_jwt("my-client", CLIENT_SECRET, issuer()).unwrap(),
@@ -148,7 +156,7 @@ async fn test_client_secret_jwt_signs_with_the_secret_and_does_not_send_it() {
         jwt.header,
         json!({"alg": "HS256", "typ": "client-authentication+jwt"})
     );
-    assert_client_claims(&jwt.claims, "my-client", ISSUER);
+    assert_client_claims(&jwt.claims, "my-client", ISSUER, before);
 }
 
 #[test]
@@ -175,6 +183,7 @@ async fn test_private_key_jwt_for_the_token_endpoint_signs_an_untyped_jwt_for_it
     let mut token_url = idp.token_url();
     token_url.set_query(Some("tenant=t1"));
 
+    let before = now();
     ClientCredentialAuthorizer::builder(
         token_url.clone(),
         ClientAuthentication::private_key_jwt("my-client", ec_key(), Audience::TokenEndpoint),
@@ -187,7 +196,7 @@ async fn test_private_key_jwt_for_the_token_endpoint_signs_an_untyped_jwt_for_it
     let public_key = DecodingKey::from_ec_pem(EC_P256_PUBLIC.as_bytes()).unwrap();
     let jwt = verify(&assertion, Algorithm::ES256, &public_key);
     assert_eq!(jwt.header, json!({"alg": "ES256", "typ": "JWT"}));
-    assert_client_claims(&jwt.claims, "my-client", token_url.as_str());
+    assert_client_claims(&jwt.claims, "my-client", token_url.as_str(), before);
 }
 
 #[tokio::test]
@@ -196,6 +205,7 @@ async fn test_a_jwt_assertion_is_a_source_that_sends_its_own_header() {
     // For an authorization server that refuses the type `client-authentication+jwt`.
     let assertion = JwtAssertion::new(ec_key(), "my-client", "my-client", ISSUER);
 
+    let before = now();
     ClientCredentialAuthorizer::builder(
         idp.token_url(),
         ClientAuthentication::client_assertion("my-client", assertion),
@@ -208,7 +218,7 @@ async fn test_a_jwt_assertion_is_a_source_that_sends_its_own_header() {
     let public_key = DecodingKey::from_ec_pem(EC_P256_PUBLIC.as_bytes()).unwrap();
     let jwt = verify(&assertion, Algorithm::ES256, &public_key);
     assert_eq!(jwt.header, json!({"alg": "ES256", "typ": "JWT"}));
-    assert_client_claims(&jwt.claims, "my-client", ISSUER);
+    assert_client_claims(&jwt.claims, "my-client", ISSUER, before);
 }
 
 #[test]

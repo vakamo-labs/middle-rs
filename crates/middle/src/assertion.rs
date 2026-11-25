@@ -79,14 +79,15 @@ fn is_compact_jws(jwt: &str) -> bool {
         })
 }
 
-/// An assertion as middle sends it to the token endpoint (RFC 7521), such as a signed JWT or a base64url-encoded SAML assertion. `Debug` never shows it.
+/// An assertion as middle sends it to the token endpoint, such as a signed or an encrypted JWT (RFC 7523).
+/// middle sends it with the `client_assertion_type` `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`. `Debug` never shows it.
 #[cfg(feature = "client-credentials")]
 #[derive(Clone)]
 pub struct Assertion(String);
 
 #[cfg(feature = "client-credentials")]
 impl Assertion {
-    /// An assertion of any type. [`SignedJwt`] converts into one with `From`.
+    /// An assertion that middle does not check for the form of a signed JWT, such as an encrypted JWT. [`SignedJwt`] converts into one with `From`.
     ///
     /// # Errors
     ///

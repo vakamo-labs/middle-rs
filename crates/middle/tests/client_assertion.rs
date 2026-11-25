@@ -73,16 +73,19 @@ impl AssertionSource for CountingSource {
     }
 }
 
-/// An assertion that is not a JWT, such as a base64url-encoded SAML assertion (RFC 7522).
-#[derive(Debug)]
-struct SamlSource;
+/// An encrypted JWT (RFC 7516, section 7.1): five parts, which `SignedJwt` refuses.
+const ENCRYPTED_JWT: &str = "eyJhbGciOiJSU0EtT0FFUCJ9.a2V5.aXY.Y2lwaGVydGV4dA.dGFn";
 
-impl AssertionSource for SamlSource {
+/// Hands out [`ENCRYPTED_JWT`].
+#[derive(Debug)]
+struct EncryptedJwtSource;
+
+impl AssertionSource for EncryptedJwtSource {
     fn assertion<'a>(
         &'a self,
         _context: &'a AssertionContext,
     ) -> Pin<Box<dyn Future<Output = Result<Assertion, AssertionError>> + Send + 'a>> {
-        Box::pin(async { Assertion::new("PHNhbWw6QXNzZXJ0aW9uLz4") })
+        Box::pin(async { Assertion::new(ENCRYPTED_JWT) })
     }
 }
 
@@ -172,12 +175,12 @@ async fn test_the_client_id_parameter_can_be_left_out() {
 }
 
 #[tokio::test]
-async fn test_an_assertion_that_is_not_a_jwt_is_sent_as_it_is() {
+async fn test_an_encrypted_jwt_is_sent_as_it_is() {
     let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
 
     ClientCredentialAuthorizer::builder(
         idp.token_url(),
-        ClientAuthentication::client_assertion("c", SamlSource),
+        ClientAuthentication::client_assertion("c", EncryptedJwtSource),
     )
     .build()
     .await
@@ -185,7 +188,7 @@ async fn test_an_assertion_that_is_not_a_jwt_is_sent_as_it_is() {
 
     assert_eq!(
         idp.requests()[0].form_value("client_assertion").as_deref(),
-        Some("PHNhbWw6QXNzZXJ0aW9uLz4")
+        Some(ENCRYPTED_JWT)
     );
 }
 
@@ -193,7 +196,7 @@ async fn test_an_assertion_that_is_not_a_jwt_is_sent_as_it_is() {
 async fn test_one_source_can_serve_several_authorizers() {
     let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
     let shared = Arc::new(CountingSource::default());
-    let boxed: Box<dyn AssertionSource> = Box::new(SamlSource);
+    let boxed: Box<dyn AssertionSource> = Box::new(EncryptedJwtSource);
 
     for authentication in [
         ClientAuthentication::client_assertion("c", Arc::clone(&shared)),
