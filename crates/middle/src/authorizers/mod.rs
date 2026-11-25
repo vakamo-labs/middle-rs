@@ -61,6 +61,8 @@ impl Authorizer {
 
     /// The header value of the current token, `Bearer` and the token, without waiting.
     ///
+    /// To drop a token that a server rejects, use [`Self::token_header`] or `wait_for_header`: `invalidate` takes the header they return.
+    ///
     /// # Errors
     ///
     /// See [`Self::token_header`].
@@ -134,7 +136,12 @@ impl Authorizer {
     }
 
     /// An interceptor for tonic clients that puts the header of this authorizer on every request without an `Authorization` header.
-    /// It never waits: a request fails with the status `unauthenticated` if no valid token is available.
+    ///
+    /// It never waits. Without a valid token, the request fails with the status `unavailable` if a retry can help, for example while the token endpoint
+    /// cannot be reached or a refresh is pending, and with `unauthenticated` otherwise. The source of the status is the [`Error`].
+    ///
+    /// The interceptor does not learn which token a server rejected. To replace a rejected token, put the header of `wait_for_header` on the request yourself,
+    /// which the interceptor keeps. If the server answers `unauthenticated`, pass that header to `invalidate`, and retry once if it returns `true`.
     ///
     /// # Errors
     ///
@@ -199,14 +206,24 @@ impl tonic::service::Interceptor for Interceptor {
             let value = match &(self.0).0 {
                 Kind::Static(header) => header.metadata.clone(),
                 #[cfg(feature = "client-credentials")]
-                Kind::Refreshing(refreshing) => refreshing
-                    .metadata()
-                    .map_err(|error| tonic::Status::unauthenticated(error.to_string()))?,
+                Kind::Refreshing(refreshing) => refreshing.metadata().map_err(status)?,
             };
             metadata.insert(http::header::AUTHORIZATION.as_str(), value);
         }
         Ok(request)
     }
+}
+
+/// The status of a request that has no valid token: `unavailable` if a retry can help, else `unauthenticated`, with `error` as its source.
+#[cfg(all(feature = "tonic", feature = "client-credentials"))]
+fn status(error: Error) -> tonic::Status {
+    let mut status = if error.is_retryable() {
+        tonic::Status::unavailable(error.to_string())
+    } else {
+        tonic::Status::unauthenticated(error.to_string())
+    };
+    status.set_source(std::sync::Arc::new(error));
+    status
 }
 
 /// Fails with [`Error::InvalidHeaderValue`] if the string is not ASCII.

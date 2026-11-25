@@ -62,4 +62,33 @@ async fn test_the_interceptor_fails_with_unauthenticated_without_a_valid_token()
     let status = intercept(&mut interceptor).unwrap_err();
     assert_eq!(status.code(), tonic::Code::Unauthenticated, "{status:?}");
     assert!(status.message().contains("invalid_client"), "{status:?}");
+    assert!(!middle_error(&status).is_retryable());
+}
+
+#[tokio::test]
+async fn test_the_interceptor_fails_with_unavailable_while_a_retry_can_help() {
+    let idp = FakeIdp::start(|number| match number {
+        1 => Reply::token("t", Some(2)),
+        _ => Reply::oauth_error(503, "temporarily_unavailable", "the server is busy"),
+    })
+    .await;
+    let mut interceptor = authorizer(&idp).await.interceptor().unwrap();
+
+    let failed = wait_until(Duration::from_secs(10), || {
+        intercept(&mut interceptor).is_err()
+    })
+    .await;
+
+    assert!(failed);
+    let status = intercept(&mut interceptor).unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+    assert!(middle_error(&status).is_retryable());
+}
+
+/// The error of middle that a failed interceptor attaches to the status.
+fn middle_error(status: &tonic::Status) -> &middle::Error {
+    std::error::Error::source(status)
+        .expect("the status has the error of middle as its source")
+        .downcast_ref::<middle::Error>()
+        .unwrap()
 }

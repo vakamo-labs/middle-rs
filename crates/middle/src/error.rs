@@ -26,8 +26,8 @@ pub enum Error {
     /// The token request did not complete, for example because the connection failed.
     #[error(transparent)]
     Transport(#[from] TransportError),
-    /// The token endpoint did not answer within this time.
-    #[error("the token endpoint did not answer within {0:?}")]
+    /// The token request did not complete within this time, creating an assertion and reading the answer included.
+    #[error("the token request did not complete within {0:?}")]
     Timeout(Duration),
     /// The configuration cannot work.
     #[error(transparent)]

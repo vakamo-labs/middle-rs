@@ -20,7 +20,7 @@ This crate provides authentication middleware for clients that need to access se
 
 In the following example, an `Authorizer` requests a token with the client credentials grant and keeps it fresh in a background task. Each request takes the header of a valid token. A token that the server rejects is dropped, and the request is retried once with a new token.
 
-```rust
+```rust,no_run
 use std::str::FromStr;
 
 use middle::{Authorizer, ClientAuthentication, TokenHeader};
@@ -67,11 +67,68 @@ async fn get_data(client: &Client, header: &TokenHeader) -> Response {
 }
 ```
 
+## JWT Bearer Grant
+
+With the JWT bearer grant (RFC 7523, section 2.1), a signed JWT is the grant, for example for a service account with a key file. With the `jwt` feature, middle signs the JWT itself. Without it, pass any `AssertionSource`, such as a `FileAssertion`.
+
+```rust,ignore
+use std::time::Duration;
+
+use middle::{
+    Authorizer, TokenHeader,
+    jwt::{JwtAssertion, SigningAlgorithm, SigningKey},
+};
+use reqwest::{Client, Response, StatusCode, header::AUTHORIZATION};
+use url::Url;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The private key, the key id, the issuer, the subject and the audience come from the service account key file.
+    let private_key = std::fs::read_to_string("service-account-key.pem")?;
+    let key = SigningKey::from_pem(&private_key, SigningAlgorithm::Rs512)?.with_key_id("my-key-id");
+    let assertion = JwtAssertion::new(
+        key,
+        "my-issuer",
+        "my-subject",
+        "https://identity.example.com",
+    )
+    .with_lifetime(Duration::from_secs(600))?;
+
+    // The JWT is the grant. middle signs a new one for every token request and keeps the token refreshed in the background.
+    let token_endpoint = Url::parse("https://identity.example.com/oauth2/token")?;
+    let authorizer = Authorizer::jwt_bearer(token_endpoint, assertion)
+        .append_param("resource", "https://api.example.com")
+        .build()
+        .await?;
+    let client = Client::new();
+
+    // The header of a valid token. If the token has expired, this waits for the refresh.
+    let header = authorizer.wait_for_header().await?;
+    let mut response = get_data(&client, &header).await?;
+
+    // If the server rejects the token, drop it. If another token can come, retry once with it.
+    if response.status() == StatusCode::UNAUTHORIZED && authorizer.invalidate(&header) {
+        let header = authorizer.wait_for_header().await?;
+        response = get_data(&client, &header).await?;
+    }
+    println!("{}", response.status());
+    Ok(())
+}
+
+async fn get_data(client: &Client, header: &TokenHeader) -> reqwest::Result<Response> {
+    client
+        .get("https://api.example.com/data")
+        .header(AUTHORIZATION, header.header().clone())
+        .send()
+        .await
+}
+```
+
 ## Tonic Integration
 
 With the `tonic` feature, `Authorizer::interceptor` returns an interceptor that puts the authorization header on every request.
 
-```rust
+```rust,ignore
 use hello_world::{SayHelloRequest, greeter_service_client::GreeterServiceClient};
 use middle::Authorizer;
 use tonic::transport::Endpoint;
@@ -107,7 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **all**: Includes `rustls-tls`, `tonic`, `client-credentials`, `runtime-tokio`, `jwt`, and `aws-lc-rs`.
 - **default**: Includes `rustls-tls`, `client-credentials`, and `runtime-tokio`.
 - **rustls-tls**: Enables reqwest's `rustls` feature: TLS with rustls and aws-lc-rs, checking certificates against the root certificates of the operating system. A container image needs them installed, for example with the `ca-certificates` package.
-- **tonic**: `Authorizer::interceptor`, a `tonic::service::Interceptor`
+- **tonic**: `Authorizer::interceptor`, a `tonic::service::Interceptor` of tonic 0.14
 - **runtime-tokio**: Enables the `tokio` runtime (currently the only supported async runtime), which refreshes requested tokens in a background task.
 - **client-credentials**: Tokens from a token endpoint, such as `Authorizer::client_credentials` for the OAuth2 client credentials grant
 - **jwt**: Signs JWT assertions (RFC 7523) with `middle::jwt`. Enable `jwt` with exactly one of these crypto backends:

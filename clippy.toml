@@ -1,2 +1,2 @@
 # `..` keeps clippy's default list.
-doc-valid-idents = ["OpenID", ".."]
+doc-valid-idents = ["OAuth2", "OpenID", "RustCrypto", ".."]

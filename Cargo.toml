@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/middle",
+    "examples/jwt-bearer-grant",
     "examples/reqwest-client-credentials",
     "examples/tonic-bearer-token",
 ]

@@ -219,7 +219,8 @@ impl ClientAuthentication {
 
     /// Leaves out the form parameter `client_id` of a client assertion, which RFC 7521 (section 4.2) makes optional. The client id still names the client in logs and in the [`crate::AssertionContext`].
     ///
-    /// Some authorization servers refuse a `client_id` that differs from the `sub` of the assertion, as it does with a Kubernetes service account token.
+    /// Some authorization servers refuse a `client_id` that differs from the `sub` of the assertion. The `sub` of a Kubernetes service account token is
+    /// `system:serviceaccount:<namespace>:<name>`, which differs from most client ids, so leave the parameter out for such a server.
     /// Other servers require `client_id`. Client secrets always send the client id.
     #[must_use]
     pub fn without_client_id_parameter(self) -> Self {

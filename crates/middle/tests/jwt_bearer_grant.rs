@@ -195,6 +195,11 @@ async fn test_a_grant_source_that_does_not_answer_is_bounded_by_the_timeout() {
         matches!(error, Error::Timeout(timeout) if timeout == Duration::from_millis(200)),
         "{error:?}"
     );
+    // The token endpoint got no request, so the message does not blame it.
+    assert_eq!(
+        error.to_string(),
+        "the token request did not complete within 200ms"
+    );
     assert_eq!(idp.count(), 0);
 }
 
