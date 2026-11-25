@@ -66,7 +66,7 @@ pub(crate) struct TokenResponse {
 pub(crate) struct AccessToken(String);
 
 impl AccessToken {
-    fn parse(token: &str) -> Option<Self> {
+    pub(crate) fn parse(token: &str) -> Option<Self> {
         let valid = !token.is_empty() && token.bytes().all(|b| b.is_ascii_graphic());
         valid.then(|| Self(token.to_string()))
     }

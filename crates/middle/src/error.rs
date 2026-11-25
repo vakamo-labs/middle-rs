@@ -35,9 +35,20 @@ pub enum Error {
     /// The token cannot be used as a header value.
     #[error("the token cannot be used as a header value; it must be visible ASCII")]
     InvalidHeaderValue,
-    /// The token has expired and a refresh has not succeeded yet.
-    #[error("the token has expired and a refresh has not succeeded yet")]
+    /// The token has expired or was invalidated, and a refresh has not succeeded yet.
+    #[error("the token has expired or was invalidated, and a refresh has not succeeded yet")]
     TokenExpired,
+    /// The token has expired or was invalidated, and no refresh task is running: refresh is disabled, or the task ended, for example because its runtime shut down.
+    #[error("the token has expired or was invalidated, and no refresh task is running")]
+    RefreshStopped,
+    /// The token request panicked.
+    #[error("the token request panicked")]
+    TokenRequestPanicked,
+    /// The token had expired when the answer arrived: the request took longer than the token lives, counted from the request. The value is that lifetime.
+    #[error(
+        "the token had expired when the answer arrived: it lives {0:?} from the request, and the request took longer"
+    )]
+    ExpiredOnArrival(Duration),
     /// A request sent through [`crate::HttpClient`] failed.
     #[error("Request failed: {0}")]
     ReqwestFailed(#[from] Arc<reqwest::Error>),
@@ -72,7 +83,8 @@ impl Error {
     ///
     /// Retryable are transport errors, timeouts, and answers with HTTP 408, 429 or 5xx, whatever OAuth error they carry. These statuses ask for a later attempt, and a 5xx comes from a server that failed, so its code is not reliable.
     /// The OAuth errors `server_error` and `temporarily_unavailable` are retryable with any status.
-    /// Not retryable are other OAuth errors with another status, such as `invalid_client` with HTTP 401, redirect errors of the HTTP client, answers middle cannot use, configuration errors, and assertions that cannot be created.
+    /// [`Error::TokenExpired`] is retryable, because a refresh is due. [`Error::ExpiredOnArrival`] is retryable, because a faster answer brings a usable token.
+    /// Not retryable are other OAuth errors with another status, such as `invalid_client` with HTTP 401, redirect errors of the HTTP client, answers middle cannot use, configuration errors, assertions that cannot be created, a panicked token request, and [`Error::RefreshStopped`].
     /// Requests sent through [`crate::HttpClient`] are not retryable, because middle cannot know whether they are safe to repeat.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
@@ -86,12 +98,14 @@ impl Error {
             }
             Self::Http(error) => is_retryable_status(error.status()),
             Self::Transport(TransportError(error)) => !error.is_builder() && !error.is_redirect(),
-            Self::Timeout(_) | Self::TokenExpired => true,
+            Self::Timeout(_) | Self::TokenExpired | Self::ExpiredOnArrival(_) => true,
             Self::InvalidResponse(_)
             | Self::Config(_)
             | Self::InvalidHeaderValue
             | Self::ReqwestFailed(_)
-            | Self::Assertion(_) => false,
+            | Self::Assertion(_)
+            | Self::RefreshStopped
+            | Self::TokenRequestPanicked => false,
         }
     }
 }
@@ -474,6 +488,9 @@ pub enum ConfigError {
     TokenUrlWithUserInfo,
     /// reqwest cannot build the HTTP client. [`std::error::Error::source`] is the [`reqwest::Error`].
     HttpClient(Arc<reqwest::Error>),
+    /// The default token lifetime is shorter than 2 s.
+    /// A token is refreshed 1 s after its request at the earliest, so a lifetime of at least 2 s makes the refresh come before the token expires.
+    DefaultTokenLifetimeTooShort(Duration),
     /// The name is not an `alg` value middle signs with. `alg` values are case-sensitive, for example `RS256` or `EdDSA`.
     #[cfg(feature = "jwt")]
     UnknownSigningAlgorithm(String),
@@ -530,6 +547,10 @@ impl fmt::Display for ConfigError {
             Self::HttpClient(_) => {
                 f.write_str("the HTTP client for the token endpoint cannot be built")
             }
+            Self::DefaultTokenLifetimeTooShort(lifetime) => write!(
+                f,
+                "the default token lifetime is {lifetime:?}, but it must be at least 2 s, so that the refresh 1 s after the request comes before the token expires"
+            ),
             #[cfg(feature = "jwt")]
             Self::UnknownSigningAlgorithm(name) => write!(
                 f,

@@ -5,7 +5,9 @@ mod response;
 use std::{fmt, time::Duration};
 
 use http::{HeaderMap, HeaderValue, StatusCode, header};
-pub(crate) use response::TokenResponse;
+#[cfg(test)]
+pub(crate) use response::AccessToken;
+pub(crate) use response::{MAX_EXPIRES_IN, TokenResponse};
 use url::Url;
 
 use crate::error::{ConfigError, Error, InvalidResponse, ResponseProblem, TransportError};
@@ -161,18 +163,8 @@ impl fmt::Debug for TokenRequest {
     }
 }
 
-/// Asks the token endpoint for a token once. `timeout` bounds the whole exchange, reading the answer included.
+/// Asks the token endpoint for a token once. The caller bounds the request with a timeout.
 pub(crate) async fn request_token(
-    http_client: &reqwest::Client,
-    request: &TokenRequest,
-    timeout: Duration,
-) -> Result<TokenResponse, Error> {
-    tokio::time::timeout(timeout, exchange(http_client, request))
-        .await
-        .unwrap_or(Err(Error::Timeout(timeout)))
-}
-
-async fn exchange(
     http_client: &reqwest::Client,
     request: &TokenRequest,
 ) -> Result<TokenResponse, Error> {
