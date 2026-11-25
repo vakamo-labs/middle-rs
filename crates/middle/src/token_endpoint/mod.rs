@@ -162,6 +162,11 @@ impl TokenRequest {
         self.client_auth.client_id()
     }
 
+    /// Whether the host of the token URL is `localhost` or a loopback address.
+    pub(crate) fn has_loopback_host(&self) -> bool {
+        is_loopback(&self.url)
+    }
+
     /// The form body: `grant_type`, the client credentials for `client_secret_post`, `scope`, then the extra parameters.
     fn form(&self) -> String {
         let mut form = url::form_urlencoded::Serializer::new(String::new());
