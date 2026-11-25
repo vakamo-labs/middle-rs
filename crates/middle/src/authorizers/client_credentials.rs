@@ -41,10 +41,7 @@ const DEFAULT_MAX_RETRIES: u32 = 3;
 /// Authenticate with an `OAuth2` server using client credentials.
 ///
 /// [`ClientCredentialAuthorizerBuilder::build`] fetches a token from the token endpoint of the identity provider.
-/// A background task refreshes it at a random point between 75 % and 85 % of its lifetime,
-/// but at least [`ClientCredentialAuthorizerBuilder::refresh_tolerance`] before expiry.
-/// For a token shorter than twice the tolerance, the window ends at half its lifetime.
-/// A refresh never comes sooner than 1 s after the request, so a token that lives 1 s or less expires before its refresh.
+/// A background task refreshes it at a random point in a window, which [`ClientCredentialAuthorizerBuilder::refresh_tolerance`] describes.
 /// If a refresh fails, the current token stays in use while it is valid, and the task retries with a backoff,
 /// at the latest after half the time the token has left.
 /// If the token endpoint sends no `expires_in`, the token lives until the `exp` of the access token if it is a JWT,
@@ -369,11 +366,12 @@ impl ClientCredentialAuthorizerBuilder {
         self
     }
 
-    /// Set the refresh tolerance: how long before expiry a token is refreshed at the latest.
+    /// Set the refresh tolerance: how long before expiry the refresh window ends at the latest.
     ///
-    /// A token is refreshed at a random point between 75 % and 85 % of its lifetime, but at least `tolerance` before it expires.
-    /// For a token shorter than twice the tolerance, the window ends at half its lifetime: it is refreshed between 40 % and 50 % of its lifetime.
-    /// A token is never refreshed sooner than 1 s after it was requested.
+    /// A token is refreshed at a random point in a window that is 10 % of its lifetime wide and ends at 85 % of it.
+    /// If that end is less than `tolerance` before expiry, the window moves earlier, so that it ends `tolerance` before expiry, but not before half the lifetime.
+    /// For example, a token of 120 s with a tolerance of 30 s is refreshed between 78 s and 90 s, and a token shorter than twice the tolerance between 40 % and 50 % of its lifetime.
+    /// A refresh never comes sooner than 1 s after the request, also when that is less than `tolerance` before expiry, so a token that lives 1 s or less expires before its refresh.
     /// Default is 30 seconds.
     #[must_use]
     pub fn refresh_tolerance(mut self, tolerance: Duration) -> Self {

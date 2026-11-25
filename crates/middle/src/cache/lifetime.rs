@@ -44,7 +44,8 @@ pub(super) fn lifetime(
 }
 
 /// The `exp` claim of a JWT in seconds since 1970, read without checking the signature.
-/// `None` if the token is not a JWS with a numeric `exp`: three base64url parts, and a header that is a JSON object with `alg` (RFC 7515, sections 4.1.1 and 7.1).
+/// `None` if the token is not a JWS with a numeric `exp`: three base64url parts, a header that is a JSON object with `alg` (RFC 7515, sections 4.1.1 and 7.1),
+/// and a signature that is empty only for `alg` `none` (RFC 7519, section 6.1).
 fn jwt_exp(token: &str) -> Option<f64> {
     let mut parts = token.split('.');
     let (Some(header), Some(payload), Some(signature), None) =
@@ -54,7 +55,10 @@ fn jwt_exp(token: &str) -> Option<f64> {
     };
     let header: serde_json::Value =
         serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header).ok()?).ok()?;
-    header.get("alg")?.as_str()?;
+    let algorithm = header.get("alg")?.as_str()?;
+    if signature.is_empty() != (algorithm == "none") {
+        return None;
+    }
     URL_SAFE_NO_PAD.decode(signature).ok()?;
     let payload = URL_SAFE_NO_PAD.decode(payload).ok()?;
     let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
@@ -183,6 +187,8 @@ mod tests {
                 "{}.{claims}.!!",
                 encode(&serde_json::json!({"alg": "RS256"}))
             ),
+            // A signed algorithm with an empty signature.
+            format!("{}.{claims}.", encode(&serde_json::json!({"alg": "RS256"}))),
             jwt(&serde_json::json!({"sub": "c"})),
             jwt(&serde_json::json!({"exp": "2000000100"})),
             jwt(&serde_json::json!({"exp": -5})),
