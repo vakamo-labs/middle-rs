@@ -54,7 +54,9 @@ impl Authorizer {
     /// A builder for the JWT bearer grant (RFC 7523, section 2.1) at the token endpoint `token_url`: a JWT from `assertion` is the grant.
     ///
     /// `assertion` is, for example, a `jwt::JwtAssertion` that middle signs, or a [`crate::FileAssertion`]. middle asks it for a new JWT for every token request, retries included.
-    /// The grant needs no client authentication. Set one with [`AuthorizerBuilder::client_authentication`] if the authorization server requires it.
+    /// The grant needs no client authentication (RFC 7523, section 2.1), but some authorization servers require it. Set one with [`AuthorizerBuilder::client_authentication`].
+    /// Some servers accept an assertion only once, by its `jti`: the source must then return a new assertion for every token request, as a `jwt::JwtAssertion` does.
+    /// Such a server answers a JWT it has seen with `invalid_grant`, which middle does not retry soon.
     /// Add parameters such as `resource` (RFC 8707) with [`AuthorizerBuilder::append_param`].
     #[must_use]
     pub fn jwt_bearer(token_url: url::Url, assertion: impl AssertionSource) -> AuthorizerBuilder {

@@ -32,8 +32,10 @@ pub enum Error {
     /// The configuration cannot work.
     #[error(transparent)]
     Config(#[from] ConfigError),
-    /// The token cannot be used as a header value.
-    #[error("the token cannot be used as a header value; it must be visible ASCII")]
+    /// The token cannot follow `Bearer ` in a header: it is empty or holds a character other than visible ASCII, such as a space.
+    #[error(
+        "the token cannot follow `Bearer ` in a header; it must be visible ASCII without spaces"
+    )]
     InvalidHeaderValue,
     /// The token has expired or was invalidated, and a refresh has not succeeded yet.
     #[error("the token has expired or was invalidated, and a refresh has not succeeded yet")]

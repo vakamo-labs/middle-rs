@@ -224,6 +224,9 @@ impl fmt::Debug for AssertionContext {
 ///
 /// Whitespace at the start and the end of the file is ignored. The file may hold at most 64 KiB, and it must be a regular file or a link to one.
 ///
+/// middle sends the JWT of the file with every token request until the writer replaces it. Some servers accept an assertion only once, by its `jti`;
+/// with them, a JWT from a file works for one token request, and the next one fails with `invalid_grant`.
+///
 /// If the payload of the JWT has an `exp` (RFC 7519, section 4.1.4) that has passed, middle does not send it. The token request then fails with an [`AssertionError`]
 /// that names the file, and middle retries the request. When the file holds a new JWT, the next retry sends it.
 #[cfg(feature = "client-credentials")]
@@ -332,4 +335,35 @@ fn has_passed(exp: f64) -> bool {
         .duration_since(UNIX_EPOCH)
         .map_or(0.0, |now| now.as_secs_f64());
     now >= exp
+}
+
+#[cfg(all(test, unix, feature = "client-credentials"))]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn test_opening_a_fifo_without_a_writer_does_not_block() {
+        let path = std::env::temp_dir().join(format!("middle-open-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        // A blocked open never returns, so it runs in a thread of its own.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let fifo = path.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(open_for_reading(&fifo).map(drop));
+        });
+        let opened = receiver.recv_timeout(Duration::from_secs(5));
+        let _ = std::fs::remove_file(&path);
+
+        assert!(matches!(opened, Ok(Ok(()))), "{opened:?}");
+    }
 }

@@ -53,9 +53,9 @@ impl Authorizer {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidHeaderValue`] if the token is not ASCII or cannot be a header value.
+    /// [`Error::InvalidHeaderValue`] if the token is empty or holds a character other than visible ASCII, such as a space (RFC 6750, section 2.1).
     pub fn bearer(token: &str) -> Result<Self> {
-        require_ascii(token)?;
+        require_visible_ascii(token)?;
         Ok(Self(Kind::Static(bearer_header(token)?)))
     }
 
@@ -138,7 +138,8 @@ impl Authorizer {
     /// An interceptor for tonic clients that puts the header of this authorizer on every request without an `Authorization` header.
     ///
     /// It never waits. Without a valid token, the request fails with the status `unavailable` if a retry can help, for example while the token endpoint
-    /// cannot be reached or a refresh is pending, and with `unauthenticated` otherwise. The source of the status is the [`Error`].
+    /// cannot be reached or a refresh is pending, and with `unauthenticated` otherwise. The status that the interceptor returns has the [`Error`] as its source;
+    /// a tonic client passes on only its code and message.
     ///
     /// The interceptor does not learn which token a server rejected. To replace a rejected token, put the header of `wait_for_header` on the request yourself,
     /// which the interceptor keeps. If the server answers `unauthenticated`, pass that header to `invalidate`, and retry once if it returns `true`.
@@ -222,9 +223,9 @@ fn status(error: Error) -> tonic::Status {
     status
 }
 
-/// Fails with [`Error::InvalidHeaderValue`] if the string is not ASCII.
-pub(crate) fn require_ascii(s: &str) -> Result<()> {
-    if s.is_ascii() {
+/// Fails with [`Error::InvalidHeaderValue`] if the token is empty or holds a character other than visible ASCII, so that it cannot follow `Bearer ` in a header.
+fn require_visible_ascii(token: &str) -> Result<()> {
+    if !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_graphic()) {
         Ok(())
     } else {
         Err(Error::InvalidHeaderValue)
@@ -286,11 +287,20 @@ mod tests {
     }
 
     #[test]
-    fn test_a_bearer_token_that_is_not_ascii_is_rejected() {
-        assert!(matches!(
-            Authorizer::bearer("tökén"),
-            Err(Error::InvalidHeaderValue)
-        ));
+    fn test_a_bearer_token_that_cannot_follow_bearer_is_rejected() {
+        for token in [
+            "",
+            " my-token",
+            "my-token ",
+            "my token",
+            "my\ttoken",
+            "tökén",
+        ] {
+            assert!(
+                matches!(Authorizer::bearer(token), Err(Error::InvalidHeaderValue)),
+                "{token:?}"
+            );
+        }
     }
 
     #[cfg(feature = "tonic")]
