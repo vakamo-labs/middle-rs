@@ -179,18 +179,30 @@ async fn test_an_unknown_oauth_error_code_is_kept() {
 #[tokio::test]
 async fn test_a_proxy_error_page_keeps_the_status_and_is_retried() {
     let reply = Reply::text(503, "text/html", "<html>upstream unavailable</html>")
-        .with_header("retry-after", "7");
-    let (error, requests) = build_error(reply, 1).await;
+        .with_header("retry-after", "2");
+    let idp = FakeIdp::start(move |_| reply.clone()).await;
+
+    let error = builder(idp.token_url())
+        .set_max_retries(1)
+        .build()
+        .await
+        .expect_err("build must fail");
 
     let Error::Http(http) = &error else {
         panic!("expected an HTTP error, got {error:?}");
     };
     assert_eq!(http.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(http.content_type(), Some("text/html"));
-    assert_eq!(http.retry_after(), Some(Duration::from_secs(7)));
-    assert_eq!(error.retry_after(), Some(Duration::from_secs(7)));
+    assert_eq!(http.retry_after(), Some(Duration::from_secs(2)));
+    assert_eq!(error.retry_after(), Some(Duration::from_secs(2)));
     assert!(error.is_retryable());
-    assert_eq!(requests, 2);
+    let requests = idp.requests();
+    assert_eq!(requests.len(), 2);
+    let wait = requests[1].received_at - requests[0].received_at;
+    assert!(
+        wait >= Duration::from_secs(2),
+        "the retry follows Retry-After: {wait:?}"
+    );
 }
 
 #[tokio::test]
@@ -471,9 +483,18 @@ async fn test_a_refresh_without_an_answer_does_not_stop_refreshing() {
         .await
         .unwrap();
 
-    // The first refresh starts after 1 s and times out after 200 ms. The token is still valid until 2 s, so the next refresh starts 1 s later.
-    assert!(eventually(|| header(&authorizer).as_deref() == Some("Bearer third")).await);
+    // The first refresh starts after 1 s and times out after 200 ms. The next one starts 1 s to 2 s later.
+    assert!(
+        eventually(|| header(&authorizer).as_deref() == Some("Bearer third")).await,
+        "requests: {:?} ms",
+        idp.arrival_ms()
+    );
     assert_eq!(idp.count(), 3);
+    let arrivals = idp.arrival_ms();
+    assert!(
+        arrivals[2] - arrivals[1] >= 1200,
+        "requests: {arrivals:?} ms"
+    );
 }
 
 #[tokio::test]

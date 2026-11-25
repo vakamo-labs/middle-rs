@@ -8,7 +8,7 @@
 
 use std::{
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use tokio::{
@@ -65,6 +65,20 @@ impl Reply {
             headers: vec![("content-type".to_string(), content_type.to_string())],
             body: body.into(),
         }
+    }
+
+    /// A successful token response without `expires_in`, whose access token is an unsigned JWT with this `exp`.
+    pub fn jwt_token(exp: u64) -> Self {
+        use base64::Engine as _;
+        let encode = |json: serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.to_string())
+        };
+        let jwt = format!(
+            "{}.{}.c2lnbmF0dXJl",
+            encode(serde_json::json!({"alg": "RS256", "typ": "at+jwt"})),
+            encode(serde_json::json!({"sub": "my-client", "exp": exp})),
+        );
+        Self::token(&jwt, None)
     }
 
     /// Adds a response header.
@@ -268,6 +282,20 @@ async fn read_more(socket: &mut TcpStream, buffer: &mut Vec<u8>) -> Option<()> {
             buffer.extend_from_slice(&chunk[..n]);
             Some(())
         }
+    }
+}
+
+/// Checks `condition` every 5 ms until it holds or `limit` has passed. Returns whether it held.
+pub async fn wait_until(limit: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        if condition() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 

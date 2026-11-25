@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 
 mod authorizers;
+#[cfg(feature = "client-credentials")]
+mod cache;
 mod client;
 pub mod error;
 #[cfg(feature = "jwt")]
