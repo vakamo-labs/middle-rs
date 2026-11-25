@@ -435,7 +435,8 @@ impl AssertionError {
     }
 
     /// Marks the error as one a retry cannot fix, such as a signing service that denies access.
-    /// Building an authorizer then fails at once, and its refresh task retries only about every 5 minutes.
+    /// Building an authorizer then fails at once. The refresh task waits as after other errors a retry cannot fix:
+    /// at most half the time the current token has left while it is valid, and about 5 minutes after it expired.
     #[must_use]
     pub fn permanent(mut self) -> Self {
         self.permanent = true;
@@ -548,7 +549,7 @@ pub enum ConfigError {
     /// middle sets this claim itself.
     #[cfg(feature = "jwt")]
     ReservedClaim(String),
-    /// An assertion lifetime shorter than one second or longer than one hour.
+    /// An assertion lifetime shorter than one second or longer than 59 minutes.
     #[cfg(feature = "jwt")]
     AssertionLifetime(std::time::Duration),
     /// The certificate is not an X.509 certificate in the form given: PEM with the label `CERTIFICATE`, or DER.
@@ -614,7 +615,7 @@ impl fmt::Display for ConfigError {
             #[cfg(feature = "jwt")]
             Self::AssertionLifetime(lifetime) => write!(
                 f,
-                "an assertion lifetime must be from one second to one hour, not {lifetime:?}"
+                "an assertion lifetime must be from one second to 59 minutes, not {lifetime:?}"
             ),
             #[cfg(feature = "jwt")]
             Self::InvalidCertificate => {

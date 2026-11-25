@@ -750,7 +750,7 @@ fn test_the_lifetime_can_be_set_in_whole_seconds() {
         (Duration::from_secs(1), 1),
         (Duration::from_millis(1900), 1),
         (Duration::from_secs(600), 600),
-        (Duration::from_secs(3600), 3600),
+        (Duration::from_secs(3540), 3540),
     ] {
         let jwt = assertion(key.clone())
             .with_lifetime(lifetime)
@@ -769,13 +769,14 @@ fn test_the_lifetime_can_be_set_in_whole_seconds() {
 }
 
 #[test]
-fn test_a_lifetime_outside_one_second_to_one_hour_is_rejected() {
+fn test_a_lifetime_outside_one_second_to_59_minutes_is_rejected() {
     let key = SigningKey::from_pem(RSA_PKCS8, SigningAlgorithm::Rs256).unwrap();
 
     for lifetime in [
         Duration::ZERO,
         Duration::from_millis(999),
-        Duration::from_millis(3_600_001),
+        Duration::from_millis(3_540_001),
+        Duration::from_secs(3600),
         Duration::MAX,
     ] {
         let error = assertion(key.clone()).with_lifetime(lifetime).unwrap_err();
@@ -785,7 +786,9 @@ fn test_a_lifetime_outside_one_second_to_one_hour_is_rejected() {
         );
         assert_eq!(
             error.to_string(),
-            format!("an assertion lifetime must be from one second to one hour, not {lifetime:?}")
+            format!(
+                "an assertion lifetime must be from one second to 59 minutes, not {lifetime:?}"
+            )
         );
     }
 }

@@ -43,8 +43,10 @@ const DEFAULT_LIFETIME: Duration = Duration::from_secs(60);
 /// The shortest lifetime [`JwtAssertion::with_lifetime`] accepts.
 const MIN_LIFETIME: Duration = Duration::from_secs(1);
 
-/// The longest lifetime [`JwtAssertion::with_lifetime`] accepts. Some servers refuse client assertions that live longer, and an assertion can be replayed until it expires.
-const MAX_LIFETIME: Duration = Duration::from_secs(3600);
+/// The longest lifetime [`JwtAssertion::with_lifetime`] accepts: 59 minutes.
+/// Some servers refuse an assertion whose `exp` lies more than one hour in the future, and `iat` lies 5 seconds before the signing,
+/// so the minute keeps `exp` minus `iat` below one hour and leaves room for clocks that differ. An assertion can be replayed until it expires.
+const MAX_LIFETIME: Duration = Duration::from_secs(3540);
 
 /// How many seconds `iat` lies before the signing, so that a server whose clock is slightly behind accepts the assertion.
 const IAT_BEFORE_SIGNING: u64 = 5;
@@ -485,11 +487,11 @@ impl JwtAssertion {
         }
     }
 
-    /// Sets how long an assertion is valid, from one second to one hour. `exp` is the time of signing plus the whole seconds of the lifetime, so a fraction of a second is cut off.
+    /// Sets how long an assertion is valid, from one second to 59 minutes. `exp` is the time of signing plus the whole seconds of the lifetime, so a fraction of a second is cut off.
     ///
     /// # Errors
     ///
-    /// [`ConfigError::AssertionLifetime`] for a lifetime shorter than one second or longer than one hour. Some servers refuse client assertions that live longer, and an assertion can be replayed until it expires.
+    /// [`ConfigError::AssertionLifetime`] for a lifetime shorter than one second or longer than 59 minutes. Some servers refuse an assertion whose `exp` lies more than one hour in the future, and an assertion can be replayed until it expires.
     pub fn with_lifetime(mut self, lifetime: Duration) -> Result<Self, ConfigError> {
         if !(MIN_LIFETIME..=MAX_LIFETIME).contains(&lifetime) {
             return Err(ConfigError::AssertionLifetime(lifetime));
@@ -619,7 +621,9 @@ pub enum Audience {
     /// The issuer identifier of the authorization server, exactly as its metadata names it (RFC 8414, section 2), including a trailing slash if it has one:
     /// RFC 10070 requires that servers compare it as a simple string. The header `typ` is `client-authentication+jwt`, which RFC 10070 recommends.
     Issuer(String),
-    /// The URL of the token endpoint the request goes to. The header `typ` is `JWT`.
+    /// The URL of the token endpoint that middle connects to, without its query. The header `typ` is `JWT`.
+    ///
+    /// The authorization server compares it with the URL it knows itself as, so a client that reaches the server under another name, such as an internal host name, needs that name.
     TokenEndpoint,
 }
 
@@ -650,7 +654,12 @@ impl crate::AssertionSource for ClientAuthenticationJwt {
     fn assertion<'a>(&'a self, context: &'a crate::AssertionContext) -> crate::AssertionFuture<'a> {
         let signed = match &self.audience {
             Audience::Issuer(issuer) => self.assertion.sign_for(issuer),
-            Audience::TokenEndpoint => self.assertion.sign_for(context.token_url().as_str()),
+            Audience::TokenEndpoint => {
+                // Servers compare the URL without a query, and the query may hold a secret.
+                let mut token_url = context.token_url().clone();
+                token_url.set_query(None);
+                self.assertion.sign_for(token_url.as_str())
+            }
         };
         Box::pin(std::future::ready(signed.map(crate::Assertion::from)))
     }

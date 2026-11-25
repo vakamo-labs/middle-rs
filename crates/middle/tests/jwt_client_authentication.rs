@@ -196,7 +196,8 @@ async fn test_private_key_jwt_for_the_token_endpoint_signs_an_untyped_jwt_for_it
     let public_key = DecodingKey::from_ec_pem(EC_P256_PUBLIC.as_bytes()).unwrap();
     let jwt = verify(&assertion, Algorithm::ES256, &public_key);
     assert_eq!(jwt.header, json!({"alg": "ES256", "typ": "JWT"}));
-    assert_client_claims(&jwt.claims, "my-client", token_url.as_str(), before);
+    // The query of the token URL is not part of the audience.
+    assert_client_claims(&jwt.claims, "my-client", idp.token_url().as_str(), before);
 }
 
 #[tokio::test]
