@@ -30,6 +30,8 @@ const RSA_3_PRIMES_PKCS1: &str = include_str!("fixtures/jwt/rsa-2048-3-primes-pk
 const RSA_UNEQUAL_PRIMES: &str = include_str!("fixtures/jwt/rsa-2048-unequal-primes-pkcs8.pem");
 const RSA_UNEQUAL_PRIMES_PUBLIC: &str =
     include_str!("fixtures/jwt/rsa-2048-unequal-primes-public.pem");
+/// An RSA-PSS key of 2048 bits (`openssl genpkey -algorithm RSA-PSS`), which has the key algorithm id-RSASSA-PSS (RFC 4055, section 3.1).
+const RSA_PSS: &str = include_str!("fixtures/jwt/rsa-pss-2048-pkcs8.pem");
 /// `rsa-2048-pkcs1.pem` encrypted with the passphrase `middle-test` by `openssl rsa -aes256 -traditional`, which writes the header `Proc-Type: 4,ENCRYPTED`.
 const RSA_ENCRYPTED_PKCS1: &str = include_str!("fixtures/jwt/rsa-2048-encrypted-pkcs1.pem");
 const EC_P256: &str = include_str!("fixtures/jwt/ec-p256-pkcs8.pem");
@@ -551,6 +553,11 @@ fn test_a_key_that_does_not_fit_the_algorithm_is_rejected() {
             "the key has the algorithm 1.3.101.113, which middle does not sign with",
         ),
         (
+            RSA_PSS,
+            SigningAlgorithm::Ps256,
+            "the key is an RSA-PSS key (1.2.840.113549.1.1.10), which middle does not sign with; an RSA key in PKCS#8 needs the algorithm rsaEncryption",
+        ),
+        (
             RSA_PKCS8,
             SigningAlgorithm::Hs256,
             "an HMAC algorithm signs with a shared secret: use `SigningKey::from_secret`",
@@ -967,6 +974,25 @@ fn test_a_certificate_of_another_key_is_rejected() {
             "the public key of the certificate does not belong to the signing key"
         );
     }
+}
+
+#[test]
+fn test_a_certificate_on_another_curve_is_rejected() {
+    // The certificate of `ec-p256-pkcs8.pem` with the curve P-192 (1.2.840.10045.3.1.1) in place of P-256 (1.2.840.10045.3.1.7): the same point, on another curve.
+    let mut certificate = der(CERTIFICATE_EC_P256);
+    let curve = certificate
+        .windows(SECP256R1.len())
+        .position(|window| window == SECP256R1)
+        .expect("the curve");
+    certificate[curve + SECP256R1.len() - 1] = 0x01;
+    let key = SigningKey::from_pem(EC_P256, SigningAlgorithm::Es256).unwrap();
+
+    let error = key.with_certificate_der(certificate).unwrap_err();
+
+    assert!(
+        matches!(error, ConfigError::CertificateKeyMismatch),
+        "{error:?}"
+    );
 }
 
 #[test]

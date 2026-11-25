@@ -58,6 +58,9 @@ const VERSION: Tag = Tag::ContextSpecific {
 /// The key algorithm rsaEncryption (RFC 8017, appendix C).
 const RSA_ENCRYPTION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
 
+/// The key algorithm id-RSASSA-PSS (RFC 4055, section 3.1), of an RSA key limited to RSA-PSS signatures.
+const ID_RSASSA_PSS: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10");
+
 /// The key algorithm id-ecPublicKey (RFC 5480, section 2.1.1).
 const ID_EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
 
@@ -232,7 +235,7 @@ pub struct SigningKey {
 }
 
 impl SigningKey {
-    /// Loads a private key in PEM form: RSA in PKCS#1 (`RSA PRIVATE KEY`) or PKCS#8 (`PRIVATE KEY`) for `RS*` and `PS*`, EC in SEC1 (`EC PRIVATE KEY`) or PKCS#8 for `ES*`, Ed25519 in PKCS#8 for `EdDSA`. An EC key names its curve.
+    /// Loads a private key in PEM form: RSA in PKCS#1 (`RSA PRIVATE KEY`) or in PKCS#8 (`PRIVATE KEY`) with the algorithm rsaEncryption for `RS*` and `PS*`, EC in SEC1 (`EC PRIVATE KEY`) or PKCS#8 for `ES*`, Ed25519 in PKCS#8 for `EdDSA`. An EC key names its curve.
     ///
     /// The text may hold other PEM blocks before or after the key, such as its certificate or the `EC PARAMETERS` that `openssl ecparam -genkey` writes before an EC key: middle reads the first private key and ignores the other blocks.
     ///
@@ -353,16 +356,21 @@ impl SigningKey {
         Ok(self)
     }
 
-    /// Checks that a signature of this key verifies with the public key of the certificate in DER form.
+    /// Checks that a signature of this key verifies with the public key of the certificate in DER form, and that the certificate names the curve of an EC key.
     fn check_certificate(&self, certificate: &[u8]) -> Result<(), ConfigError> {
         let (key_algorithm, public_key) =
             certificate_public_key(certificate).ok_or(ConfigError::InvalidCertificate)?;
         let public_key = match (
             self.algorithm.family(),
-            Family::of_key_algorithm(key_algorithm),
+            Family::of_key_algorithm(key_algorithm.oid),
         ) {
             (Family::Rsa, Some(Family::Rsa)) => DecodingKey::from_rsa_der(public_key),
-            (Family::Ec, Some(Family::Ec)) => DecodingKey::from_ec_der(public_key),
+            // The verifier reads the point on the curve of the algorithm, whatever curve the certificate names.
+            (Family::Ec, Some(Family::Ec))
+                if named_curve(&key_algorithm) == self.algorithm.curve() =>
+            {
+                DecodingKey::from_ec_der(public_key)
+            }
             // RFC 8410, section 4: an Ed25519 public key has 32 bytes. jsonwebtoken's RustCrypto verifier panics on a shorter one.
             (Family::Ed, Some(Family::Ed)) if public_key.len() == 32 => {
                 DecodingKey::from_ed_der(public_key)
@@ -370,7 +378,7 @@ impl SigningKey {
             (Family::Hmac, _) | (_, Some(_)) => return Err(ConfigError::CertificateKeyMismatch),
             (_, None) => {
                 return Err(ConfigError::UnsupportedCertificateKey(
-                    key_algorithm.to_string(),
+                    key_algorithm.oid.to_string(),
                 ));
             }
         };
@@ -674,10 +682,13 @@ fn pkcs8_private_key(
     let key =
         PrivateKeyInfoRef::from_der(der).map_err(|_| invalid("the key is not in PKCS#8 form"))?;
     let key_algorithm = key.algorithm.oid;
-    let family = Family::of_key_algorithm(key_algorithm).ok_or_else(|| {
-        invalid(format!(
+    let family = Family::of_key_algorithm(key_algorithm).ok_or_else(|| match key_algorithm {
+        ID_RSASSA_PSS => invalid(format!(
+            "the key is an RSA-PSS key ({ID_RSASSA_PSS}), which middle does not sign with; an RSA key in PKCS#8 needs the algorithm rsaEncryption"
+        )),
+        _ => invalid(format!(
             "the key has the algorithm {key_algorithm}, which middle does not sign with"
-        ))
+        )),
     })?;
     check_family(family, algorithm)?;
     match family {
@@ -689,14 +700,11 @@ fn pkcs8_private_key(
             Ok(Cow::Borrowed(rsa))
         }
         Family::Ec => {
-            // RFC 5480, section 2.1.1: the parameters of an EC key are the OID of its named curve.
-            let curve = key
-                .algorithm
-                .parameters
-                .and_then(|parameters| ObjectIdentifier::try_from(parameters).ok())
-                .ok_or_else(|| invalid(
+            let curve = named_curve(&key.algorithm).ok_or_else(|| {
+                invalid(
                     "the EC key does not name its curve; convert it to a named curve with `openssl pkey -in key.pem -ec_param_enc named_curve -out key-named.pem`",
-                ))?;
+                )
+            })?;
             check_curve(curve, algorithm)?;
             // The public key of PKCS#8 v2, which aws-lc-rs refuses in an EC key. The backends compute it from the private key.
             if key.public_key.is_none() {
@@ -711,6 +719,13 @@ fn pkcs8_private_key(
         }
         Family::Ed | Family::Hmac => Ok(Cow::Borrowed(der)),
     }
+}
+
+/// The named curve of an EC key algorithm: RFC 5480, section 2.1.1, makes it the parameters of id-ecPublicKey.
+fn named_curve(key_algorithm: &AlgorithmIdentifierRef<'_>) -> Option<ObjectIdentifier> {
+    key_algorithm
+        .parameters
+        .and_then(|parameters| ObjectIdentifier::try_from(parameters).ok())
 }
 
 /// Wraps an EC private key in SEC1 form (RFC 5915, section 3) into PKCS#8 (RFC 5958, section 2), the form jsonwebtoken's backends sign with: the algorithm id-ecPublicKey with the curve of the key as its parameter (RFC 5480, section 2.1.1), and the SEC1 key as the private key.
@@ -799,7 +814,7 @@ fn check_rsa_key(
 /// The `subjectPublicKey` is in the form jsonwebtoken's `DecodingKey::from_rsa_der`, `from_ec_der` and `from_ed_der` read.
 ///
 /// middle checks that the certificate has its three parts and that the fields before the key have their types, and decodes only the `subjectPublicKeyInfo`, with `spki`. It skips the other fields unread: a CA may write the names as a `BMPString` or as a `PrintableString` with characters such as `*`, which strict decoders refuse.
-fn certificate_public_key(der: &[u8]) -> Option<(ObjectIdentifier, &[u8])> {
+fn certificate_public_key(der: &[u8]) -> Option<(AlgorithmIdentifierRef<'_>, &[u8])> {
     let mut reader = SliceReader::new(der).ok()?;
     // tbsCertificate, signatureAlgorithm and signatureValue (RFC 5280, section 4.1).
     let subject_public_key_info = reader
@@ -835,7 +850,7 @@ fn certificate_public_key(der: &[u8]) -> Option<(ObjectIdentifier, &[u8])> {
         .ok()?;
     reader.finish().ok()?;
     let public_key = subject_public_key_info.subject_public_key.as_bytes()?;
-    Some((subject_public_key_info.algorithm.oid, public_key))
+    Some((subject_public_key_info.algorithm, public_key))
 }
 
 #[cfg(test)]
