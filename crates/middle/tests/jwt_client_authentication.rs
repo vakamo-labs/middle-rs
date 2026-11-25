@@ -100,11 +100,10 @@ fn assert_client_claims(
     assert_eq!(claims["iss"], client_id);
     assert_eq!(claims["sub"], client_id);
     assert_eq!(claims["aud"], audience);
-    // `iat` lies 5 seconds before the signing, and `exp` 60 seconds after it.
+    // `iat` lies 5 seconds before the signing, and `exp` 60 seconds after `iat`.
     let iat = claims["iat"].as_u64().unwrap();
-    let signed_at = iat + 5;
-    assert!((signed_after..=now()).contains(&signed_at), "iat {iat}");
-    assert_eq!(claims["exp"].as_u64().unwrap(), signed_at + 60);
+    assert!((signed_after..=now()).contains(&(iat + 5)), "iat {iat}");
+    assert_eq!(claims["exp"].as_u64().unwrap(), iat + 60);
     assert_eq!(claims["jti"].as_str().unwrap().len(), 22);
 }
 

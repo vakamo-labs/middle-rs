@@ -549,7 +549,7 @@ pub enum ConfigError {
     /// middle sets this claim itself.
     #[cfg(feature = "jwt")]
     ReservedClaim(String),
-    /// An assertion lifetime shorter than one second or longer than 59 minutes.
+    /// An assertion lifetime shorter than 10 seconds or longer than one hour.
     #[cfg(feature = "jwt")]
     AssertionLifetime(std::time::Duration),
     /// The certificate is not an X.509 certificate in the form given: PEM with the label `CERTIFICATE`, or DER.
@@ -615,7 +615,7 @@ impl fmt::Display for ConfigError {
             #[cfg(feature = "jwt")]
             Self::AssertionLifetime(lifetime) => write!(
                 f,
-                "an assertion lifetime must be from one second to 59 minutes, not {lifetime:?}"
+                "an assertion lifetime must be from 10 seconds to one hour, not {lifetime:?}"
             ),
             #[cfg(feature = "jwt")]
             Self::InvalidCertificate => {

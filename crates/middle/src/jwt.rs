@@ -40,13 +40,12 @@ const REGISTERED_CLAIMS: [&str; 6] = ["iss", "sub", "aud", "exp", "iat", "jti"];
 /// The lifetime of an assertion unless [`JwtAssertion::with_lifetime`] sets another.
 const DEFAULT_LIFETIME: Duration = Duration::from_secs(60);
 
-/// The shortest lifetime [`JwtAssertion::with_lifetime`] accepts.
-const MIN_LIFETIME: Duration = Duration::from_secs(1);
+/// The shortest lifetime [`JwtAssertion::with_lifetime`] accepts: `iat` lies 5 seconds before the signing, so `exp` lies about 5 seconds after the signing.
+const MIN_LIFETIME: Duration = Duration::from_secs(10);
 
-/// The longest lifetime [`JwtAssertion::with_lifetime`] accepts: 59 minutes.
-/// Some servers refuse an assertion whose `exp` lies more than one hour in the future, and `iat` lies 5 seconds before the signing,
-/// so the minute keeps `exp` minus `iat` below one hour and leaves room for clocks that differ. An assertion can be replayed until it expires.
-const MAX_LIFETIME: Duration = Duration::from_secs(3540);
+/// The longest lifetime [`JwtAssertion::with_lifetime`] accepts: one hour.
+/// Some servers refuse an assertion whose `exp` lies more than one hour after its `iat`. An assertion can be replayed until it expires.
+const MAX_LIFETIME: Duration = Duration::from_secs(3600);
 
 /// How many seconds `iat` lies before the signing, so that a server whose clock is slightly behind accepts the assertion.
 const IAT_BEFORE_SIGNING: u64 = 5;
@@ -487,11 +486,12 @@ impl JwtAssertion {
         }
     }
 
-    /// Sets how long an assertion is valid, from one second to 59 minutes. `exp` is the time of signing plus the whole seconds of the lifetime, so a fraction of a second is cut off.
+    /// Sets how long an assertion is valid, from 10 seconds to one hour. `exp` is `iat` plus the whole seconds of the lifetime, so a fraction of a second is cut off.
+    /// `iat` lies 5 seconds before the signing, so the assertion expires about 5 seconds before the lifetime has passed since the signing.
     ///
     /// # Errors
     ///
-    /// [`ConfigError::AssertionLifetime`] for a lifetime shorter than one second or longer than 59 minutes. Some servers refuse an assertion whose `exp` lies more than one hour in the future, and an assertion can be replayed until it expires.
+    /// [`ConfigError::AssertionLifetime`] for a lifetime shorter than 10 seconds or longer than one hour. Some servers refuse an assertion whose `exp` lies more than one hour after its `iat`, and an assertion can be replayed until it expires.
     pub fn with_lifetime(mut self, lifetime: Duration) -> Result<Self, ConfigError> {
         if !(MIN_LIFETIME..=MAX_LIFETIME).contains(&lifetime) {
             return Err(ConfigError::AssertionLifetime(lifetime));
@@ -534,7 +534,7 @@ impl JwtAssertion {
         Ok(self)
     }
 
-    /// Signs a new assertion: `iat` is 5 seconds before now, so that a server whose clock is slightly behind accepts it, `exp` is now plus the lifetime, and `jti` is 16 random bytes.
+    /// Signs a new assertion: `iat` is 5 seconds before now, so that a server whose clock is slightly behind accepts it, `exp` is `iat` plus the lifetime, and `jti` is 16 random bytes.
     ///
     /// # Errors
     ///
@@ -572,13 +572,11 @@ impl JwtAssertion {
         claims.insert("iss".to_string(), self.issuer.as_str().into());
         claims.insert("sub".to_string(), self.subject.as_str().into());
         claims.insert("aud".to_string(), audience.into());
-        claims.insert(
-            "iat".to_string(),
-            now.saturating_sub(IAT_BEFORE_SIGNING).into(),
-        );
+        let iat = now.saturating_sub(IAT_BEFORE_SIGNING);
+        claims.insert("iat".to_string(), iat.into());
         claims.insert(
             "exp".to_string(),
-            now.saturating_add(self.lifetime.as_secs()).into(),
+            iat.saturating_add(self.lifetime.as_secs()).into(),
         );
         claims.insert("jti".to_string(), URL_SAFE_NO_PAD.encode(jti).into());
 
