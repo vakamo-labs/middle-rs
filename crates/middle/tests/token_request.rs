@@ -2,8 +2,6 @@
 
 mod support;
 
-use std::time::Duration;
-
 use middle::{
     Authorizer as _, ClientAuthentication, ClientCredentialAuthorizer,
     ClientCredentialAuthorizerBuilder, ConfigError, Error,
@@ -221,16 +219,34 @@ async fn test_an_http_token_url_needs_a_loopback_host() {
 
 #[tokio::test]
 async fn test_danger_allow_http_allows_an_http_token_url_with_any_host() {
-    // RFC 2606, section 2: `.invalid` never resolves, so the request fails after the configuration was accepted.
-    let error = builder("http://idp.invalid/token".parse().unwrap())
-        .danger_allow_http()
-        .set_max_retries(0)
-        .timeout(Duration::from_secs(5))
+    let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
+    let address = idp.token_url().socket_addrs(|| None).unwrap()[0];
+    // The HTTP client resolves `idp.example.com` to the fake token endpoint.
+    let http_client = reqwest::Client::builder()
+        .resolve("idp.example.com", address)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .unwrap();
+    let host = format!("idp.example.com:{}", address.port());
+    let builder =
+        builder(format!("http://{host}/token").parse().unwrap()).set_http_client(http_client);
+
+    let error = builder
+        .clone()
+        .danger_allow_http(false)
         .build()
         .await
-        .expect_err("the host does not resolve");
+        .expect_err("http with another host needs danger_allow_http");
+    assert!(
+        matches!(&error, Error::Config(ConfigError::HttpTokenUrl(h)) if h == "idp.example.com"),
+        "{error:?}"
+    );
+    assert_eq!(idp.count(), 0);
 
-    assert!(!matches!(error, Error::Config(_)), "{error:?}");
+    builder.danger_allow_http(true).build().await.unwrap();
+    assert_eq!(idp.count(), 1);
+    assert_eq!(idp.requests()[0].header("host"), Some(host.as_str()));
 }
 
 #[tokio::test]

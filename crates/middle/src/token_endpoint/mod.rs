@@ -334,9 +334,12 @@ mod tests {
                 "http://localhost.example.com/token",
                 "localhost.example.com",
             ),
+            ("http://localhost./token", "localhost."),
             ("http://10.0.0.1/token", "10.0.0.1"),
             ("http://0.0.0.0/token", "0.0.0.0"),
             ("http://[::2]/token", "[::2]"),
+            // An IPv4-mapped IPv6 address is not a loopback address.
+            ("http://[::ffff:127.0.0.1]/token", "[::ffff:7f00:1]"),
         ] {
             assert!(
                 matches!(check_url(url, false), Err(ConfigError::HttpTokenUrl(h)) if h == host),
@@ -344,6 +347,22 @@ mod tests {
             );
             assert!(check_url(url, true).is_ok(), "{url}");
         }
+    }
+
+    #[test]
+    fn test_danger_allow_http_keeps_the_other_checks() {
+        assert!(matches!(
+            check_url("ftp://idp.example.com/token", true),
+            Err(ConfigError::TokenUrlScheme(scheme)) if scheme == "ftp"
+        ));
+        assert!(matches!(
+            check_url("http://idp.example.com/token#part", true),
+            Err(ConfigError::TokenUrlWithFragment)
+        ));
+        assert!(matches!(
+            check_url("http://user:password@idp.example.com/token", true),
+            Err(ConfigError::TokenUrlWithUserInfo)
+        ));
     }
 
     #[test]

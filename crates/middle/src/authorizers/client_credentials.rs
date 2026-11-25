@@ -224,7 +224,8 @@ pub struct ClientAuthentication(ClientAuth);
 impl ClientAuthentication {
     /// The client id and secret in an HTTP Basic `Authorization` header, each form-urlencoded first (`client_secret_basic`, RFC 6749, section 2.3.1).
     ///
-    /// RFC 6749 requires token endpoints to support it. Some token endpoints do not decode the form-urlencoding, and so reject a secret with characters such as `+`, `/` or `=`;
+    /// RFC 6749 (section 2.3.1) requires token endpoints to support it; the OAuth 2.1 draft (draft-ietf-oauth-v2-1-17, section 2.4.1) makes it optional.
+    /// Some token endpoints do not decode the form-urlencoding, and so reject a secret with characters such as `+`, `/` or `=`;
     /// use [`Self::client_secret_post`] for them.
     #[must_use]
     pub fn client_secret_basic(
@@ -239,7 +240,10 @@ impl ClientAuthentication {
 
     /// The client id and secret as the form parameters `client_id` and `client_secret` (`client_secret_post`).
     ///
-    /// The OAuth 2.1 draft (section 2.4.1) requires token endpoints to support it, while RFC 6749 (section 2.3.1) leaves it optional.
+    /// The OAuth 2.1 draft (draft-ietf-oauth-v2-1-17, section 2.4.1) requires token endpoints to support it; RFC 6749 (section 2.3.1) makes it optional.
+    ///
+    /// The client secret is in the form body. A client set with [`ClientCredentialAuthorizerBuilder::set_http_client`] that follows redirects sends it to the redirect target,
+    /// also to another host or over `http`.
     #[must_use]
     pub fn client_secret_post(
         client_id: impl Into<String>,
@@ -260,7 +264,7 @@ impl ClientAuthentication {
 /// * `http_client`: Custom `reqwest::Client` to use for token requests. Default is a client with redirects disabled and a connect timeout of 10 seconds.
 /// * `scopes`: Scopes to request in the token. Empty by default.
 /// * `params`: Further form parameters of the token request, added with [`Self::append_param`]. Empty by default.
-/// * `danger_allow_http`: Allow an `http` token URL with any host. By default, `http` works only with `localhost` and loopback addresses.
+/// * `danger_allow_http`: Whether an `http` token URL may have any host. Default is `false`: `http` works only with `localhost` and loopback addresses.
 /// * `enable_refresh`: Enable automatic token refresh. Default is `true`.
 /// * `refresh_tolerance`: How long before expiry a token is refreshed at the latest. Default is 30 seconds.
 /// * `default_token_lifetime`: The lifetime of a token if the token endpoint does not say. Default is 5 minutes.
@@ -305,7 +309,9 @@ impl ClientCredentialAuthorizerBuilder {
     /// Optionally specify the `reqwest::Client` to use for token requests.
     ///
     /// middle uses the client as it is. If the client follows redirects, which reqwest does by default,
-    /// a 307 or 308 answer of the token endpoint makes reqwest send the form body again to the URL the answer names.
+    /// a 307 or 308 answer of the token endpoint makes reqwest send the form body again to the URL the answer names, also to another host or over `http`.
+    /// With [`ClientAuthentication::client_secret_post`], that body holds the client secret. reqwest drops the `Authorization` header of
+    /// [`ClientAuthentication::client_secret_basic`] when the host, port or scheme changes, and keeps the body.
     /// middle refuses an answer whose final URL is not the token URL, but the other URL has already received the request,
     /// and an answer after a chain of redirects that ends at the token URL counts as the token endpoint's answer.
     /// Set `redirect(reqwest::redirect::Policy::none())` on the client to prevent this.
@@ -369,8 +375,9 @@ impl ClientCredentialAuthorizerBuilder {
         self
     }
 
-    /// Appends a form parameter to the token request, after the scope. Each call adds one more parameter, so a name may repeat,
-    /// as with one `resource` parameter for each resource (RFC 8707, section 2).
+    /// Appends a form parameter to the token request, after the scope. Each call adds one more parameter.
+    /// RFC 6749 (section 3.2) allows each parameter once, so repeat a name only where its specification allows it,
+    /// as RFC 8707 (section 2) does with one `resource` parameter for each resource.
     ///
     /// [`Self::build`] fails for a parameter middle sets itself: `grant_type`, `scope`, `client_id`, `client_secret`,
     /// `client_assertion`, `client_assertion_type` and `assertion`.
@@ -380,12 +387,12 @@ impl ClientCredentialAuthorizerBuilder {
         self
     }
 
-    /// Allows an `http` token URL with any host. middle then sends the client credentials without TLS, so use it only in a network you trust.
+    /// Whether an `http` token URL may have any host. middle then sends the client credentials without TLS, so allow it only in a network you trust.
     ///
-    /// Without it, [`Self::build`] fails for an `http` token URL unless its host is `localhost` or a loopback address (`127.0.0.0/8` or `::1`).
+    /// The default is `false`: [`Self::build`] fails for an `http` token URL unless its host is `localhost` or a loopback address (`127.0.0.0/8` or `::1`).
     #[must_use]
-    pub fn danger_allow_http(mut self) -> Self {
-        self.allow_http = true;
+    pub fn danger_allow_http(mut self, allow: bool) -> Self {
+        self.allow_http = allow;
         self
     }
 
