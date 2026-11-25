@@ -436,7 +436,7 @@ impl AssertionError {
 
     /// Marks the error as one a retry cannot fix, such as a signing service that denies access.
     /// Building an authorizer then fails at once. The refresh task waits as after other errors a retry cannot fix:
-    /// at most half the time the current token has left while it is valid, and about 5 minutes once it expired or was invalidated.
+    /// at most half the time the current token has left, but at least 1 s, while it is valid, and about 5 minutes once it expired or was invalidated.
     #[must_use]
     pub fn permanent(mut self) -> Self {
         self.permanent = true;
