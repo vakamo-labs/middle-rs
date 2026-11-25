@@ -482,6 +482,8 @@ pub enum ConfigError {
     EmptyParameterName,
     /// The token URL uses a scheme other than `http` and `https`.
     TokenUrlScheme(String),
+    /// The token URL uses `http` with a host other than `localhost` and the loopback addresses `127.0.0.0/8` and `::1`, and `http` is not allowed with `danger_allow_http`. The value is the host.
+    HttpTokenUrl(String),
     /// The token URL has a fragment (RFC 6749, section 3.2).
     TokenUrlWithFragment,
     /// The token URL contains a user name or password.
@@ -538,6 +540,10 @@ impl fmt::Display for ConfigError {
             Self::TokenUrlScheme(scheme) => {
                 write!(f, "the token URL must use http or https, not `{scheme}`")
             }
+            Self::HttpTokenUrl(host) => write!(
+                f,
+                "the token URL uses http with the host `{host}`, which sends the client credentials without TLS: use https, or allow http with `danger_allow_http`"
+            ),
             Self::TokenUrlWithFragment => {
                 f.write_str("the token URL must not have a fragment (RFC 6749, section 3.2)")
             }

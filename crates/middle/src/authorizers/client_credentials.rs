@@ -4,7 +4,6 @@ compile_error!(
 );
 
 use std::{
-    collections::HashMap,
     fmt,
     sync::Arc,
     time::{Duration, SystemTime},
@@ -68,9 +67,6 @@ pub struct ClientCredentialAuthorizer {
     refresh_task: Option<Arc<RefreshTask>>,
 }
 
-/// Another name for [`ClientCredentialAuthorizer`].
-pub type BasicClientCredentialAuthorizer = ClientCredentialAuthorizer;
-
 // The authorizer is shared between threads and tasks.
 const _: () = {
     const fn assert_send_sync_static<T: Send + Sync + 'static>() {}
@@ -93,14 +89,25 @@ impl RefreshTask {
 }
 
 impl ClientCredentialAuthorizer {
-    /// Create a new [`ClientCredentialAuthorizerBuilder`]. The client authenticates with HTTP Basic (RFC 6749, section 2.3.1).
+    /// A builder for the client credentials grant (RFC 6749, section 4.4) at the token endpoint `token_url`, with the client authentication the grant requires.
     #[must_use]
-    pub fn basic_builder(
-        client_id: &str,
-        client_secret: &str,
+    pub fn builder(
         token_url: url::Url,
+        client_authentication: ClientAuthentication,
     ) -> ClientCredentialAuthorizerBuilder {
-        ClientCredentialAuthorizerBuilder::new(client_id, client_secret, token_url)
+        ClientCredentialAuthorizerBuilder {
+            token_url,
+            client_auth: client_authentication.0,
+            max_retries: None,
+            timeout: None,
+            http_client: None,
+            scopes: Vec::new(),
+            params: Vec::new(),
+            allow_http: false,
+            enable_refresh: true,
+            refresh_tolerance: None,
+            default_token_lifetime: None,
+        }
     }
 
     #[cfg(feature = "runtime-tokio")]
@@ -208,19 +215,61 @@ fn token_header(token: &Token) -> TokenHeader {
     }
 }
 
-/// Builder for [`ClientCredentialAuthorizer`].
+/// How the client authenticates at the token endpoint (RFC 6749, section 2.3).
+///
+/// `Debug` shows the client id, never the secret.
+#[derive(Clone, Debug)]
+pub struct ClientAuthentication(ClientAuth);
+
+impl ClientAuthentication {
+    /// The client id and secret in an HTTP Basic `Authorization` header, each form-urlencoded first (`client_secret_basic`, RFC 6749, section 2.3.1).
+    ///
+    /// RFC 6749 (section 2.3.1) requires token endpoints to support it; the OAuth 2.1 draft (draft-ietf-oauth-v2-1-17, section 2.4.1) makes it optional.
+    /// Some token endpoints do not decode the form-urlencoding, and so reject a secret with characters such as `+`, `/` or `=`;
+    /// use [`Self::client_secret_post`] for them.
+    #[must_use]
+    pub fn client_secret_basic(
+        client_id: impl Into<String>,
+        client_secret: impl Into<String>,
+    ) -> Self {
+        Self(ClientAuth::SecretBasic {
+            client_id: client_id.into(),
+            secret: Secret::new(client_secret),
+        })
+    }
+
+    /// The client id and secret as the form parameters `client_id` and `client_secret` (`client_secret_post`).
+    ///
+    /// The OAuth 2.1 draft (draft-ietf-oauth-v2-1-17, section 2.4.1) requires token endpoints to support it; RFC 6749 (section 2.3.1) makes it optional.
+    ///
+    /// The client secret is in the form body. A client set with [`ClientCredentialAuthorizerBuilder::set_http_client`] that follows redirects sends it to the redirect target,
+    /// also to another host or over `http`.
+    #[must_use]
+    pub fn client_secret_post(
+        client_id: impl Into<String>,
+        client_secret: impl Into<String>,
+    ) -> Self {
+        Self(ClientAuth::SecretPost {
+            client_id: client_id.into(),
+            secret: Secret::new(client_secret),
+        })
+    }
+}
+
+/// Builder for [`ClientCredentialAuthorizer`], made with [`ClientCredentialAuthorizer::builder`].
 ///
 /// The following configurations are available:
 /// * `max_retries`: How often `build()` retries the first token request. Default is 3. Only errors a retry can fix are retried, see [`Error::is_retryable`].
 /// * `timeout`: How long one token request may take, reading the answer included, and how long `build()` may take. Default is 30 seconds.
 /// * `http_client`: Custom `reqwest::Client` to use for token requests. Default is a client with redirects disabled and a connect timeout of 10 seconds.
 /// * `scopes`: Scopes to request in the token. Empty by default.
-/// * `extra_params`: Extra parameters to include in the token request. Empty by default.
+/// * `params`: Further form parameters of the token request, added with [`Self::append_param`]. Empty by default.
+/// * `danger_allow_http`: Whether an `http` token URL may have any host. Default is `false`: `http` works only with `localhost` and loopback addresses.
 /// * `enable_refresh`: Enable automatic token refresh. Default is `true`.
 /// * `refresh_tolerance`: How long before expiry a token is refreshed at the latest. Default is 30 seconds.
 /// * `default_token_lifetime`: The lifetime of a token if the token endpoint does not say. Default is 5 minutes.
 ///
-/// `Debug` shows the names of the extra parameters, not their values, and never the client secret.
+/// `Debug` shows the names of the parameters, not their values, and never the client secret.
 #[derive(Clone)]
 pub struct ClientCredentialAuthorizerBuilder {
     token_url: url::Url,
@@ -229,19 +278,17 @@ pub struct ClientCredentialAuthorizerBuilder {
     timeout: Option<Duration>,
     http_client: Option<reqwest::Client>,
     scopes: Vec<String>,
-    extra_params: HashMap<String, String>,
+    params: Vec<(String, String)>,
+    allow_http: bool,
     enable_refresh: bool,
     refresh_tolerance: Option<Duration>,
     default_token_lifetime: Option<Duration>,
 }
 
-/// Another name for [`ClientCredentialAuthorizerBuilder`].
-pub type BasicClientCredentialAuthorizerBuilder = ClientCredentialAuthorizerBuilder;
-
 impl fmt::Debug for ClientCredentialAuthorizerBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let token_url = token_endpoint::redacted_url(&self.token_url);
-        let extra_param_names: Vec<&String> = self.extra_params.keys().collect();
+        let param_names: Vec<&str> = self.params.iter().map(|(name, _)| name.as_str()).collect();
         f.debug_struct("ClientCredentialAuthorizerBuilder")
             .field("token_url", &token_url.as_str())
             .field("client_auth", &self.client_auth)
@@ -249,7 +296,8 @@ impl fmt::Debug for ClientCredentialAuthorizerBuilder {
             .field("timeout", &self.timeout)
             .field("http_client", &self.http_client)
             .field("scopes", &self.scopes)
-            .field("extra_param_names", &extra_param_names)
+            .field("param_names", &param_names)
+            .field("allow_http", &self.allow_http)
             .field("enable_refresh", &self.enable_refresh)
             .field("refresh_tolerance", &self.refresh_tolerance)
             .field("default_token_lifetime", &self.default_token_lifetime)
@@ -258,31 +306,12 @@ impl fmt::Debug for ClientCredentialAuthorizerBuilder {
 }
 
 impl ClientCredentialAuthorizerBuilder {
-    #[must_use]
-    /// Create a new [`ClientCredentialAuthorizer`] from a client id, client secret and token url.
-    /// The client authenticates with HTTP Basic (RFC 6749, section 2.3.1).
-    pub fn new(client_id: &str, client_secret: &str, token_url: url::Url) -> Self {
-        Self {
-            token_url,
-            client_auth: ClientAuth::SecretBasic {
-                client_id: client_id.to_string(),
-                secret: Secret::new(client_secret),
-            },
-            max_retries: None,
-            timeout: None,
-            http_client: None,
-            scopes: Vec::new(),
-            extra_params: HashMap::new(),
-            enable_refresh: true,
-            refresh_tolerance: None,
-            default_token_lifetime: None,
-        }
-    }
-
     /// Optionally specify the `reqwest::Client` to use for token requests.
     ///
     /// middle uses the client as it is. If the client follows redirects, which reqwest does by default,
-    /// a 307 or 308 answer of the token endpoint makes reqwest send the form body again to the URL the answer names.
+    /// a 307 or 308 answer of the token endpoint makes reqwest send the form body again to the URL the answer names, also to another host or over `http`.
+    /// With [`ClientAuthentication::client_secret_post`], that body holds the client secret. reqwest drops the `Authorization` header of
+    /// [`ClientAuthentication::client_secret_basic`] when the host, port or scheme changes, and keeps the body.
     /// middle refuses an answer whose final URL is not the token URL, but the other URL has already received the request,
     /// and an answer after a chain of redirects that ends at the token URL counts as the token endpoint's answer.
     /// Set `redirect(reqwest::redirect::Policy::none())` on the client to prevent this.
@@ -346,15 +375,24 @@ impl ClientCredentialAuthorizerBuilder {
         self
     }
 
-    /// Appends an extra param to the token request.
-    /// A second call with the same name replaces the value.
+    /// Appends a form parameter to the token request, after the scope. Each call adds one more parameter.
+    /// RFC 6749 (section 3.2) allows each parameter once, so repeat a name only where its specification allows it,
+    /// as RFC 8707 (section 2) does with one `resource` parameter for each resource.
     ///
     /// [`Self::build`] fails for a parameter middle sets itself: `grant_type`, `scope`, `client_id`, `client_secret`,
     /// `client_assertion`, `client_assertion_type` and `assertion`.
     #[must_use]
-    pub fn add_extra_param(mut self, name: &str, value: &str) -> Self {
-        self.extra_params
-            .insert(name.to_string(), value.to_string());
+    pub fn append_param(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.params.push((name.into(), value.into()));
+        self
+    }
+
+    /// Whether an `http` token URL may have any host. middle then sends the client credentials without TLS, so allow it only in a network you trust.
+    ///
+    /// The default is `false`: [`Self::build`] fails for an `http` token URL unless its host is `localhost` or a loopback address (`127.0.0.0/8` or `::1`).
+    #[must_use]
+    pub fn danger_allow_http(mut self, allow: bool) -> Self {
+        self.allow_http = allow;
         self
     }
 
@@ -395,7 +433,7 @@ impl ClientCredentialAuthorizerBuilder {
     ///
     /// # Errors
     ///
-    /// - [`Error::Config`] if the token URL, a scope or an extra parameter is not valid, the default token lifetime is shorter than 2 s, or the HTTP client cannot be built.
+    /// - [`Error::Config`] if the token URL, a scope or a parameter is not valid, the default token lifetime is shorter than 2 s, or the HTTP client cannot be built.
     /// - Any error of the initial token fetch.
     pub async fn build(self) -> Result<ClientCredentialAuthorizer, Error> {
         let default_lifetime = self
@@ -408,7 +446,8 @@ impl ClientCredentialAuthorizerBuilder {
             self.token_url,
             self.client_auth,
             &self.scopes,
-            self.extra_params,
+            self.params,
+            self.allow_http,
         )?;
         let http_client = match self.http_client {
             Some(http_client) => http_client,
@@ -525,10 +564,9 @@ mod test {
                 .to_string(),
             )
             .create();
-        let authorizer = BasicClientCredentialAuthorizerBuilder::new(
-            "my-client",
-            "my-secret",
+        let authorizer = ClientCredentialAuthorizer::builder(
             format!("{url}/my-tenant/oauth2/token").parse().unwrap(),
+            ClientAuthentication::client_secret_basic("my-client", "my-secret"),
         )
         .add_scope("my-scope")
         .add_scope("my-other-scope")
@@ -570,10 +608,9 @@ mod test {
             )
             .expect(2)
             .create();
-        let authorizer = BasicClientCredentialAuthorizerBuilder::new(
-            "my-client",
-            "my-secret",
+        let authorizer = ClientCredentialAuthorizer::builder(
             format!("{url}/my-tenant/oauth2/token").parse().unwrap(),
+            ClientAuthentication::client_secret_basic("my-client", "my-secret"),
         )
         .add_scope("my-scope")
         .add_scope("my-other-scope")
@@ -617,10 +654,9 @@ mod test {
             )
             .expect(3)
             .create();
-        let authorizer = BasicClientCredentialAuthorizerBuilder::new(
-            "my-client",
-            "my-secret",
+        let authorizer = ClientCredentialAuthorizer::builder(
             format!("{url}/my-tenant/oauth2/token").parse().unwrap(),
+            ClientAuthentication::client_secret_basic("my-client", "my-secret"),
         )
         .add_scope("my-scope")
         .add_scope("my-other-scope")
@@ -663,10 +699,9 @@ mod test {
             )
             .expect(1)
             .create();
-        let authorizer = BasicClientCredentialAuthorizerBuilder::new(
-            "my-client",
-            "my-secret",
+        let authorizer = ClientCredentialAuthorizer::builder(
             format!("{url}/my-tenant/oauth2/token").parse().unwrap(),
+            ClientAuthentication::client_secret_basic("my-client", "my-secret"),
         )
         .add_scope("my-scope")
         .add_scope("my-other-scope")
@@ -701,10 +736,9 @@ mod test {
             )
             .create_async()
             .await;
-        let authorizer = BasicClientCredentialAuthorizerBuilder::new(
-            "my-client",
-            "my-secret",
+        let authorizer = ClientCredentialAuthorizer::builder(
             format!("{url}/token").parse().unwrap(),
+            ClientAuthentication::client_secret_basic("my-client", "my-secret"),
         )
         .build()
         .await
