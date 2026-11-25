@@ -7,10 +7,11 @@ check-format:
 	cargo +nightly-2025-12-25 fmt --all -- --check
 
 check-clippy:
-	cargo clippy --all-features --workspace -- -D warnings
+	cargo clippy --all-targets --all-features --workspace -- -D warnings
 	cargo clippy --workspace -- -D warnings
 	cargo clippy --workspace --no-default-features -- -D warnings
 	cargo clippy -p middle --all-targets -- -D warnings
+	cargo clippy -p middle --all-targets --features tonic -- -D warnings
 	cargo clippy -p middle --no-default-features -- -D warnings
 	cargo clippy -p middle --no-default-features --features "jwt rust-crypto" -- -D warnings
 

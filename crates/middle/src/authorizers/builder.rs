@@ -469,7 +469,7 @@ impl AuthorizerBuilder {
     /// Build the [`Authorizer`].
     /// This triggers an initial token fetch, which takes at most the [`Self::timeout`], retries included.
     ///
-    /// Call it inside a Tokio runtime with timers enabled, such as the one `#[tokio::main]` starts. The refresh task runs on that runtime
+    /// Call it inside a Tokio runtime with IO and timers enabled (`enable_all`), such as the one `#[tokio::main]` starts. The refresh task runs on that runtime
     /// and stops when the runtime shuts down; the authorizer then answers with [`Error::RefreshStopped`] once the token has expired.
     ///
     /// # Panics
@@ -479,6 +479,7 @@ impl AuthorizerBuilder {
     /// # Errors
     ///
     /// - [`Error::Config`] if the token URL, a scope or a parameter is not valid, the default token lifetime is shorter than 2 s, or the HTTP client cannot be built.
+    /// - [`Error::TokenRequestPanicked`] in a runtime without IO (`enable_io`).
     /// - Any error of the initial token fetch.
     pub async fn build(self) -> Result<Authorizer, Error> {
         let default_lifetime = self
