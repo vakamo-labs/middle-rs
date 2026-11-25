@@ -84,7 +84,7 @@ impl Error {
     /// Retryable are transport errors, timeouts, and answers with HTTP 408, 429 or 5xx, whatever OAuth error they carry. These statuses ask for a later attempt, and a 5xx comes from a server that failed, so its code is not reliable.
     /// The OAuth errors `server_error` and `temporarily_unavailable` are retryable with any status.
     /// [`Error::TokenExpired`] is retryable, because a refresh is due. [`Error::ExpiredOnArrival`] is retryable, because a faster answer brings a usable token.
-    /// [`Error::Assertion`] is retryable: middle creates the assertion before it sends the request, so a retry costs the token endpoint nothing, and an assertion file or a signing service can recover.
+    /// [`Error::Assertion`] is retryable unless [`AssertionError::permanent`] marks it: middle creates the assertion before it sends the request, so a retry costs the token endpoint nothing, and an assertion file or a signing service can recover.
     /// Not retryable are other OAuth errors with another status, such as `invalid_client` with HTTP 401, redirect errors of the HTTP client, answers middle cannot use, configuration errors, a panicked token request, and [`Error::RefreshStopped`].
     /// Requests sent through [`crate::HttpClient`] are not retryable, because middle cannot know whether they are safe to repeat.
     #[must_use]
@@ -99,10 +99,8 @@ impl Error {
             }
             Self::Http(error) => is_retryable_status(error.status()),
             Self::Transport(TransportError(error)) => !error.is_builder() && !error.is_redirect(),
-            Self::Timeout(_)
-            | Self::TokenExpired
-            | Self::ExpiredOnArrival(_)
-            | Self::Assertion(_) => true,
+            Self::Timeout(_) | Self::TokenExpired | Self::ExpiredOnArrival(_) => true,
+            Self::Assertion(error) => !error.permanent,
             Self::InvalidResponse(_)
             | Self::Config(_)
             | Self::InvalidHeaderValue
@@ -416,10 +414,13 @@ impl fmt::Display for ResponseProblem {
 
 /// An assertion that could not be created, for example because signing failed or an assertion file cannot be read.
 /// [`std::error::Error::source`] is the cause, if there is one.
+///
+/// A retry may fix it, unless it is marked with [`AssertionError::permanent`].
 #[derive(Debug, Clone)]
 pub struct AssertionError {
     message: Cow<'static, str>,
     source: Option<Arc<dyn std::error::Error + Send + Sync>>,
+    permanent: bool,
 }
 
 impl AssertionError {
@@ -429,7 +430,16 @@ impl AssertionError {
         Self {
             message: message.into(),
             source: None,
+            permanent: false,
         }
+    }
+
+    /// Marks the error as one a retry cannot fix, such as a signing service that denies access.
+    /// Building an authorizer then fails at once, and its refresh task retries only about every 5 minutes.
+    #[must_use]
+    pub fn permanent(mut self) -> Self {
+        self.permanent = true;
+        self
     }
 
     /// Sets the cause, which [`std::error::Error::source`] returns.

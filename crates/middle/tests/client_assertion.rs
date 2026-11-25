@@ -11,19 +11,24 @@ use std::{
 };
 
 use middle::{
-    AssertionContext, AssertionError, AssertionSource, ClientAuthentication,
+    Assertion, AssertionContext, AssertionError, AssertionSource, ClientAuthentication,
     ClientCredentialAuthorizer, Error, FileAssertion, SignedJwt,
 };
 use support::{FakeIdp, Reply};
 
 const JWT_BEARER: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 
+/// The token URL and the client id of each call of a source.
+type Calls = Vec<(url::Url, Option<String>)>;
+
 /// Hands out the assertions `aGVhZGVy.cGF5bG9hZA.c2lnbmF0dXJl1`, `…2`, and so on, and records the context of each call.
 #[derive(Debug, Clone, Default)]
 struct CountingSource {
-    calls: Arc<Mutex<Vec<(url::Url, String)>>>,
+    calls: Arc<Mutex<Calls>>,
     /// The calls that fail, counted from 1.
     failing: Vec<usize>,
+    /// Whether the failures are permanent.
+    permanent: bool,
     /// The calls that never answer, counted from 1.
     hanging: Vec<usize>,
 }
@@ -33,7 +38,7 @@ impl CountingSource {
         format!("aGVhZGVy.cGF5bG9hZA.c2lnbmF0dXJl{number}")
     }
 
-    fn calls(&self) -> Vec<(url::Url, String)> {
+    fn calls(&self) -> Calls {
         self.calls.lock().unwrap().clone()
     }
 }
@@ -42,22 +47,47 @@ impl AssertionSource for CountingSource {
     fn assertion<'a>(
         &'a self,
         context: &'a AssertionContext,
-    ) -> Pin<Box<dyn Future<Output = Result<SignedJwt, AssertionError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Assertion, AssertionError>> + Send + 'a>> {
         Box::pin(async move {
             let number = {
                 let mut calls = self.calls.lock().unwrap();
-                calls.push((context.token_url().clone(), context.client_id().to_string()));
+                calls.push((
+                    context.token_url().clone(),
+                    context.client_id().map(str::to_string),
+                ));
                 calls.len()
             };
             if self.hanging.contains(&number) {
                 std::future::pending::<()>().await;
             }
             if self.failing.contains(&number) {
-                return Err(AssertionError::new("the signer is not ready"));
+                let error = AssertionError::new("the signer is not ready");
+                return Err(if self.permanent {
+                    error.permanent()
+                } else {
+                    error
+                });
             }
-            SignedJwt::new(Self::assertion(number))
+            Assertion::new(Self::assertion(number))
         })
     }
+}
+
+/// An assertion that is not a JWT, such as a base64url-encoded SAML assertion (RFC 7522).
+#[derive(Debug)]
+struct SamlSource;
+
+impl AssertionSource for SamlSource {
+    fn assertion<'a>(
+        &'a self,
+        _context: &'a AssertionContext,
+    ) -> Pin<Box<dyn Future<Output = Result<Assertion, AssertionError>> + Send + 'a>> {
+        Box::pin(async { Assertion::new("PHNhbWw6QXNzZXJ0aW9uLz4") })
+    }
+}
+
+fn context() -> AssertionContext {
+    AssertionContext::new("https://idp.example.com/token".parse().unwrap()).with_client_id("c")
 }
 
 /// A file in the temporary directory, removed when dropped.
@@ -109,8 +139,116 @@ async fn test_a_client_assertion_is_sent_with_the_client_id() {
     );
     assert_eq!(
         source.calls(),
-        vec![(idp.token_url(), "my client".to_string())]
+        vec![(idp.token_url(), Some("my client".to_string()))]
     );
+}
+
+#[tokio::test]
+async fn test_the_client_id_parameter_can_be_left_out() {
+    let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
+    let source = CountingSource::default();
+
+    ClientCredentialAuthorizer::builder(
+        idp.token_url(),
+        ClientAuthentication::client_assertion("my-client", source.clone())
+            .without_client_id_parameter(),
+    )
+    .build()
+    .await
+    .unwrap();
+
+    assert_eq!(
+        idp.requests()[0].body,
+        format!(
+            "grant_type=client_credentials&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion={}",
+            CountingSource::assertion(1)
+        )
+    );
+    // The source still learns the client id.
+    assert_eq!(
+        source.calls(),
+        vec![(idp.token_url(), Some("my-client".to_string()))]
+    );
+}
+
+#[tokio::test]
+async fn test_an_assertion_that_is_not_a_jwt_is_sent_as_it_is() {
+    let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
+
+    ClientCredentialAuthorizer::builder(
+        idp.token_url(),
+        ClientAuthentication::client_assertion("c", SamlSource),
+    )
+    .build()
+    .await
+    .unwrap();
+
+    assert_eq!(
+        idp.requests()[0].form_value("client_assertion").as_deref(),
+        Some("PHNhbWw6QXNzZXJ0aW9uLz4")
+    );
+}
+
+#[tokio::test]
+async fn test_one_source_can_serve_several_authorizers() {
+    let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
+    let shared = Arc::new(CountingSource::default());
+    let boxed: Box<dyn AssertionSource> = Box::new(SamlSource);
+
+    for authentication in [
+        ClientAuthentication::client_assertion("c", Arc::clone(&shared)),
+        ClientAuthentication::client_assertion("c", Arc::clone(&shared)),
+        ClientAuthentication::client_assertion("c", boxed),
+    ] {
+        ClientCredentialAuthorizer::builder(idp.token_url(), authentication)
+            .build()
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(shared.calls().len(), 2);
+    assert_eq!(idp.count(), 3);
+}
+
+#[test]
+fn test_an_assertion_is_visible_ascii() {
+    assert_eq!(Assertion::new("a.b+c/=_-~").unwrap().as_str(), "a.b+c/=_-~");
+    for value in ["", " a", "a b", "a\n", "a\u{0}", "ä"] {
+        let error = Assertion::new(value).expect_err(value);
+        assert_eq!(
+            error.to_string(),
+            "the assertion is empty or holds a character other than visible ASCII"
+        );
+    }
+    let jwt = SignedJwt::new("aGVhZGVy.cGF5bG9hZA.c2ln").unwrap();
+    assert_eq!(Assertion::from(jwt).as_str(), "aGVhZGVy.cGF5bG9hZA.c2ln");
+    assert_eq!(
+        format!("{:?}", Assertion::new("U0VDUkVU").unwrap()),
+        "Assertion([redacted])"
+    );
+}
+
+#[tokio::test]
+async fn test_a_permanent_assertion_error_fails_build_at_once() {
+    let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
+    let source = CountingSource {
+        failing: vec![1],
+        permanent: true,
+        ..CountingSource::default()
+    };
+
+    let error = ClientCredentialAuthorizer::builder(
+        idp.token_url(),
+        ClientAuthentication::client_assertion("c", source.clone()),
+    )
+    .build()
+    .await
+    .expect_err("a retry cannot fix the error");
+
+    assert!(matches!(&error, Error::Assertion(_)), "{error:?}");
+    assert!(!error.is_retryable());
+    assert_eq!(source.calls().len(), 1);
+    assert_eq!(idp.count(), 0);
 }
 
 #[tokio::test]
@@ -215,7 +353,7 @@ async fn test_an_assertion_error_is_retryable_and_names_its_cause() {
 async fn test_a_file_assertion_is_read_for_every_request() {
     let file = TempFile::new("every-request", "aGVhZGVy.Zmlyc3Q.c2ln\n");
     let source = FileAssertion::new(&file.0);
-    let context = AssertionContext::new("https://idp.example.com/token".parse().unwrap(), "c");
+    let context = context();
 
     // The newline at the end is not part of the assertion.
     assert_eq!(
@@ -251,7 +389,7 @@ async fn test_a_file_assertion_is_sent() {
 #[tokio::test]
 async fn test_a_missing_file_is_an_assertion_error_that_names_the_file() {
     let path = std::env::temp_dir().join("middle-client-assertion-does-not-exist");
-    let context = AssertionContext::new("https://idp.example.com/token".parse().unwrap(), "c");
+    let context = context();
 
     let error = FileAssertion::new(&path)
         .assertion(&context)
@@ -274,7 +412,7 @@ async fn test_a_missing_file_is_an_assertion_error_that_names_the_file() {
 
 #[tokio::test]
 async fn test_a_file_that_is_not_a_jwt_is_an_assertion_error_without_its_content() {
-    let context = AssertionContext::new("https://idp.example.com/token".parse().unwrap(), "c");
+    let context = context();
     for (name, content) in [
         ("empty", "".as_bytes()),
         ("two-parts", b"SECRET.SECRET".as_slice()),
@@ -297,7 +435,7 @@ async fn test_a_file_that_is_not_a_jwt_is_an_assertion_error_without_its_content
 #[tokio::test]
 async fn test_a_file_larger_than_64_kib_is_refused() {
     let file = TempFile::new("large", "a".repeat(64 * 1024 + 1));
-    let context = AssertionContext::new("https://idp.example.com/token".parse().unwrap(), "c");
+    let context = context();
 
     let error = FileAssertion::new(&file.0)
         .assertion(&context)
@@ -309,6 +447,59 @@ async fn test_a_file_larger_than_64_kib_is_refused() {
         format!(
             "the assertion file `{}` is larger than 64 KiB",
             file.0.display()
+        )
+    );
+}
+
+#[tokio::test]
+async fn test_a_path_that_is_not_a_regular_file_is_refused() {
+    let directory = std::env::temp_dir();
+
+    let error = FileAssertion::new(&directory)
+        .assertion(&context())
+        .await
+        .expect_err("a directory");
+
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "the assertion file `{}` is not a regular file",
+            directory.display()
+        )
+    );
+}
+
+/// Opening a FIFO without a writer blocks, and a blocking read cannot be cancelled.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_a_fifo_is_refused_without_opening_it() {
+    let path = std::env::temp_dir().join(format!(
+        "middle-client-assertion-{}-fifo",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let source = FileAssertion::new(&path);
+
+    let result = tokio::time::timeout(Duration::from_secs(5), source.assertion(&context())).await;
+    if result.is_err() {
+        // A writer releases the blocked reader, so that the runtime can shut down.
+        let _ = std::fs::OpenOptions::new().write(true).open(&path);
+    }
+    let _ = std::fs::remove_file(&path);
+
+    let error = result.expect("the FIFO is not opened").expect_err("a FIFO");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "the assertion file `{}` is not a regular file",
+            path.display()
         )
     );
 }

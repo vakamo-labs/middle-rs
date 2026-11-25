@@ -20,7 +20,7 @@ mod token_endpoint;
 #[cfg(any(feature = "client-credentials", feature = "jwt"))]
 pub use assertion::SignedJwt;
 #[cfg(feature = "client-credentials")]
-pub use assertion::{AssertionContext, AssertionFuture, AssertionSource, FileAssertion};
+pub use assertion::{Assertion, AssertionContext, AssertionFuture, AssertionSource, FileAssertion};
 pub use authorizers::*;
 pub use client::*;
 pub use error::{

@@ -10,7 +10,7 @@ use jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER as PROVIDER;
 use jsonwebtoken::{Algorithm, DecodingKey};
 use middle::{
     ClientAuthentication, ClientCredentialAuthorizer, ConfigError,
-    jwt::{JwtAssertion, SigningAlgorithm, SigningKey},
+    jwt::{Audience, JwtAssertion, SigningAlgorithm, SigningKey},
 };
 use serde_json::{Value, json};
 use support::{FakeIdp, Reply, Request};
@@ -50,6 +50,17 @@ fn decode_part(part: &str) -> Value {
     serde_json::from_slice(&URL_SAFE_NO_PAD.decode(part).expect("base64url")).expect("JSON")
 }
 
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn issuer() -> Audience {
+    Audience::Issuer(ISSUER.to_string())
+}
+
 fn ec_key() -> SigningKey {
     SigningKey::from_pem(EC_P256, SigningAlgorithm::Es256).unwrap()
 }
@@ -83,8 +94,11 @@ fn assert_client_claims(claims: &serde_json::Map<String, Value>, client_id: &str
     assert_eq!(claims["iss"], client_id);
     assert_eq!(claims["sub"], client_id);
     assert_eq!(claims["aud"], audience);
+    // `iat` lies 5 seconds before the signing, and `exp` 60 seconds after it.
     let iat = claims["iat"].as_u64().unwrap();
-    assert_eq!(claims["exp"].as_u64().unwrap() - iat, 60);
+    let signed_at = iat + 5;
+    assert!((now() - 2..=now()).contains(&signed_at), "iat {iat}");
+    assert_eq!(claims["exp"].as_u64().unwrap(), signed_at + 60);
     assert_eq!(claims["jti"].as_str().unwrap().len(), 22);
 }
 
@@ -94,7 +108,7 @@ async fn test_private_key_jwt_signs_a_typed_assertion_for_the_issuer() {
 
     ClientCredentialAuthorizer::builder(
         idp.token_url(),
-        ClientAuthentication::private_key_jwt("my-client", ec_key().with_key_id("key-1"), ISSUER),
+        ClientAuthentication::private_key_jwt("my-client", ec_key().with_key_id("key-1"), issuer()),
     )
     .build()
     .await
@@ -116,7 +130,7 @@ async fn test_client_secret_jwt_signs_with_the_secret_and_does_not_send_it() {
 
     ClientCredentialAuthorizer::builder(
         idp.token_url(),
-        ClientAuthentication::client_secret_jwt("my-client", CLIENT_SECRET, ISSUER).unwrap(),
+        ClientAuthentication::client_secret_jwt("my-client", CLIENT_SECRET, issuer()).unwrap(),
     )
     .build()
     .await
@@ -139,7 +153,7 @@ async fn test_client_secret_jwt_signs_with_the_secret_and_does_not_send_it() {
 
 #[test]
 fn test_client_secret_jwt_refuses_a_secret_shorter_than_256_bits() {
-    let error = ClientAuthentication::client_secret_jwt("c", &CLIENT_SECRET[1..], ISSUER)
+    let error = ClientAuthentication::client_secret_jwt("c", &CLIENT_SECRET[1..], issuer())
         .expect_err("RFC 7518, section 3.2");
 
     assert!(
@@ -156,15 +170,14 @@ fn test_client_secret_jwt_refuses_a_secret_shorter_than_256_bits() {
 }
 
 #[tokio::test]
-async fn test_a_jwt_assertion_can_name_the_token_endpoint_as_its_audience() {
+async fn test_private_key_jwt_for_the_token_endpoint_signs_an_untyped_jwt_for_its_url() {
     let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
-    let token_url = idp.token_url();
-    // For an authorization server that expects its token endpoint URL as the audience, which RFC 10070 (section 4) forbids.
-    let assertion = JwtAssertion::new(ec_key(), "my-client", "my-client", token_url.as_str());
+    let mut token_url = idp.token_url();
+    token_url.set_query(Some("tenant=t1"));
 
     ClientCredentialAuthorizer::builder(
         token_url.clone(),
-        ClientAuthentication::client_assertion("my-client", assertion),
+        ClientAuthentication::private_key_jwt("my-client", ec_key(), Audience::TokenEndpoint),
     )
     .build()
     .await
@@ -177,11 +190,32 @@ async fn test_a_jwt_assertion_can_name_the_token_endpoint_as_its_audience() {
     assert_client_claims(&jwt.claims, "my-client", token_url.as_str());
 }
 
+#[tokio::test]
+async fn test_a_jwt_assertion_is_a_source_that_sends_its_own_header() {
+    let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
+    // For an authorization server that refuses the type `client-authentication+jwt`.
+    let assertion = JwtAssertion::new(ec_key(), "my-client", "my-client", ISSUER);
+
+    ClientCredentialAuthorizer::builder(
+        idp.token_url(),
+        ClientAuthentication::client_assertion("my-client", assertion),
+    )
+    .build()
+    .await
+    .unwrap();
+
+    let assertion = client_assertion(&idp.requests()[0], "my-client");
+    let public_key = DecodingKey::from_ec_pem(EC_P256_PUBLIC.as_bytes()).unwrap();
+    let jwt = verify(&assertion, Algorithm::ES256, &public_key);
+    assert_eq!(jwt.header, json!({"alg": "ES256", "typ": "JWT"}));
+    assert_client_claims(&jwt.claims, "my-client", ISSUER);
+}
+
 #[test]
 fn test_debug_output_hides_the_keys() {
     for authentication in [
-        ClientAuthentication::private_key_jwt("my-client", ec_key(), ISSUER),
-        ClientAuthentication::client_secret_jwt("my-client", CLIENT_SECRET, ISSUER).unwrap(),
+        ClientAuthentication::private_key_jwt("my-client", ec_key(), issuer()),
+        ClientAuthentication::client_secret_jwt("my-client", CLIENT_SECRET, issuer()).unwrap(),
     ] {
         let debug = format!("{authentication:?}");
         assert!(debug.contains("my-client"), "{debug}");

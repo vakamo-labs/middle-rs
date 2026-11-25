@@ -11,7 +11,7 @@ pub(crate) use response::{MAX_EXPIRES_IN, TokenResponse};
 use url::Url;
 
 use crate::{
-    assertion::{AssertionContext, AssertionSource, SignedJwt},
+    assertion::{Assertion, AssertionContext, AssertionSource},
     error::{AssertionError, ConfigError, Error, InvalidResponse, ResponseProblem, TransportError},
 };
 
@@ -62,10 +62,11 @@ pub(crate) enum ClientAuth {
     SecretBasic { client_id: String, secret: Secret },
     /// The client id and secret as the form parameters `client_id` and `client_secret` (RFC 6749, section 2.3.1; OAuth 2.1 draft, section 2.4.1).
     SecretPost { client_id: String, secret: Secret },
-    /// The client id and a JWT from `source` as the form parameters `client_id` and `client_assertion` (RFC 7523, section 2.2).
+    /// An assertion from `source` as the form parameter `client_assertion`, with `client_id` unless `send_client_id` is false (RFC 7521, section 4.2; RFC 7523, section 2.2).
     Assertion {
         client_id: String,
         source: Arc<dyn AssertionSource>,
+        send_client_id: bool,
     },
 }
 
@@ -183,8 +184,10 @@ impl TokenRequest {
     /// The form body, with a new assertion for [`ClientAuth::Assertion`].
     async fn form(&self) -> Result<String, AssertionError> {
         let assertion = match &self.client_auth {
-            ClientAuth::Assertion { client_id, source } => {
-                let context = AssertionContext::new(self.url.clone(), client_id.clone());
+            ClientAuth::Assertion {
+                client_id, source, ..
+            } => {
+                let context = AssertionContext::new(self.url.clone()).with_client_id(client_id);
                 Some(source.assertion(&context).await?)
             }
             ClientAuth::SecretBasic { .. } | ClientAuth::SecretPost { .. } => None,
@@ -194,7 +197,7 @@ impl TokenRequest {
 
     /// The form body: `grant_type`, the client credentials in the body, `scope`, then the extra parameters.
     /// `assertion` is the client assertion for [`ClientAuth::Assertion`].
-    fn encode_form(&self, assertion: Option<&SignedJwt>) -> String {
+    fn encode_form(&self, assertion: Option<&Assertion>) -> String {
         let mut form = url::form_urlencoded::Serializer::new(String::new());
         form.append_pair("grant_type", "client_credentials");
         match &self.client_auth {
@@ -204,8 +207,14 @@ impl TokenRequest {
                 form.append_pair("client_id", client_id);
                 form.append_pair("client_secret", secret.expose());
             }
-            ClientAuth::Assertion { client_id, .. } => {
-                form.append_pair("client_id", client_id);
+            ClientAuth::Assertion {
+                client_id,
+                send_client_id,
+                ..
+            } => {
+                if *send_client_id {
+                    form.append_pair("client_id", client_id);
+                }
                 form.append_pair("client_assertion_type", JWT_BEARER_CLIENT_ASSERTION);
                 if let Some(assertion) = assertion {
                     form.append_pair("client_assertion", assertion.as_str());
