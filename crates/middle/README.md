@@ -10,7 +10,7 @@ This crate provides authentication middleware for clients that need to access se
 * Thread-safe token management with interior mutability
 * `reqwest` integration by using a wrapped `HttpClient`
 * `tonic` integration via Interceptors
-* Support for OAuth2 Client Credential flow
+* Support for OAuth2 Client Credential flow, with the client secret (Basic or form body) or a JWT client assertion (RFC 7523): `private_key_jwt`, `client_secret_jwt`, or an assertion from a file such as a Kubernetes service account token
 * Support for Bearer Token authentication
 * Safe defaults - does not follow redirects and hides sensitive data in Debug
 * More flows coming soon!

@@ -2,7 +2,7 @@
 
 mod response;
 
-use std::{fmt, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 #[cfg(test)]
@@ -10,7 +10,10 @@ pub(crate) use response::AccessToken;
 pub(crate) use response::{MAX_EXPIRES_IN, TokenResponse};
 use url::Url;
 
-use crate::error::{ConfigError, Error, InvalidResponse, ResponseProblem, TransportError};
+use crate::{
+    assertion::{AssertionContext, AssertionSource, SignedJwt},
+    error::{AssertionError, ConfigError, Error, InvalidResponse, ResponseProblem, TransportError},
+};
 
 /// The largest answer middle reads from a token endpoint, in bytes.
 pub(crate) const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -49,6 +52,9 @@ impl fmt::Debug for Secret {
     }
 }
 
+/// The `client_assertion_type` of a JWT client assertion (RFC 7523, section 2.2).
+const JWT_BEARER_CLIENT_ASSERTION: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+
 /// How the client authenticates at the token endpoint.
 #[derive(Clone, Debug)]
 pub(crate) enum ClientAuth {
@@ -56,12 +62,19 @@ pub(crate) enum ClientAuth {
     SecretBasic { client_id: String, secret: Secret },
     /// The client id and secret as the form parameters `client_id` and `client_secret` (RFC 6749, section 2.3.1; OAuth 2.1 draft, section 2.4.1).
     SecretPost { client_id: String, secret: Secret },
+    /// The client id and a JWT from `source` as the form parameters `client_id` and `client_assertion` (RFC 7523, section 2.2).
+    Assertion {
+        client_id: String,
+        source: Arc<dyn AssertionSource>,
+    },
 }
 
 impl ClientAuth {
     fn client_id(&self) -> &str {
         match self {
-            Self::SecretBasic { client_id, .. } | Self::SecretPost { client_id, .. } => client_id,
+            Self::SecretBasic { client_id, .. }
+            | Self::SecretPost { client_id, .. }
+            | Self::Assertion { client_id, .. } => client_id,
         }
     }
 }
@@ -167,13 +180,37 @@ impl TokenRequest {
         is_loopback(&self.url)
     }
 
-    /// The form body: `grant_type`, the client credentials for `client_secret_post`, `scope`, then the extra parameters.
-    fn form(&self) -> String {
+    /// The form body, with a new assertion for [`ClientAuth::Assertion`].
+    async fn form(&self) -> Result<String, AssertionError> {
+        let assertion = match &self.client_auth {
+            ClientAuth::Assertion { client_id, source } => {
+                let context = AssertionContext::new(self.url.clone(), client_id.clone());
+                Some(source.assertion(&context).await?)
+            }
+            ClientAuth::SecretBasic { .. } | ClientAuth::SecretPost { .. } => None,
+        };
+        Ok(self.encode_form(assertion.as_ref()))
+    }
+
+    /// The form body: `grant_type`, the client credentials in the body, `scope`, then the extra parameters.
+    /// `assertion` is the client assertion for [`ClientAuth::Assertion`].
+    fn encode_form(&self, assertion: Option<&SignedJwt>) -> String {
         let mut form = url::form_urlencoded::Serializer::new(String::new());
         form.append_pair("grant_type", "client_credentials");
-        if let ClientAuth::SecretPost { client_id, secret } = &self.client_auth {
-            form.append_pair("client_id", client_id);
-            form.append_pair("client_secret", secret.expose());
+        match &self.client_auth {
+            // The credentials are in the `Authorization` header.
+            ClientAuth::SecretBasic { .. } => {}
+            ClientAuth::SecretPost { client_id, secret } => {
+                form.append_pair("client_id", client_id);
+                form.append_pair("client_secret", secret.expose());
+            }
+            ClientAuth::Assertion { client_id, .. } => {
+                form.append_pair("client_id", client_id);
+                form.append_pair("client_assertion_type", JWT_BEARER_CLIENT_ASSERTION);
+                if let Some(assertion) = assertion {
+                    form.append_pair("client_assertion", assertion.as_str());
+                }
+            }
         }
         if !self.scopes.is_empty() {
             let scopes: Vec<&str> = self.scopes.iter().map(|scope| scope.0.as_str()).collect();
@@ -198,7 +235,7 @@ impl fmt::Debug for TokenRequest {
     }
 }
 
-/// Asks the token endpoint for a token once. The caller bounds the request with a timeout.
+/// Asks the token endpoint for a token once, with a new client assertion if the client authenticates with one. The caller bounds the request with a timeout.
 pub(crate) async fn request_token(
     http_client: &reqwest::Client,
     request: &TokenRequest,
@@ -210,7 +247,7 @@ pub(crate) async fn request_token(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/x-www-form-urlencoded"),
         )
-        .body(request.form());
+        .body(request.form().await?);
     match &request.client_auth {
         ClientAuth::SecretBasic { client_id, secret } => {
             // reqwest Base64-encodes `id:secret` and marks the header sensitive.
@@ -220,7 +257,7 @@ pub(crate) async fn request_token(
             );
         }
         // The credentials are in the form body.
-        ClientAuth::SecretPost { .. } => {}
+        ClientAuth::SecretPost { .. } | ClientAuth::Assertion { .. } => {}
     }
     let response = builder
         .send()
@@ -373,7 +410,7 @@ mod tests {
     #[test]
     fn test_a_request_without_scopes_sends_no_scope() {
         assert_eq!(
-            request(&[], &[]).unwrap().form(),
+            request(&[], &[]).unwrap().encode_form(None),
             "grant_type=client_credentials"
         );
     }
@@ -383,7 +420,7 @@ mod tests {
         assert_eq!(
             request(&["a", "b:c", "https://api.example.com/.default"], &[])
                 .unwrap()
-                .form(),
+                .encode_form(None),
             "grant_type=client_credentials&scope=a+b%3Ac+https%3A%2F%2Fapi.example.com%2F.default"
         );
     }
@@ -393,7 +430,7 @@ mod tests {
         assert_eq!(
             request(&[], &[("resource", "a"), ("resource", "b")])
                 .unwrap()
-                .form(),
+                .encode_form(None),
             "grant_type=client_credentials&resource=a&resource=b"
         );
     }

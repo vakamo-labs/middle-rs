@@ -12,11 +12,18 @@ use std::{
 use http::HeaderValue;
 
 use super::Authorizer;
+#[cfg(feature = "jwt")]
+use crate::jwt::{JwtAssertion, SigningAlgorithm, SigningKey};
 use crate::{
+    AssertionSource,
     cache::{BoxFuture, CacheConfig, Token, TokenCache, TokenId, TokenSource},
     error::{ConfigError, Error},
     token_endpoint::{self, ClientAuth, Secret, TokenRequest, TokenResponse},
 };
+
+/// The `typ` header of a client authentication JWT (RFC 10070).
+#[cfg(feature = "jwt")]
+const CLIENT_AUTHENTICATION_JWT_TYPE: &str = "client-authentication+jwt";
 
 /// How long one token request may take, reading the answer included.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -234,7 +241,7 @@ fn token_header(token: &Token) -> TokenHeader {
 
 /// How the client authenticates at the token endpoint (RFC 6749, section 2.3).
 ///
-/// `Debug` shows the client id, never the secret.
+/// `Debug` shows the client id and, for a client assertion, the `Debug` output of its source. It never shows a secret, a key of middle's types or an assertion.
 #[derive(Clone, Debug)]
 pub struct ClientAuthentication(ClientAuth);
 
@@ -270,6 +277,57 @@ impl ClientAuthentication {
             client_id: client_id.into(),
             secret: Secret::new(client_secret),
         })
+    }
+
+    /// A JWT from `source` as the form parameter `client_assertion`, with the client id as `client_id` (RFC 7523, section 2.2; RFC 7521, section 4.2).
+    ///
+    /// `source` supplies a new assertion for every token request, such as a Kubernetes service account token from a [`crate::FileAssertion`].
+    /// middle sends the assertion as it is, so `source` decides its `iss`, `sub` and `aud`.
+    #[must_use]
+    pub fn client_assertion(client_id: impl Into<String>, source: impl AssertionSource) -> Self {
+        Self(ClientAuth::Assertion {
+            client_id: client_id.into(),
+            source: Arc::new(source),
+        })
+    }
+
+    /// A JWT signed with the client's private key as the form parameter `client_assertion` (`private_key_jwt`, RFC 7523, section 2.2; OpenID Connect Core 1.0, section 9).
+    ///
+    /// middle signs a new assertion for every token request, as RFC 7523 (section 3) and RFC 10070 describe: `iss` and `sub` are the client id, `aud` is `issuer`,
+    /// the issuer identifier of the authorization server, `exp` is 60 seconds after `iat`, `jti` is new, and the header `typ` is `client-authentication+jwt`.
+    /// The client id is also sent as `client_id`.
+    ///
+    /// Some authorization servers expect their token endpoint URL as the audience, which RFC 10070 (section 4) forbids. For them, pass a [`JwtAssertion`] with that audience to [`Self::client_assertion`].
+    /// For a client secret as the key, use [`Self::client_secret_jwt`].
+    #[cfg(feature = "jwt")]
+    #[must_use]
+    pub fn private_key_jwt(
+        client_id: impl Into<String>,
+        key: SigningKey,
+        issuer: impl Into<String>,
+    ) -> Self {
+        let client_id = client_id.into();
+        let assertion = JwtAssertion::new(key, client_id.clone(), client_id.clone(), issuer)
+            .with_type(CLIENT_AUTHENTICATION_JWT_TYPE);
+        Self::client_assertion(client_id, assertion)
+    }
+
+    /// A JWT signed with HS256 and the client secret as the form parameter `client_assertion` (`client_secret_jwt`, OpenID Connect Core 1.0, section 9).
+    /// The secret itself is not sent.
+    ///
+    /// The assertion has the claims and the header that [`Self::private_key_jwt`] describes.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::WeakSigningKey`] if the secret is shorter than 32 bytes (RFC 7518, section 3.2).
+    #[cfg(feature = "jwt")]
+    pub fn client_secret_jwt(
+        client_id: impl Into<String>,
+        client_secret: impl AsRef<str>,
+        issuer: impl Into<String>,
+    ) -> Result<Self, ConfigError> {
+        let key = SigningKey::from_secret(client_secret.as_ref(), SigningAlgorithm::Hs256)?;
+        Ok(Self::private_key_jwt(client_id, key, issuer))
     }
 }
 
@@ -327,7 +385,8 @@ impl ClientCredentialAuthorizerBuilder {
     ///
     /// middle uses the client as it is. If the client follows redirects, which reqwest does by default,
     /// a 307 or 308 answer of the token endpoint makes reqwest send the form body again to the URL the answer names, also to another host or over `http`.
-    /// With [`ClientAuthentication::client_secret_post`], that body holds the client secret. reqwest drops the `Authorization` header of
+    /// With [`ClientAuthentication::client_secret_post`], that body holds the client secret, and with a client assertion the assertion, which is valid until it expires.
+    /// reqwest drops the `Authorization` header of
     /// [`ClientAuthentication::client_secret_basic`] when the host, port or scheme changes, and keeps the body.
     /// middle refuses an answer whose final URL is not the token URL, but the other URL has already received the request,
     /// and an answer after a chain of redirects that ends at the token URL counts as the token endpoint's answer.
