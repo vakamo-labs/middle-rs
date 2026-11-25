@@ -10,6 +10,7 @@ check-clippy:
 	cargo clippy --all-features --workspace -- -D warnings
 	cargo clippy --workspace -- -D warnings
 	cargo clippy --workspace --no-default-features -- -D warnings
+	cargo clippy -p middle --all-targets -- -D warnings
 	cargo clippy -p middle --no-default-features -- -D warnings
 	cargo clippy -p middle --no-default-features --features "jwt rust-crypto" -- -D warnings
 
@@ -27,6 +28,7 @@ test: doc-test
 	cargo test --all-targets --all-features --workspace
 	cargo test --all-targets --workspace --no-default-features
 	cargo test --all-targets --workspace --features "all"
+	cargo test --all-targets -p middle
 	cargo test --all-targets -p middle --no-default-features --features "jwt rust-crypto"
 
 doc-test:

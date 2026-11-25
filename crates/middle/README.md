@@ -14,7 +14,6 @@ This crate provides authentication middleware for clients that need to access se
 * Support for the JWT bearer grant (RFC 7523, section 2.1), with or without client authentication
 * Support for Bearer Token authentication
 * Safe defaults - does not follow redirects and hides sensitive data in Debug
-* More flows coming soon!
 
 # Example
 
@@ -163,9 +162,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - **all**: Includes `rustls-tls`, `tonic`, `client-credentials`, `runtime-tokio`, `jwt`, and `aws-lc-rs`.
 - **default**: Includes `rustls-tls`, `client-credentials`, and `runtime-tokio`.
-- **rustls-tls**: Enables reqwest's `rustls` feature: TLS with rustls and aws-lc-rs, checking certificates against the root certificates of the operating system. A container image needs them installed, for example with the `ca-certificates` package.
+- **rustls-tls**: Enables reqwest's `rustls` feature: TLS with rustls and aws-lc-rs, checking certificates against the root certificates of the operating system. A container image needs them installed, for example with the `ca-certificates` package. Without `rustls-tls`, enable a TLS feature of reqwest 0.13 in your own `Cargo.toml`, such as `native-tls`: middle uses the reqwest of your build, and a reqwest without TLS cannot reach an `https` token endpoint.
 - **tonic**: `Authorizer::interceptor`, a `tonic::service::Interceptor` of tonic 0.14
-- **runtime-tokio**: Enables the `tokio` runtime (currently the only supported async runtime), which refreshes requested tokens in a background task.
+- **runtime-tokio**: Refreshes requested tokens in a background task on Tokio. `client-credentials` needs it.
 - **client-credentials**: Tokens from a token endpoint, such as `Authorizer::client_credentials` for the OAuth2 client credentials grant
 - **jwt**: Signs JWT assertions (RFC 7523) with `middle::jwt`. Enable `jwt` with exactly one of these crypto backends:
     - **aws-lc-rs**: aws-lc-rs.

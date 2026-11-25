@@ -53,7 +53,7 @@ impl Authorizer {
 
     /// A builder for the JWT bearer grant (RFC 7523, section 2.1) at the token endpoint `token_url`: a JWT from `assertion` is the grant.
     ///
-    /// middle asks `assertion` for a new JWT for every token request, retries included, such as a `jwt::JwtAssertion` that middle signs or a [`crate::FileAssertion`].
+    /// `assertion` is, for example, a `jwt::JwtAssertion` that middle signs, or a [`crate::FileAssertion`]. middle asks it for a new JWT for every token request, retries included.
     /// The grant needs no client authentication. Set one with [`AuthorizerBuilder::client_authentication`] if the authorization server requires it.
     /// Add parameters such as `resource` (RFC 8707) with [`AuthorizerBuilder::append_param`].
     #[must_use]
@@ -468,6 +468,13 @@ impl AuthorizerBuilder {
 
     /// Build the [`Authorizer`].
     /// This triggers an initial token fetch, which takes at most the [`Self::timeout`], retries included.
+    ///
+    /// Call it inside a Tokio runtime with timers enabled, such as the one `#[tokio::main]` starts. The refresh task runs on that runtime
+    /// and stops when the runtime shuts down; the authorizer then answers with [`Error::RefreshStopped`] once the token has expired.
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime, or in a runtime without timers (`enable_time`).
     ///
     /// # Errors
     ///
