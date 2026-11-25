@@ -92,6 +92,10 @@ name = "jwt"
 required-features = ["jwt"]
 
 [[test]]
+name = "proxy"
+required-features = ["client-credentials"]
+
+[[test]]
 name = "token_refresh"
 required-features = ["client-credentials"]
 

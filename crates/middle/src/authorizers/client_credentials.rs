@@ -208,6 +208,23 @@ impl TokenHeader {
     }
 }
 
+/// The HTTP client for a builder without [`ClientCredentialAuthorizerBuilder::set_http_client`]: no redirects, a connect timeout of 10 s,
+/// and a proxy from the environment, except for a token URL with a loopback host.
+fn default_http_client(request: &TokenRequest) -> Result<reqwest::Client, ConfigError> {
+    let builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(DEFAULT_CONNECT_TIMEOUT);
+    // A proxy on another machine cannot reach the loopback address of this one, and would see the credentials of an `http` request.
+    let builder = if request.has_loopback_host() {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    builder
+        .build()
+        .map_err(|error| ConfigError::HttpClient(Arc::new(error)))
+}
+
 fn token_header(token: &Token) -> TokenHeader {
     TokenHeader {
         header: Arc::clone(token.header()),
@@ -261,7 +278,7 @@ impl ClientAuthentication {
 /// The following configurations are available:
 /// * `max_retries`: How often `build()` retries the first token request. Default is 3. Only errors a retry can fix are retried, see [`Error::is_retryable`].
 /// * `timeout`: How long one token request may take, reading the answer included, and how long `build()` may take. Default is 30 seconds.
-/// * `http_client`: Custom `reqwest::Client` to use for token requests. Default is a client with redirects disabled and a connect timeout of 10 seconds.
+/// * `http_client`: Custom `reqwest::Client` to use for token requests. Default is a client with redirects disabled, a connect timeout of 10 seconds, and no proxy for `localhost` and loopback addresses.
 /// * `scopes`: Scopes to request in the token. Empty by default.
 /// * `params`: Further form parameters of the token request, added with [`Self::append_param`]. Empty by default.
 /// * `danger_allow_http`: Whether an `http` token URL may have any host. Default is `false`: `http` works only with `localhost` and loopback addresses.
@@ -317,6 +334,7 @@ impl ClientCredentialAuthorizerBuilder {
     /// Set `redirect(reqwest::redirect::Policy::none())` on the client to prevent this.
     ///
     /// If not set, middle builds a client with redirects disabled and a connect timeout of 10 seconds.
+    /// It uses a proxy from the environment (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY`), except for a token URL with `localhost` or a loopback address.
     ///
     /// Use this method if you want to set custom headers or timeouts.
     #[must_use]
@@ -451,11 +469,7 @@ impl ClientCredentialAuthorizerBuilder {
         )?;
         let http_client = match self.http_client {
             Some(http_client) => http_client,
-            None => reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-                .build()
-                .map_err(|error| ConfigError::HttpClient(Arc::new(error)))?,
+            None => default_http_client(&request)?,
         };
         let source = Arc::new(ClientCredentials {
             request,
