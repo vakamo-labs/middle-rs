@@ -100,11 +100,10 @@ fn assert_client_claims(
     assert_eq!(claims["iss"], client_id);
     assert_eq!(claims["sub"], client_id);
     assert_eq!(claims["aud"], audience);
-    // `iat` lies 5 seconds before the signing, and `exp` 60 seconds after it.
+    // `iat` lies 5 seconds before the signing, and `exp` 60 seconds after `iat`.
     let iat = claims["iat"].as_u64().unwrap();
-    let signed_at = iat + 5;
-    assert!((signed_after..=now()).contains(&signed_at), "iat {iat}");
-    assert_eq!(claims["exp"].as_u64().unwrap(), signed_at + 60);
+    assert!((signed_after..=now()).contains(&(iat + 5)), "iat {iat}");
+    assert_eq!(claims["exp"].as_u64().unwrap(), iat + 60);
     assert_eq!(claims["jti"].as_str().unwrap().len(), 22);
 }
 
@@ -196,7 +195,8 @@ async fn test_private_key_jwt_for_the_token_endpoint_signs_an_untyped_jwt_for_it
     let public_key = DecodingKey::from_ec_pem(EC_P256_PUBLIC.as_bytes()).unwrap();
     let jwt = verify(&assertion, Algorithm::ES256, &public_key);
     assert_eq!(jwt.header, json!({"alg": "ES256", "typ": "JWT"}));
-    assert_client_claims(&jwt.claims, "my-client", token_url.as_str(), before);
+    // The query of the token URL is not part of the audience.
+    assert_client_claims(&jwt.claims, "my-client", idp.token_url().as_str(), before);
 }
 
 #[tokio::test]

@@ -250,6 +250,23 @@ impl AssertionSource for FileAssertion {
     }
 }
 
+/// Opens the file for reading with `O_NONBLOCK`, so that opening a FIFO that replaced the file after the check of its path returns at once,
+/// and the check of the opened file refuses it. The flag has no effect on a regular file.
+#[cfg(all(feature = "client-credentials", unix))]
+fn open_for_reading(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+/// Opens the file for reading.
+#[cfg(all(feature = "client-credentials", not(unix)))]
+fn open_for_reading(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
 /// Reads the assertion file at `path`. The errors name the file, never its content.
 #[cfg(feature = "client-credentials")]
 fn read_assertion(path: &Path) -> Result<Assertion, AssertionError> {
@@ -270,7 +287,7 @@ fn read_assertion(path: &Path) -> Result<Assertion, AssertionError> {
     if !std::fs::metadata(path).map_err(cannot_read)?.is_file() {
         return Err(not_regular());
     }
-    let file = std::fs::File::open(path).map_err(cannot_read)?;
+    let file = open_for_reading(path).map_err(cannot_read)?;
     // The path may have changed since the check.
     if !file.metadata().map_err(cannot_read)?.is_file() {
         return Err(not_regular());

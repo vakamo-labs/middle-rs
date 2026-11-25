@@ -241,10 +241,10 @@ fn test_an_assertion_has_the_claims_of_rfc_7523_and_verifies() {
     assert_eq!(claims["iss"], "my-client");
     assert_eq!(claims["sub"], "my-subject");
     assert_eq!(claims["aud"], "https://idp.example.com");
-    // `iat` lies 5 seconds before the signing, so that a server whose clock is slightly behind accepts the assertion.
+    // `iat` lies 5 seconds before the signing, so that a server whose clock is slightly behind accepts the assertion, and `exp` the lifetime after `iat`.
     let iat = claims["iat"].as_u64().unwrap();
     assert!((before..=now()).contains(&(iat + 5)), "iat {iat}");
-    assert_eq!(claims["exp"].as_u64().unwrap(), iat + 5 + 60);
+    assert_eq!(claims["exp"].as_u64().unwrap(), iat + 60);
     let jti = claims["jti"].as_str().unwrap();
     assert_eq!(URL_SAFE_NO_PAD.decode(jti).unwrap().len(), 16);
     assert_eq!(claims.len(), 6, "{claims:?}");
@@ -747,8 +747,8 @@ fn test_the_lifetime_can_be_set_in_whole_seconds() {
     let key = SigningKey::from_pem(RSA_PKCS8, SigningAlgorithm::Rs256).unwrap();
 
     for (lifetime, seconds) in [
-        (Duration::from_secs(1), 1),
-        (Duration::from_millis(1900), 1),
+        (Duration::from_secs(10), 10),
+        (Duration::from_millis(10_900), 10),
         (Duration::from_secs(600), 600),
         (Duration::from_secs(3600), 3600),
     ] {
@@ -759,22 +759,22 @@ fn test_the_lifetime_can_be_set_in_whole_seconds() {
             .unwrap();
 
         let claims = verify(jwt.as_str(), Algorithm::RS256, &rsa_public()).claims;
-        // `exp` is the lifetime after the signing, which lies 5 seconds after `iat`.
+        // `exp` is `iat` plus the lifetime.
         assert_eq!(
             claims["exp"].as_u64().unwrap() - claims["iat"].as_u64().unwrap(),
-            seconds + 5,
+            seconds,
             "{lifetime:?}"
         );
     }
 }
 
 #[test]
-fn test_a_lifetime_outside_one_second_to_one_hour_is_rejected() {
+fn test_a_lifetime_outside_10_seconds_to_one_hour_is_rejected() {
     let key = SigningKey::from_pem(RSA_PKCS8, SigningAlgorithm::Rs256).unwrap();
 
     for lifetime in [
         Duration::ZERO,
-        Duration::from_millis(999),
+        Duration::from_millis(9_999),
         Duration::from_millis(3_600_001),
         Duration::MAX,
     ] {
@@ -785,7 +785,7 @@ fn test_a_lifetime_outside_one_second_to_one_hour_is_rejected() {
         );
         assert_eq!(
             error.to_string(),
-            format!("an assertion lifetime must be from one second to one hour, not {lifetime:?}")
+            format!("an assertion lifetime must be from 10 seconds to one hour, not {lifetime:?}")
         );
     }
 }

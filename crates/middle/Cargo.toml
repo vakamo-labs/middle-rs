@@ -25,7 +25,7 @@ default = ["rustls-tls", "client-credentials", "runtime-tokio"]
 rustls-tls = ["reqwest/rustls"]
 tonic = ["dep:tonic"]
 runtime-tokio = ["tokio"]
-client-credentials = ["dep:base64"]
+client-credentials = ["dep:base64", "dep:libc"]
 # Signs JWT assertions (RFC 7523). Enable it with exactly one crypto backend, `aws-lc-rs` or `rust-crypto`. If the application uses jsonwebtoken 12, choose the backend it uses. Without a backend, middle does not compile.
 jwt = [
     "dep:base64",
@@ -68,6 +68,10 @@ tracing = { version = "^0.1", features = ["attributes"] }
 typed-builder = "0.23"
 url = { workspace = true, features = ["serde"] }
 veil = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+# `O_NONBLOCK`, so that opening an assertion file never blocks.
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 base64 = "0.23"

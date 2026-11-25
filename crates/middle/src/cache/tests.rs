@@ -864,7 +864,7 @@ async fn test_the_refresh_task_ends_when_the_cache_is_dropped_while_it_waits_aft
     .await;
     let task = started.task.take().unwrap();
     let source = Arc::clone(&started.source);
-    // The refresh at 30 s fails, and the next request would come about 5 minutes later.
+    // The refresh comes at 24 s to 30 s and fails. The next request waits half the time the token has left, so none comes before 39 s.
     tokio::time::sleep(secs(31.0)).await;
     assert_eq!(source.count(), 2);
 

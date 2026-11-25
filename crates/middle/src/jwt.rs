@@ -40,10 +40,11 @@ const REGISTERED_CLAIMS: [&str; 6] = ["iss", "sub", "aud", "exp", "iat", "jti"];
 /// The lifetime of an assertion unless [`JwtAssertion::with_lifetime`] sets another.
 const DEFAULT_LIFETIME: Duration = Duration::from_secs(60);
 
-/// The shortest lifetime [`JwtAssertion::with_lifetime`] accepts.
-const MIN_LIFETIME: Duration = Duration::from_secs(1);
+/// The shortest lifetime [`JwtAssertion::with_lifetime`] accepts: `iat` lies 5 seconds before the signing, so `exp` lies about 5 seconds after the signing.
+const MIN_LIFETIME: Duration = Duration::from_secs(10);
 
-/// The longest lifetime [`JwtAssertion::with_lifetime`] accepts. Some servers refuse client assertions that live longer, and an assertion can be replayed until it expires.
+/// The longest lifetime [`JwtAssertion::with_lifetime`] accepts: one hour.
+/// Some servers refuse an assertion whose `exp` lies more than one hour after its `iat`. An assertion can be replayed until it expires.
 const MAX_LIFETIME: Duration = Duration::from_secs(3600);
 
 /// How many seconds `iat` lies before the signing, so that a server whose clock is slightly behind accepts the assertion.
@@ -485,11 +486,12 @@ impl JwtAssertion {
         }
     }
 
-    /// Sets how long an assertion is valid, from one second to one hour. `exp` is the time of signing plus the whole seconds of the lifetime, so a fraction of a second is cut off.
+    /// Sets how long an assertion is valid, from 10 seconds to one hour. `exp` is `iat` plus the whole seconds of the lifetime, so a fraction of a second is cut off.
+    /// `iat` lies 5 seconds before the signing, so the assertion expires about 5 seconds before the lifetime has passed since the signing.
     ///
     /// # Errors
     ///
-    /// [`ConfigError::AssertionLifetime`] for a lifetime shorter than one second or longer than one hour. Some servers refuse client assertions that live longer, and an assertion can be replayed until it expires.
+    /// [`ConfigError::AssertionLifetime`] for a lifetime shorter than 10 seconds or longer than one hour. Some servers refuse an assertion whose `exp` lies more than one hour after its `iat`, and an assertion can be replayed until it expires.
     pub fn with_lifetime(mut self, lifetime: Duration) -> Result<Self, ConfigError> {
         if !(MIN_LIFETIME..=MAX_LIFETIME).contains(&lifetime) {
             return Err(ConfigError::AssertionLifetime(lifetime));
@@ -532,7 +534,7 @@ impl JwtAssertion {
         Ok(self)
     }
 
-    /// Signs a new assertion: `iat` is 5 seconds before now, so that a server whose clock is slightly behind accepts it, `exp` is now plus the lifetime, and `jti` is 16 random bytes.
+    /// Signs a new assertion: `iat` is 5 seconds before now, so that a server whose clock is slightly behind accepts it, `exp` is `iat` plus the lifetime, and `jti` is 16 random bytes.
     ///
     /// # Errors
     ///
@@ -570,13 +572,11 @@ impl JwtAssertion {
         claims.insert("iss".to_string(), self.issuer.as_str().into());
         claims.insert("sub".to_string(), self.subject.as_str().into());
         claims.insert("aud".to_string(), audience.into());
-        claims.insert(
-            "iat".to_string(),
-            now.saturating_sub(IAT_BEFORE_SIGNING).into(),
-        );
+        let iat = now.saturating_sub(IAT_BEFORE_SIGNING);
+        claims.insert("iat".to_string(), iat.into());
         claims.insert(
             "exp".to_string(),
-            now.saturating_add(self.lifetime.as_secs()).into(),
+            iat.saturating_add(self.lifetime.as_secs()).into(),
         );
         claims.insert("jti".to_string(), URL_SAFE_NO_PAD.encode(jti).into());
 
@@ -619,7 +619,9 @@ pub enum Audience {
     /// The issuer identifier of the authorization server, exactly as its metadata names it (RFC 8414, section 2), including a trailing slash if it has one:
     /// RFC 10070 requires that servers compare it as a simple string. The header `typ` is `client-authentication+jwt`, which RFC 10070 recommends.
     Issuer(String),
-    /// The URL of the token endpoint the request goes to. The header `typ` is `JWT`.
+    /// The URL of the token endpoint that middle connects to, without its query. The header `typ` is `JWT`.
+    ///
+    /// The authorization server compares it with the URL it knows itself as, so a client that reaches the server under another name, such as an internal host name, needs that name.
     TokenEndpoint,
 }
 
@@ -650,7 +652,12 @@ impl crate::AssertionSource for ClientAuthenticationJwt {
     fn assertion<'a>(&'a self, context: &'a crate::AssertionContext) -> crate::AssertionFuture<'a> {
         let signed = match &self.audience {
             Audience::Issuer(issuer) => self.assertion.sign_for(issuer),
-            Audience::TokenEndpoint => self.assertion.sign_for(context.token_url().as_str()),
+            Audience::TokenEndpoint => {
+                // Servers compare the URL without a query, and the query may hold a secret.
+                let mut token_url = context.token_url().clone();
+                token_url.set_query(None);
+                self.assertion.sign_for(token_url.as_str())
+            }
         };
         Box::pin(std::future::ready(signed.map(crate::Assertion::from)))
     }

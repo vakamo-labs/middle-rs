@@ -311,7 +311,7 @@ impl ClientAuthentication {
     /// A JWT signed with the client's private key as the form parameter `client_assertion` (`private_key_jwt`, RFC 7523, section 2.2; OpenID Connect Core 1.0, section 9).
     ///
     /// middle signs a new assertion for every token request (RFC 7523, section 3): `iss` and `sub` are the client id, `aud` and the header `typ` follow `audience`,
-    /// `exp` is 60 seconds after the signing, and `jti` is new. The client id is also sent as `client_id`.
+    /// `iat` is 5 seconds before the signing, `exp` 60 seconds after `iat`, and `jti` is new. The client id is also sent as `client_id`.
     ///
     /// [`Audience::Issuer`] is what RFC 10070 requires, and [`Audience::TokenEndpoint`] what OpenID Connect Core 1.0 names. Choose the one the authorization server accepts.
     /// For other claims or another header, pass a [`crate::jwt::JwtAssertion`] to [`Self::client_assertion`].
@@ -424,9 +424,10 @@ impl ClientCredentialAuthorizerBuilder {
     ///
     /// The refresh task retries until a request succeeds.
     ///
-    /// After a failed token request, middle waits between 1 s and 2 s, doubling with each further failure up to 30 s,
-    /// and longer if the token endpoint sends a `Retry-After` header.
+    /// After a failed token request, middle waits between 1 s and 2 s, doubling with each further failure up to 30 s.
     /// After an error a retry cannot fix, the refresh task waits about 5 minutes.
+    /// While the current token is still in use, neither expired nor invalidated, a wait is at most half the time the token has left, but at least 1 s.
+    /// A `Retry-After` header of the token endpoint makes a wait longer, up to 5 minutes.
     #[must_use]
     pub fn set_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = Some(max_retries);
