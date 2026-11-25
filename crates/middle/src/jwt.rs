@@ -46,7 +46,7 @@ const MAX_LIFETIME: Duration = Duration::from_secs(3600);
 /// RFC 7518, section 3.3: RSA keys have at least 2048 bits.
 const MIN_RSA_BITS: usize = 2048;
 
-/// The longest RSA key middle signs with, the limit of aws-lc-rs, so that both crypto backends accept the same keys.
+/// The longest RSA key middle signs with. aws-lc-rs refuses longer keys. rust-crypto signs with them, but reads no longer public key, so it cannot check their signatures or certificates.
 const MAX_RSA_BITS: usize = 8192;
 
 /// The tag of `[0] EXPLICIT`, the version of an X.509 certificate (RFC 5280, section 4.1).
@@ -73,8 +73,13 @@ const SECP384R1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.34")
 /// The named curve P-521 (RFC 5480, section 2.1.1.1).
 const SECP521R1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.35");
 
-/// The PEM labels of the private keys [`private_key_der`] reads.
-const PRIVATE_KEY_LABELS: [&str; 3] = ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY"];
+/// The PEM labels of private keys: the forms [`private_key_der`] reads, and the encrypted PKCS#8 form (RFC 7468, section 11), which it names in its error.
+const PRIVATE_KEY_LABELS: [&str; 4] = [
+    "PRIVATE KEY",
+    "RSA PRIVATE KEY",
+    "EC PRIVATE KEY",
+    "ENCRYPTED PRIVATE KEY",
+];
 
 /// A JWS algorithm (RFC 7518, section 3.1) that middle signs with.
 ///
@@ -231,9 +236,11 @@ impl SigningKey {
     ///
     /// The text may hold other PEM blocks before or after the key, such as its certificate or the `EC PARAMETERS` that `openssl ecparam -genkey` writes before an EC key: middle reads the first private key and ignores the other blocks.
     ///
+    /// middle signs once with the key, so a key the crypto backend refuses fails here. The backends differ for RSA keys whose two primes differ in length: aws-lc-rs signs with them, and rust-crypto refuses them.
+    ///
     /// # Errors
     ///
-    /// [`ConfigError::InvalidSigningKey`] if the PEM holds no private key, such as only a public key or a certificate, if the key does not fit the algorithm or cannot sign, or for an RSA key longer than 8192 bits,
+    /// [`ConfigError::InvalidSigningKey`] if the PEM holds no private key, such as only a public key or a certificate, if the key is encrypted, does not fit the algorithm or cannot sign, or for an RSA key longer than 8192 bits,
     /// [`ConfigError::WeakSigningKey`] for an RSA key shorter than 2048 bits (RFC 7518, section 3.3).
     pub fn from_pem(
         pem: impl AsRef<[u8]>,
@@ -314,6 +321,7 @@ impl SigningKey {
     /// # Errors
     ///
     /// [`ConfigError::InvalidCertificate`] if the text is not in PEM form, holds no PEM certificate (`CERTIFICATE`), or the certificate cannot be read,
+    /// [`ConfigError::UnsupportedCertificateKey`] if the public key of the certificate has an algorithm middle does not sign with, such as RSA-PSS,
     /// [`ConfigError::CertificateKeyMismatch`] if the public key of the certificate does not belong to this key, which is always so for a shared secret.
     pub fn with_certificate_pem(self, certificate: impl AsRef<[u8]>) -> Result<Self, ConfigError> {
         let blocks = pem::parse_many(certificate).map_err(|_| ConfigError::InvalidCertificate)?;
@@ -331,6 +339,7 @@ impl SigningKey {
     /// # Errors
     ///
     /// [`ConfigError::InvalidCertificate`] if the certificate cannot be read,
+    /// [`ConfigError::UnsupportedCertificateKey`] if the public key of the certificate has an algorithm middle does not sign with, such as RSA-PSS,
     /// [`ConfigError::CertificateKeyMismatch`] if the public key of the certificate does not belong to this key, which is always so for a shared secret.
     pub fn with_certificate_der(
         mut self,
@@ -346,16 +355,24 @@ impl SigningKey {
 
     /// Checks that a signature of this key verifies with the public key of the certificate in DER form.
     fn check_certificate(&self, certificate: &[u8]) -> Result<(), ConfigError> {
-        let (family, public_key) =
+        let (key_algorithm, public_key) =
             certificate_public_key(certificate).ok_or(ConfigError::InvalidCertificate)?;
-        let public_key = match (self.algorithm.family(), family) {
+        let public_key = match (
+            self.algorithm.family(),
+            Family::of_key_algorithm(key_algorithm),
+        ) {
             (Family::Rsa, Some(Family::Rsa)) => DecodingKey::from_rsa_der(public_key),
             (Family::Ec, Some(Family::Ec)) => DecodingKey::from_ec_der(public_key),
             // RFC 8410, section 4: an Ed25519 public key has 32 bytes. jsonwebtoken's RustCrypto verifier panics on a shorter one.
             (Family::Ed, Some(Family::Ed)) if public_key.len() == 32 => {
                 DecodingKey::from_ed_der(public_key)
             }
-            _ => return Err(ConfigError::CertificateKeyMismatch),
+            (Family::Hmac, _) | (_, Some(_)) => return Err(ConfigError::CertificateKeyMismatch),
+            (_, None) => {
+                return Err(ConfigError::UnsupportedCertificateKey(
+                    key_algorithm.to_string(),
+                ));
+            }
         };
         let message = b"middle checks the certificate";
         let signature = self
@@ -616,6 +633,16 @@ fn private_key_der(
     algorithm: SigningAlgorithm,
 ) -> Result<Cow<'_, [u8]>, ConfigError> {
     let der = block.contents();
+    // RFC 1421, section 4.6.1.1: the header `Proc-Type: 4,ENCRYPTED` marks a key in PKCS#1 or SEC1 form that a passphrase encrypts, as `openssl rsa -aes256 -traditional` writes it.
+    let encrypted = block
+        .headers()
+        .get("Proc-Type")
+        .is_some_and(|value| value.ends_with("ENCRYPTED"));
+    if encrypted || block.tag() == "ENCRYPTED PRIVATE KEY" {
+        return Err(invalid(
+            "the key is encrypted; decrypt it with `openssl pkey -in key.pem -out key-decrypted.pem`",
+        ));
+    }
     match block.tag() {
         "PRIVATE KEY" => pkcs8_private_key(der, algorithm),
         "RSA PRIVATE KEY" => {
@@ -639,7 +666,7 @@ fn private_key_der(
     }
 }
 
-/// The DER jsonwebtoken's backends sign with for a private key in PKCS#8 form (RFC 5958, section 2): the RSA key in PKCS#1 form it holds, or the PKCS#8 key itself for EC and Ed25519.
+/// The DER jsonwebtoken's backends sign with for a private key in PKCS#8 form (RFC 5958, section 2): the RSA key in PKCS#1 form it holds, the EC key in PKCS#8 without the public key, or the PKCS#8 key itself for Ed25519.
 fn pkcs8_private_key(
     der: &[u8],
     algorithm: SigningAlgorithm,
@@ -671,7 +698,16 @@ fn pkcs8_private_key(
                     "the EC key does not name its curve; convert it to a named curve with `openssl pkey -in key.pem -ec_param_enc named_curve -out key-named.pem`",
                 ))?;
             check_curve(curve, algorithm)?;
-            Ok(Cow::Borrowed(der))
+            // The public key of PKCS#8 v2, which aws-lc-rs refuses in an EC key. The backends compute it from the private key.
+            if key.public_key.is_none() {
+                return Ok(Cow::Borrowed(der));
+            }
+            PrivateKeyInfoRef::new(key.algorithm, key.private_key)
+                .to_der()
+                .map(Cow::Owned)
+                .map_err(|_| {
+                    invalid("the EC key in PKCS#8 form cannot be written without its public key")
+                })
         }
         Family::Ed | Family::Hmac => Ok(Cow::Borrowed(der)),
     }
@@ -682,7 +718,7 @@ fn sec1_private_key(der: &[u8], algorithm: SigningAlgorithm) -> Result<Vec<u8>, 
     // RFC 5915, section 3: the parameters are a named curve. `sec1` refuses explicit parameters, which `openssl ec -param_enc explicit` writes.
     let key = EcPrivateKey::from_der(der).map_err(|_| {
         invalid(
-            "the key is not in SEC1 form with a named curve; convert it to a named curve with `openssl pkey -in key.pem -ec_param_enc named_curve -out key-named.pem`",
+            "the key is not in SEC1 form with a named curve; if it has explicit curve parameters, convert it to a named curve with `openssl pkey -in key.pem -ec_param_enc named_curve -out key-named.pem`",
         )
     })?;
     let curve = key
@@ -732,7 +768,7 @@ fn check_rsa_key(
     key: &RsaPrivateKeyRef<'_>,
     algorithm: SigningAlgorithm,
 ) -> Result<(), ConfigError> {
-    // RFC 8017, section 3.2: `otherPrimeInfos` holds the primes after the first two.
+    // RFC 8017, section 3.2: `otherPrimeInfos` holds the primes after the first two. Neither crypto backend signs with such a key.
     if key.other_prime_infos.is_some() {
         return Err(invalid(
             "the RSA key has more than two primes; middle signs with RSA keys of two primes",
@@ -758,12 +794,12 @@ fn check_rsa_key(
     Ok(())
 }
 
-/// The family and the `subjectPublicKey` of an X.509 certificate in DER form (RFC 5280, section 4.1).
+/// The key algorithm and the `subjectPublicKey` of an X.509 certificate in DER form (RFC 5280, section 4.1).
 ///
 /// The `subjectPublicKey` is in the form jsonwebtoken's `DecodingKey::from_rsa_der`, `from_ec_der` and `from_ed_der` read.
 ///
 /// middle checks that the certificate has its three parts and that the fields before the key have their types, and decodes only the `subjectPublicKeyInfo`, with `spki`. It skips the other fields unread: a CA may write the names as a `BMPString` or as a `PrintableString` with characters such as `*`, which strict decoders refuse.
-fn certificate_public_key(der: &[u8]) -> Option<(Option<Family>, &[u8])> {
+fn certificate_public_key(der: &[u8]) -> Option<(ObjectIdentifier, &[u8])> {
     let mut reader = SliceReader::new(der).ok()?;
     // tbsCertificate, signatureAlgorithm and signatureValue (RFC 5280, section 4.1).
     let subject_public_key_info = reader
@@ -799,10 +835,7 @@ fn certificate_public_key(der: &[u8]) -> Option<(Option<Family>, &[u8])> {
         .ok()?;
     reader.finish().ok()?;
     let public_key = subject_public_key_info.subject_public_key.as_bytes()?;
-    Some((
-        Family::of_key_algorithm(subject_public_key_info.algorithm.oid),
-        public_key,
-    ))
+    Some((subject_public_key_info.algorithm.oid, public_key))
 }
 
 #[cfg(test)]

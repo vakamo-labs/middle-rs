@@ -26,7 +26,15 @@ const RSA_8200: &str = include_str!("fixtures/jwt/rsa-8200-pkcs8.pem");
 /// An RSA key of 2048 bits with three primes (RFC 8017, section 3.2).
 const RSA_3_PRIMES_PKCS8: &str = include_str!("fixtures/jwt/rsa-2048-3-primes-pkcs8.pem");
 const RSA_3_PRIMES_PKCS1: &str = include_str!("fixtures/jwt/rsa-2048-3-primes-pkcs1.pem");
+/// An RSA key of 2048 bits whose two primes have 1048 and 1000 bits.
+const RSA_UNEQUAL_PRIMES: &str = include_str!("fixtures/jwt/rsa-2048-unequal-primes-pkcs8.pem");
+const RSA_UNEQUAL_PRIMES_PUBLIC: &str =
+    include_str!("fixtures/jwt/rsa-2048-unequal-primes-public.pem");
+/// `rsa-2048-pkcs1.pem` encrypted with the passphrase `middle-test` by `openssl rsa -aes256 -traditional`, which writes the header `Proc-Type: 4,ENCRYPTED`.
+const RSA_ENCRYPTED_PKCS1: &str = include_str!("fixtures/jwt/rsa-2048-encrypted-pkcs1.pem");
 const EC_P256: &str = include_str!("fixtures/jwt/ec-p256-pkcs8.pem");
+/// `ec-p256-pkcs8.pem` in PKCS#8 v2 (RFC 5958, section 2), with its public key.
+const EC_P256_V2: &str = include_str!("fixtures/jwt/ec-p256-pkcs8-v2.pem");
 /// `ec-p256-pkcs8.pem` with the curve as explicit parameters.
 const EC_P256_EXPLICIT: &str = include_str!("fixtures/jwt/ec-p256-explicit-pkcs8.pem");
 const EC_P256_SEC1: &str = include_str!("fixtures/jwt/ec-p256-sec1.pem");
@@ -58,6 +66,8 @@ const CERTIFICATE_PRINTABLESTRING: &str =
     include_str!("fixtures/jwt/certificate-printablestring.pem");
 /// The X.509 v1 certificate of `ec-p256-pkcs8.pem`: no version field, no extensions.
 const CERTIFICATE_V1_EC_P256: &str = include_str!("fixtures/jwt/certificate-v1-ec-p256.pem");
+/// The certificate of a key of `openssl genpkey -algorithm RSA-PSS`, which has the key algorithm id-RSASSA-PSS (RFC 4055, section 3.1).
+const CERTIFICATE_RSA_PSS: &str = include_str!("fixtures/jwt/certificate-rsa-pss.pem");
 /// `openssl x509 -in certificate.pem -outform DER | openssl dgst -sha256 -binary`, base64url without padding.
 const CERTIFICATE_X5T_S256: &str = "5BBv8GolnkvNYuhh8k-UmD4VXngLSqlaWE8ePJk0j9s";
 const HMAC_SECRET: &[u8] = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -77,7 +87,7 @@ const SECP256R1: [u8; 8] = [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
 /// The OID of the curve P-384 (RFC 5480, section 2.1.1.1) in DER, without tag and length.
 const SECP384R1: [u8; 5] = [0x2b, 0x81, 0x04, 0x00, 0x22];
 /// The reason for an `EC PRIVATE KEY` that is not in SEC1 form with a named curve.
-const NOT_SEC1_REASON: &str = "the key is not in SEC1 form with a named curve; convert it to a named curve with `openssl pkey -in key.pem -ec_param_enc named_curve -out key-named.pem`";
+const NOT_SEC1_REASON: &str = "the key is not in SEC1 form with a named curve; if it has explicit curve parameters, convert it to a named curve with `openssl pkey -in key.pem -ec_param_enc named_curve -out key-named.pem`";
 
 struct Decoded {
     header: Value,
@@ -393,6 +403,21 @@ fn test_an_ec_key_may_be_in_sec1_form() {
 }
 
 #[test]
+fn test_an_ec_key_in_pkcs8_v2_signs() {
+    // aws-lc-rs refuses an EC key in PKCS#8 with its public key.
+    let key = SigningKey::from_pem(EC_P256_V2, SigningAlgorithm::Es256)
+        .unwrap()
+        .with_certificate_pem(CERTIFICATE_EC_P256)
+        .unwrap();
+
+    let jwt = assertion(key).sign().unwrap();
+
+    let p256 = DecodingKey::from_ec_pem(EC_P256_PUBLIC.as_bytes()).unwrap();
+    let decoded = verify(jwt.as_str(), Algorithm::ES256, &p256);
+    assert_eq!(decoded.header["x5t#S256"], CERTIFICATE_EC_P256_X5T_S256);
+}
+
+#[test]
 fn test_an_ec_key_in_sec1_form_must_name_the_curve_of_the_algorithm() {
     let p384 = ec_p256_sec1_with(Some(&element(0x06, &SECP384R1)));
     let without_curve = ec_p256_sec1_with(None);
@@ -570,14 +595,27 @@ fn test_a_public_key_or_certificate_is_not_a_private_key() {
         (CERTIFICATE_EC_P256, SigningAlgorithm::Es256, certificate),
         (ED25519_PUBLIC, SigningAlgorithm::EdDsa, public_key),
         (CERTIFICATE_ED25519, SigningAlgorithm::EdDsa, certificate),
-        (
-            ENCRYPTED_PRIVATE_KEY,
-            SigningAlgorithm::Rs256,
-            "the PEM holds `ENCRYPTED PRIVATE KEY`, not `PRIVATE KEY`, `RSA PRIVATE KEY` or `EC PRIVATE KEY`",
-        ),
     ] {
         let error = SigningKey::from_pem(pem, algorithm).unwrap_err();
         assert_eq!(invalid_key_reason(error), reason, "{algorithm}: {pem}");
+    }
+}
+
+#[test]
+fn test_an_encrypted_key_is_rejected() {
+    let certificate_first = format!("{CERTIFICATE}{ENCRYPTED_PRIVATE_KEY}");
+    for pem in [
+        RSA_ENCRYPTED_PKCS1,
+        ENCRYPTED_PRIVATE_KEY,
+        certificate_first.as_str(),
+    ] {
+        let error = SigningKey::from_pem(pem, SigningAlgorithm::Rs256).unwrap_err();
+
+        assert_eq!(
+            invalid_key_reason(error),
+            "the key is encrypted; decrypt it with `openssl pkey -in key.pem -out key-decrypted.pem`",
+            "{pem}"
+        );
     }
 }
 
@@ -630,6 +668,24 @@ fn test_an_rsa_key_with_more_than_two_primes_is_rejected() {
             invalid_key_reason(error),
             "the RSA key has more than two primes; middle signs with RSA keys of two primes",
             "{pem}"
+        );
+    }
+}
+
+#[test]
+fn test_only_aws_lc_rs_signs_with_an_rsa_key_whose_primes_differ_in_length() {
+    // With both backends, middle uses aws-lc-rs.
+    let key = SigningKey::from_pem(RSA_UNEQUAL_PRIMES, SigningAlgorithm::Rs256);
+
+    if cfg!(feature = "aws-lc-rs") {
+        let jwt = assertion(key.unwrap()).sign().unwrap();
+        let public = DecodingKey::from_rsa_pem(RSA_UNEQUAL_PRIMES_PUBLIC.as_bytes()).unwrap();
+        verify(jwt.as_str(), Algorithm::RS256, &public);
+    } else {
+        // middle signs when it loads a key, so the backend refuses the key here.
+        assert_eq!(
+            invalid_key_reason(key.unwrap_err()),
+            "the key cannot sign with RS256: signature error: PKCS#1 cryptographic key data malformed"
         );
     }
 }
@@ -911,6 +967,22 @@ fn test_a_certificate_of_another_key_is_rejected() {
             "the public key of the certificate does not belong to the signing key"
         );
     }
+}
+
+#[test]
+fn test_a_certificate_with_a_key_algorithm_middle_does_not_sign_with_is_rejected() {
+    let key = SigningKey::from_pem(RSA_PKCS8, SigningAlgorithm::Ps256).unwrap();
+
+    let error = key.with_certificate_pem(CERTIFICATE_RSA_PSS).unwrap_err();
+
+    assert!(
+        matches!(&error, ConfigError::UnsupportedCertificateKey(algorithm) if algorithm == "1.2.840.113549.1.1.10"),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "the public key of the certificate has the algorithm 1.2.840.113549.1.1.10, which middle does not sign with"
+    );
 }
 
 #[test]

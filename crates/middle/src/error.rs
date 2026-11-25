@@ -502,6 +502,9 @@ pub enum ConfigError {
     /// The public key of the certificate does not belong to the signing key. A shared secret for `HS*` has no certificate.
     #[cfg(feature = "jwt")]
     CertificateKeyMismatch,
+    /// The public key of the certificate has an algorithm middle does not sign with, such as RSA-PSS. The value is the OID of the algorithm, such as `1.2.840.113549.1.1.10`.
+    #[cfg(feature = "jwt")]
+    UnsupportedCertificateKey(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -558,6 +561,11 @@ impl fmt::Display for ConfigError {
             Self::CertificateKeyMismatch => {
                 f.write_str("the public key of the certificate does not belong to the signing key")
             }
+            #[cfg(feature = "jwt")]
+            Self::UnsupportedCertificateKey(algorithm) => write!(
+                f,
+                "the public key of the certificate has the algorithm {algorithm}, which middle does not sign with"
+            ),
         }
     }
 }

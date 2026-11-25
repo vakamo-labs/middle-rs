@@ -106,4 +106,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     If your application also uses jsonwebtoken 12, choose the backend your jsonwebtoken uses: `aws-lc-rs` in middle with `aws_lc_rs` in jsonwebtoken, or `rust-crypto` with `rust_crypto`. Without a backend, middle does not compile.
 
+    The backends differ for RSA keys whose two primes differ in length: aws-lc-rs signs with them, and rust-crypto refuses them. middle signs once when it loads a key, so `SigningKey::from_pem` returns the error.
+
     middle passes its backend to every jsonwebtoken call, so it works whatever process-wide default jsonwebtoken has. With both backends in one build, for example with `--all-features`, middle signs with aws-lc-rs, and jsonwebtoken has no default backend: your own `jsonwebtoken::encode` and `jsonwebtoken::decode` calls panic unless your application calls `jsonwebtoken::crypto::CryptoProvider::install_default` at startup.
