@@ -20,9 +20,10 @@ pub type TokenFuture<'a> =
 /// middle asks for a token for every refresh, retries included. The [`TokenContext`] says why, and the reasons of [`TokenReason`] say what to return:
 /// a token that lives clearly longer than the current one for a refresh, and a token other than the rejected one after `invalidate`.
 ///
-/// An error fails the attempt, and middle retries it, see [`SourceError`]. A token whose lifetime has passed when the source answers fails the attempt
-/// with [`crate::Error::ExpiredOnArrival`], which middle retries too. Each attempt may take at most the timeout of the builder: middle then drops the future,
-/// so the source must cope with being stopped at any `.await`.
+/// An error fails the attempt, and middle retries it, see [`SourceError`]. A token whose lifetime ends while middle waits for the source fails the attempt
+/// with [`crate::Error::ExpiredOnArrival`], which middle retries too. A JWT without a lifetime whose `exp` had passed when middle asked lives the default token lifetime
+/// of the builder, because middle cannot tell a stale token from a local clock that runs ahead. Each attempt may take at most the timeout of the builder:
+/// middle then drops the future, so the source must cope with being stopped at any `.await`.
 ///
 /// middle shows the `Debug` output of a source in the `Debug` output of the authorizer and its builder, so it must not show secrets or tokens.
 /// Log messages name the source by its type.
