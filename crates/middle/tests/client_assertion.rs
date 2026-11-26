@@ -3,9 +3,7 @@
 mod support;
 
 use std::{
-    future::Future,
     path::PathBuf,
-    pin::Pin,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -45,32 +43,27 @@ impl CountingSource {
 }
 
 impl AssertionSource for CountingSource {
-    fn assertion<'a>(
-        &'a self,
-        context: &'a AssertionContext,
-    ) -> Pin<Box<dyn Future<Output = Result<Assertion, SourceError>> + Send + 'a>> {
-        Box::pin(async move {
-            let number = {
-                let mut calls = self.calls.lock().unwrap();
-                calls.push((
-                    context.token_url().clone(),
-                    context.client_id().map(str::to_string),
-                ));
-                calls.len()
-            };
-            if self.hanging.contains(&number) {
-                std::future::pending::<()>().await;
-            }
-            if self.failing.contains(&number) {
-                let error = SourceError::new("the signer is not ready");
-                return Err(if self.permanent {
-                    error.permanent()
-                } else {
-                    error
-                });
-            }
-            Assertion::new(Self::assertion(number))
-        })
+    async fn assertion(&self, context: &AssertionContext) -> Result<Assertion, SourceError> {
+        let number = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push((
+                context.token_url().clone(),
+                context.client_id().map(str::to_string),
+            ));
+            calls.len()
+        };
+        if self.hanging.contains(&number) {
+            std::future::pending::<()>().await;
+        }
+        if self.failing.contains(&number) {
+            let error = SourceError::new("the signer is not ready");
+            return Err(if self.permanent {
+                error.permanent()
+            } else {
+                error
+            });
+        }
+        Assertion::new(Self::assertion(number))
     }
 }
 
@@ -82,11 +75,8 @@ const ENCRYPTED_JWT: &str = "eyJhbGciOiJSU0EtT0FFUCJ9.a2V5.aXY.Y2lwaGVydGV4dA.dG
 struct EncryptedJwtSource;
 
 impl AssertionSource for EncryptedJwtSource {
-    fn assertion<'a>(
-        &'a self,
-        _context: &'a AssertionContext,
-    ) -> Pin<Box<dyn Future<Output = Result<Assertion, SourceError>> + Send + 'a>> {
-        Box::pin(async { Assertion::new(ENCRYPTED_JWT) })
+    async fn assertion(&self, _context: &AssertionContext) -> Result<Assertion, SourceError> {
+        Assertion::new(ENCRYPTED_JWT)
     }
 }
 
@@ -197,12 +187,11 @@ async fn test_an_encrypted_jwt_is_sent_as_it_is() {
 async fn test_one_source_can_serve_several_authorizers() {
     let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
     let shared = Arc::new(CountingSource::default());
-    let boxed: Box<dyn AssertionSource> = Box::new(EncryptedJwtSource);
 
     for authentication in [
         ClientAuthentication::client_assertion("c", Arc::clone(&shared)),
         ClientAuthentication::client_assertion("c", Arc::clone(&shared)),
-        ClientAuthentication::client_assertion("c", boxed),
+        ClientAuthentication::client_assertion("c", EncryptedJwtSource),
     ] {
         Authorizer::client_credentials(idp.token_url(), authentication)
             .build()

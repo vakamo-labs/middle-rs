@@ -462,6 +462,18 @@ impl SourceError {
         self
     }
 
+    /// Whether [`Self::permanent`] marked the error as one a retry cannot fix.
+    #[must_use]
+    pub fn is_permanent(&self) -> bool {
+        self.permanent
+    }
+
+    /// The wait that [`Self::with_retry_after`] asks for.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
+    }
+
     #[cfg(feature = "jwt")]
     pub(crate) fn with_shared_source(
         mut self,

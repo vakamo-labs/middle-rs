@@ -3,8 +3,6 @@
 mod support;
 
 use std::{
-    future::Future,
-    pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -44,18 +42,13 @@ impl CountingSource {
 }
 
 impl AssertionSource for CountingSource {
-    fn assertion<'a>(
-        &'a self,
-        context: &'a AssertionContext,
-    ) -> Pin<Box<dyn Future<Output = Result<Assertion, SourceError>> + Send + 'a>> {
-        Box::pin(async move {
-            let number = {
-                let mut client_ids = self.client_ids.lock().unwrap();
-                client_ids.push(context.client_id().map(str::to_string));
-                client_ids.len()
-            };
-            Assertion::new(self.assertion(number))
-        })
+    async fn assertion(&self, context: &AssertionContext) -> Result<Assertion, SourceError> {
+        let number = {
+            let mut client_ids = self.client_ids.lock().unwrap();
+            client_ids.push(context.client_id().map(str::to_string));
+            client_ids.len()
+        };
+        Assertion::new(self.assertion(number))
     }
 }
 
@@ -170,11 +163,8 @@ async fn test_each_attempt_gets_a_new_grant_assertion() {
 struct HangingSource;
 
 impl AssertionSource for HangingSource {
-    fn assertion<'a>(
-        &'a self,
-        _context: &'a AssertionContext,
-    ) -> Pin<Box<dyn Future<Output = Result<Assertion, SourceError>> + Send + 'a>> {
-        Box::pin(std::future::pending())
+    async fn assertion(&self, _context: &AssertionContext) -> Result<Assertion, SourceError> {
+        std::future::pending().await
     }
 }
 

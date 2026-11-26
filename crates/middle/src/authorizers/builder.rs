@@ -17,6 +17,7 @@ use crate::{
     cache::{BoxFuture, CacheConfig, Fetch, Token, TokenCache},
     error::{ConfigError, Error},
     token_endpoint::{self, ClientAuth, Grant, Secret, TokenRequest, TokenResponse},
+    token_source::BoxedTokenSource,
 };
 
 /// How long one token request may take, reading the answer included.
@@ -354,7 +355,7 @@ impl fmt::Debug for FromTokenEndpoint {
 /// The token source of an [`AuthorizerBuilder`] made with [`Authorizer::from_source`]. `Debug` shows the `Debug` output of the source.
 #[derive(Clone)]
 pub struct FromSource {
-    source: Arc<dyn TokenSource>,
+    source: Arc<dyn BoxedTokenSource>,
     /// The type name of the source, which names it in log messages.
     name: &'static str,
 }
@@ -372,7 +373,7 @@ impl Fetch for FromSource {
     ) -> BoxFuture<'a, Result<TokenResponse, Error>> {
         Box::pin(async move {
             self.source
-                .token(context)
+                .boxed(context)
                 .await
                 .map(AccessToken::into_response)
                 .map_err(Error::Source)

@@ -602,11 +602,11 @@ impl JwtAssertion {
 /// Signs a new assertion for every token request.
 #[cfg(feature = "client-credentials")]
 impl crate::AssertionSource for JwtAssertion {
-    fn assertion<'a>(
-        &'a self,
-        _context: &'a crate::AssertionContext,
-    ) -> crate::AssertionFuture<'a> {
-        Box::pin(std::future::ready(self.sign().map(crate::Assertion::from)))
+    async fn assertion(
+        &self,
+        _context: &crate::AssertionContext,
+    ) -> Result<crate::Assertion, crate::SourceError> {
+        self.sign().map(crate::Assertion::from)
     }
 }
 
@@ -650,7 +650,10 @@ impl ClientAuthenticationJwt {
 
 #[cfg(feature = "client-credentials")]
 impl crate::AssertionSource for ClientAuthenticationJwt {
-    fn assertion<'a>(&'a self, context: &'a crate::AssertionContext) -> crate::AssertionFuture<'a> {
+    async fn assertion(
+        &self,
+        context: &crate::AssertionContext,
+    ) -> Result<crate::Assertion, crate::SourceError> {
         let signed = match &self.audience {
             Audience::Issuer(issuer) => self.assertion.sign_for(issuer),
             Audience::TokenEndpoint => {
@@ -660,7 +663,7 @@ impl crate::AssertionSource for ClientAuthenticationJwt {
                 self.assertion.sign_for(token_url.as_str())
             }
         };
-        Box::pin(std::future::ready(signed.map(crate::Assertion::from)))
+        signed.map(crate::Assertion::from)
     }
 }
 

@@ -517,12 +517,13 @@ impl Refresher {
         shared: &Shared,
     ) -> Result<(), ReadersGone> {
         let mut failures: u32 = 0;
-        let mut reason = TokenReason::Refresh;
         loop {
             // Once the current token is invalidated, every attempt asks for a token other than the rejected one.
-            if sender.borrow().token.is_invalidated(shared) {
-                reason = TokenReason::Rejected;
-            }
+            let reason = if sender.borrow().token.is_invalidated(shared) {
+                TokenReason::Rejected
+            } else {
+                TokenReason::Refresh
+            };
             let timeout = attempt_timeout(&sender.borrow().token, shared, self.config.timeout);
             let error = match until_readers_gone(sender, self.request(timeout, reason)).await? {
                 Ok(mut token) => {

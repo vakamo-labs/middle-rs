@@ -23,11 +23,11 @@ mod token_source;
 #[cfg(any(feature = "client-credentials", feature = "jwt"))]
 pub use assertion::SignedJwt;
 #[cfg(feature = "client-credentials")]
-pub use assertion::{Assertion, AssertionContext, AssertionFuture, AssertionSource, FileAssertion};
+pub use assertion::{Assertion, AssertionContext, AssertionSource, FileAssertion};
 pub use authorizers::*;
 pub use error::{
     ConfigError, Error, ErrorCode, HttpError, InvalidResponse, OAuthError, ResponseProblem, Result,
     SourceError, TransportError,
 };
 #[cfg(feature = "client-credentials")]
-pub use token_source::{AccessToken, TokenContext, TokenFuture, TokenReason, TokenSource};
+pub use token_source::{AccessToken, TokenContext, TokenReason, TokenSource};

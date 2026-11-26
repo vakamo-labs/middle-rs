@@ -10,10 +10,7 @@ use std::{
     time::Duration,
 };
 
-use middle::{
-    AccessToken, Authorizer, Error, SourceError, TokenContext, TokenFuture, TokenReason,
-    TokenSource,
-};
+use middle::{AccessToken, Authorizer, Error, SourceError, TokenContext, TokenReason, TokenSource};
 use support::wait_until;
 
 /// Hands out `token-1`, `token-2`, and so on, valid for `expires_in`, and fails the calls in `failing`, counted from 1, with `error`.
@@ -47,21 +44,19 @@ impl CountingSource {
 }
 
 impl TokenSource for CountingSource {
-    fn token<'a>(&'a self, context: &'a TokenContext) -> TokenFuture<'a> {
+    async fn token(&self, context: &TokenContext) -> Result<AccessToken, SourceError> {
         self.reasons.lock().unwrap().push(context.reason());
         let number = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-        Box::pin(async move {
-            if number > 1 {
-                tokio::time::sleep(self.delay).await;
-            }
-            if self.failing.contains(&number) {
-                return Err(self.error.clone().expect("an error for failing calls"));
-            }
-            let token = AccessToken::new(format!("token-{number}"))?;
-            Ok(match self.expires_in {
-                Some(expires_in) => token.with_expires_in(expires_in),
-                None => token,
-            })
+        if number > 1 {
+            tokio::time::sleep(self.delay).await;
+        }
+        if self.failing.contains(&number) {
+            return Err(self.error.clone().expect("an error for failing calls"));
+        }
+        let token = AccessToken::new(format!("token-{number}"))?;
+        Ok(match self.expires_in {
+            Some(expires_in) => token.with_expires_in(expires_in),
+            None => token,
         })
     }
 }
@@ -90,19 +85,16 @@ impl CachingSource {
 }
 
 impl TokenSource for CachingSource {
-    fn token<'a>(&'a self, context: &'a TokenContext) -> TokenFuture<'a> {
+    async fn token(&self, context: &TokenContext) -> Result<AccessToken, SourceError> {
         let reason = context.reason();
         self.reasons.lock().unwrap().push(reason);
-        Box::pin(async move {
-            let number = if reason == TokenReason::Rejected {
-                self.new_tokens.fetch_add(1, Ordering::SeqCst) + 1
-            } else {
-                tokio::time::sleep(self.delay).await;
-                self.new_tokens.load(Ordering::SeqCst)
-            };
-            Ok(AccessToken::new(format!("cached-{number}"))?
-                .with_expires_in(Duration::from_secs(2)))
-        })
+        let number = if reason == TokenReason::Rejected {
+            self.new_tokens.fetch_add(1, Ordering::SeqCst) + 1
+        } else {
+            tokio::time::sleep(self.delay).await;
+            self.new_tokens.load(Ordering::SeqCst)
+        };
+        Ok(AccessToken::new(format!("cached-{number}"))?.with_expires_in(Duration::from_secs(2)))
     }
 }
 
@@ -111,8 +103,8 @@ impl TokenSource for CachingSource {
 struct HangingSource;
 
 impl TokenSource for HangingSource {
-    fn token<'a>(&'a self, _context: &'a TokenContext) -> TokenFuture<'a> {
-        Box::pin(std::future::pending())
+    async fn token(&self, _context: &TokenContext) -> Result<AccessToken, SourceError> {
+        std::future::pending().await
     }
 }
 
@@ -123,7 +115,7 @@ fn header(authorizer: &Authorizer) -> Option<String> {
         .map(|header| header.to_str().unwrap().to_string())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_the_token_of_the_source_is_the_header() {
     let source = Arc::new(CountingSource::valid_for(Duration::from_secs(3600)));
 
@@ -138,23 +130,40 @@ async fn test_the_token_of_the_source_is_the_header() {
     assert_eq!(source.calls(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_the_source_is_asked_again_before_the_token_expires() {
     let source = Arc::new(CountingSource::valid_for(Duration::from_secs(2)));
     let authorizer = Authorizer::from_source(Arc::clone(&source))
         .build()
         .await
         .unwrap();
+    let built = tokio::time::Instant::now();
 
-    // A token of 2 s is refreshed about 1 s after the source was asked.
-    assert!(
-        wait_until(Duration::from_secs(3), || header(&authorizer).as_deref()
-            == Some("Bearer token-2"))
-        .await
-    );
+    // A token of 2 s is refreshed 1 s after the source was asked.
+    tokio::time::sleep_until(built + Duration::from_millis(999)).await;
+    assert_eq!(header(&authorizer).as_deref(), Some("Bearer token-1"));
+    tokio::time::sleep_until(built + Duration::from_millis(1500)).await;
+    assert_eq!(header(&authorizer).as_deref(), Some("Bearer token-2"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
+async fn test_one_source_can_serve_several_authorizers() {
+    let source = Arc::new(CountingSource::valid_for(Duration::from_secs(3600)));
+    let first = Authorizer::from_source(Arc::clone(&source))
+        .build()
+        .await
+        .unwrap();
+    let second = Authorizer::from_source(Arc::clone(&source))
+        .build()
+        .await
+        .unwrap();
+
+    assert_eq!(header(&first).as_deref(), Some("Bearer token-1"));
+    assert_eq!(header(&second).as_deref(), Some("Bearer token-2"));
+    assert_eq!(source.calls(), 2);
+}
+
+#[tokio::test(start_paused = true)]
 async fn test_the_source_learns_why_middle_asks_for_a_token() {
     let source = Arc::new(CountingSource::valid_for(Duration::from_secs(2)));
     let authorizer = Authorizer::from_source(Arc::clone(&source))
@@ -181,7 +190,7 @@ async fn test_the_source_learns_why_middle_asks_for_a_token() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_a_token_rejected_while_middle_waits_to_retry_is_replaced_with_the_reason_rejected() {
     let source = Arc::new(CountingSource {
         failing: vec![2],
@@ -210,7 +219,7 @@ async fn test_a_token_rejected_while_middle_waits_to_retry_is_replaced_with_the_
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_a_token_rejected_while_a_refresh_runs_is_not_taken_back_from_that_refresh() {
     let source = Arc::new(CachingSource::new(Duration::from_millis(300)));
     let authorizer = Authorizer::from_source(Arc::clone(&source))
@@ -236,7 +245,7 @@ async fn test_a_token_rejected_while_a_refresh_runs_is_not_taken_back_from_that_
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_a_new_token_of_a_refresh_that_ran_during_a_rejection_is_kept() {
     let source = Arc::new(CountingSource {
         delay: Duration::from_millis(300),
@@ -257,7 +266,7 @@ async fn test_a_new_token_of_a_refresh_that_ran_during_a_rejection_is_kept() {
     assert_eq!(source.reasons(), [TokenReason::First, TokenReason::Refresh]);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_a_token_rejected_after_a_refresh_brought_it_back_is_replaced() {
     let source = Arc::new(CachingSource::new(Duration::ZERO));
     let authorizer = Authorizer::from_source(Arc::clone(&source))
@@ -303,23 +312,27 @@ fn test_a_context_can_be_made_for_tests_of_a_source() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_a_token_without_a_lifetime_lives_the_default_token_lifetime() {
-    let source = Arc::new(CountingSource::default());
+    // Only the first call answers in time, so the first token expires.
+    let source = Arc::new(CountingSource {
+        delay: Duration::from_secs(3600),
+        ..CountingSource::default()
+    });
     let authorizer = Authorizer::from_source(Arc::clone(&source))
         .default_token_lifetime(Duration::from_secs(2))
         .build()
         .await
         .unwrap();
+    let built = tokio::time::Instant::now();
 
-    assert!(
-        wait_until(Duration::from_secs(3), || header(&authorizer).as_deref()
-            == Some("Bearer token-2"))
-        .await
-    );
+    tokio::time::sleep_until(built + Duration::from_millis(1999)).await;
+    assert_eq!(header(&authorizer).as_deref(), Some("Bearer token-1"));
+    tokio::time::sleep_until(built + Duration::from_millis(2001)).await;
+    assert_eq!(header(&authorizer), None);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_a_source_error_is_retried() {
     let source = Arc::new(CountingSource {
         failing: vec![1],
@@ -336,7 +349,7 @@ async fn test_a_source_error_is_retried() {
     assert_eq!(source.calls(), 2);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_a_permanent_source_error_fails_build_at_once() {
     let source = Arc::new(CountingSource {
         failing: vec![1],
@@ -364,7 +377,19 @@ fn test_a_source_error_can_ask_for_a_wait() {
     assert!(error.is_retryable());
 }
 
-#[tokio::test]
+#[test]
+fn test_a_source_error_tells_what_it_asks_for() {
+    let error = SourceError::new("failed");
+    assert!(!error.is_permanent());
+    assert_eq!(error.retry_after(), None);
+
+    let error = SourceError::new("rate limited").with_retry_after(Duration::from_secs(10));
+    assert_eq!(error.retry_after(), Some(Duration::from_secs(10)));
+
+    assert!(SourceError::new("access denied").permanent().is_permanent());
+}
+
+#[tokio::test(start_paused = true)]
 async fn test_a_source_that_does_not_answer_is_bounded_by_the_timeout() {
     let build = Authorizer::from_source(HangingSource)
         .max_retries(0)
@@ -382,7 +407,7 @@ async fn test_a_source_that_does_not_answer_is_bounded_by_the_timeout() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_invalidate_asks_the_source_for_a_new_token() {
     let source = Arc::new(CountingSource::valid_for(Duration::from_secs(3600)));
     let authorizer = Authorizer::from_source(Arc::clone(&source))
@@ -409,7 +434,7 @@ fn test_an_access_token_must_fit_in_a_header() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_debug_output_shows_the_source_and_not_the_token() {
     let authorizer = Authorizer::from_source(CountingSource::valid_for(Duration::from_secs(3600)))
         .build()

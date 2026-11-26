@@ -1,29 +1,30 @@
 //! Token sources of the application's own, see [`TokenSource`].
 
-use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{fmt, future::Future, sync::Arc, time::Duration};
 
 use crate::{
+    cache::BoxFuture,
     error::SourceError,
     token_endpoint::{MAX_EXPIRES_IN, TokenResponse, TokenValue},
 };
 
-/// The future of [`TokenSource::token`].
-pub type TokenFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<AccessToken, SourceError>> + Send + 'a>>;
-
-/// Supplies the access tokens of an authorizer made with [`crate::Authorizer::from_source`].
+/// Supplies the access tokens of an authorizer made with [`crate::Authorizer::from_source`]. Implement it with `async fn token`.
 ///
 /// middle handles the tokens of a source as those of a token endpoint: it keeps the current token, asks the source for a new one before the token expires,
 /// retries failures with a backoff, and asks for a new token after `invalidate`. Sources are, for example, a token exchange of your own, a cloud SDK,
-/// or a token in a file that another process renews. `Arc<S>` and `Box<S>` are sources too.
+/// or a token in a file that another process renews. `Arc<S>` is a source too, so one source can serve several authorizers.
 ///
 /// middle asks for a token for every refresh, retries included. The [`TokenContext`] says why, and the reasons of [`TokenReason`] say what to return:
-/// a token that lives clearly longer than the current one for a refresh, and a token other than the rejected one after `invalidate`.
+/// the newest token the source has for a refresh, and a token other than the rejected one after `invalidate`.
 ///
 /// An error fails the attempt, and middle retries it, see [`SourceError`]. A token whose lifetime ends while middle waits for the source fails the attempt
 /// with [`crate::Error::ExpiredOnArrival`], which middle retries too. A JWT without a lifetime whose `exp` had passed when middle asked lives the default token lifetime
-/// of the builder, because middle cannot tell a stale token from a local clock that runs ahead. Each attempt may take at most the timeout of the builder:
-/// middle then drops the future, so the source must cope with being stopped at any `.await`.
+/// of the builder, because middle cannot tell a stale token from a local clock that runs ahead.
+///
+/// Each attempt may take at most the timeout of the builder, and during a refresh while the current token is valid, at most half the time it has left,
+/// but at least 1 s. middle then drops the future, so the source must cope with being stopped at any `.await`. A source that retries inside should
+/// finish its retries within that time. Work that several attempts or callers share, such as a request that
+/// a cache of the source starts, belongs in a spawned task, so that dropping one attempt does not cancel it.
 ///
 /// middle shows the `Debug` output of a source in the `Debug` output of the authorizer and its builder, so it must not show secrets or tokens.
 /// Log messages name the source by its type.
@@ -31,42 +32,57 @@ pub type TokenFuture<'a> =
 /// # Example
 ///
 /// ```
-/// use middle::{AccessToken, SourceError, TokenContext, TokenFuture, TokenSource};
+/// use middle::{AccessToken, SourceError, TokenContext, TokenSource};
 ///
 /// /// Reads a token that another process writes to a file and renews every few minutes.
 /// #[derive(Debug)]
 /// struct TokenFile(std::path::PathBuf);
 ///
 /// impl TokenSource for TokenFile {
-///     fn token<'a>(&'a self, _context: &'a TokenContext) -> TokenFuture<'a> {
-///         Box::pin(async move {
-///             // Reading a file blocks, so it runs on a thread for blocking work.
-///             let path = self.0.clone();
-///             let token = tokio::task::spawn_blocking(move || std::fs::read_to_string(path))
-///                 .await
-///                 .map_err(|error| SourceError::new("reading the token file failed").with_source(error))?
-///                 .map_err(|error| SourceError::new("cannot read the token file").with_source(error))?;
-///             // The file holds the newest token whatever the reason. Without `with_expires_in`, middle uses
-///             // the `exp` of the token if it is a JWT with an `exp` in the future, else the default token lifetime of the builder.
-///             AccessToken::new(token.trim())
-///         })
+///     async fn token(&self, _context: &TokenContext) -> Result<AccessToken, SourceError> {
+///         // Reading a file blocks, so it runs on a thread for blocking work.
+///         let path = self.0.clone();
+///         let token = tokio::task::spawn_blocking(move || std::fs::read_to_string(path))
+///             .await
+///             .map_err(|error| SourceError::new("reading the token file failed").with_source(error))?
+///             .map_err(|error| SourceError::new("cannot read the token file").with_source(error))?;
+///         // The file holds the newest token whatever the reason. Without `with_expires_in`, middle uses
+///         // the `exp` of the token if it is a JWT with an `exp` in the future, else the default token lifetime of the builder.
+///         AccessToken::new(token.trim())
 ///     }
 /// }
 /// ```
 pub trait TokenSource: fmt::Debug + Send + Sync + 'static {
     /// A new access token.
-    fn token<'a>(&'a self, context: &'a TokenContext) -> TokenFuture<'a>;
+    fn token(
+        &self,
+        context: &TokenContext,
+    ) -> impl Future<Output = Result<AccessToken, SourceError>> + Send;
 }
 
-impl<S: TokenSource + ?Sized> TokenSource for Arc<S> {
-    fn token<'a>(&'a self, context: &'a TokenContext) -> TokenFuture<'a> {
+impl<S: TokenSource> TokenSource for Arc<S> {
+    fn token(
+        &self,
+        context: &TokenContext,
+    ) -> impl Future<Output = Result<AccessToken, SourceError>> + Send {
         (**self).token(context)
     }
 }
 
-impl<S: TokenSource + ?Sized> TokenSource for Box<S> {
-    fn token<'a>(&'a self, context: &'a TokenContext) -> TokenFuture<'a> {
-        (**self).token(context)
+/// A [`TokenSource`] with a boxed future, so that middle can keep a source of any type behind one pointer.
+pub(crate) trait BoxedTokenSource: fmt::Debug + Send + Sync + 'static {
+    fn boxed<'a>(
+        &'a self,
+        context: &'a TokenContext,
+    ) -> BoxFuture<'a, Result<AccessToken, SourceError>>;
+}
+
+impl<S: TokenSource> BoxedTokenSource for S {
+    fn boxed<'a>(
+        &'a self,
+        context: &'a TokenContext,
+    ) -> BoxFuture<'a, Result<AccessToken, SourceError>> {
+        Box::pin(self.token(context))
     }
 }
 
@@ -96,9 +112,13 @@ impl TokenContext {
 pub enum TokenReason {
     /// The first token, which `build()` requests.
     First,
-    /// The current token is due for refresh or has expired. Return a token that lives clearly longer than the current one:
-    /// middle may refresh after 40 % of the lifetime, so a cache should hand out its token only while more than 60 % of its lifetime is left,
-    /// else middle asks again soon, and the token may expire before a new one arrives.
+    /// The current token is due for refresh or has expired. Return the newest token the source has.
+    ///
+    /// If that is the current token, middle keeps using it and asks again before it expires, as for any token, but not sooner than 1 s after this request,
+    /// so a token with 1 s or less left expires first. middle asks more often as the expiry comes closer. A source whose own cache renews its token
+    /// at least a few seconds before expiry works well with this; with a cache that hands out its token until it expires, readers may have no token
+    /// for up to a second around each expiry. A token without a lifetime that is not a JWT with an `exp` in the future lives the default token lifetime
+    /// of the builder, counted from each request, so set that lifetime to at most the time before expiry at which the source renews its token.
     Refresh,
     /// The current token was dropped with `invalidate`, because a server rejected it. Return another token: a retry with the same token fails again.
     /// If an attempt that started before `invalidate` returns the rejected token, middle asks again with this reason.

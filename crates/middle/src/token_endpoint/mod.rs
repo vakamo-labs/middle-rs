@@ -9,7 +9,7 @@ pub(crate) use response::{MAX_EXPIRES_IN, TokenResponse, TokenValue};
 use url::Url;
 
 use crate::{
-    assertion::{Assertion, AssertionContext, AssertionSource},
+    assertion::{Assertion, AssertionContext, BoxedAssertionSource},
     error::{ConfigError, Error, InvalidResponse, ResponseProblem, SourceError, TransportError},
 };
 
@@ -62,7 +62,7 @@ pub(crate) enum Grant {
     /// The client credentials grant (RFC 6749, section 4.4).
     ClientCredentials,
     /// The JWT bearer grant (RFC 7523, section 2.1): an assertion from the source is the grant.
-    JwtBearer(Arc<dyn AssertionSource>),
+    JwtBearer(Arc<dyn BoxedAssertionSource>),
 }
 
 /// How the client authenticates at the token endpoint.
@@ -75,7 +75,7 @@ pub(crate) enum ClientAuth {
     /// An assertion from `source` as the form parameter `client_assertion`, with `client_id` unless `send_client_id` is false (RFC 7521, section 4.2; RFC 7523, section 2.2).
     Assertion {
         client_id: String,
-        source: Arc<dyn AssertionSource>,
+        source: Arc<dyn BoxedAssertionSource>,
         send_client_id: bool,
     },
 }
@@ -226,7 +226,7 @@ impl TokenRequest {
         }
         let grant = match &self.grant {
             Grant::ClientCredentials => GrantForm::ClientCredentials,
-            Grant::JwtBearer(source) => GrantForm::JwtBearer(source.assertion(&context).await?),
+            Grant::JwtBearer(source) => GrantForm::JwtBearer(source.boxed(&context).await?),
         };
         let client = match &self.client_auth {
             None | Some(ClientAuth::SecretBasic { .. }) => ClientForm::None,
@@ -239,7 +239,7 @@ impl TokenRequest {
                 send_client_id,
             }) => ClientForm::Assertion {
                 client_id: send_client_id.then_some(client_id.as_str()),
-                assertion: source.assertion(&context).await?,
+                assertion: source.boxed(&context).await?,
             },
         };
         Ok(self.encode_form(&grant, &client))

@@ -6,7 +6,6 @@ use std::{
     future::Future,
     io::Read as _,
     path::{Path, PathBuf},
-    pin::Pin,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -14,6 +13,8 @@ use std::{
 #[cfg(feature = "client-credentials")]
 use url::Url;
 
+#[cfg(feature = "client-credentials")]
+use crate::cache::BoxFuture;
 use crate::error::SourceError;
 
 /// The largest assertion file [`FileAssertion`] reads, in bytes.
@@ -132,37 +133,52 @@ impl fmt::Debug for Assertion {
     }
 }
 
-/// The future of [`AssertionSource::assertion`].
-#[cfg(feature = "client-credentials")]
-pub type AssertionFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Assertion, SourceError>> + Send + 'a>>;
-
 /// Supplies the assertion for the JWT bearer grant ([`crate::Authorizer::jwt_bearer`]) or for JWT client authentication ([`crate::ClientAuthentication::client_assertion`]).
+/// Implement it with `async fn assertion`.
 ///
 /// Sources are, for example, a [`FileAssertion`] for a Kubernetes service account token, a `jwt::JwtAssertion` (feature `jwt`) that middle signs, or a key management service that signs.
-/// `Arc<S>` and `Box<S>` are sources too, so one source can serve several authorizers.
+/// `Arc<S>` is a source too, so one source can serve several authorizers.
 ///
 /// middle asks for a new assertion for every token request, retries included, within the timeout of that request.
+/// When the request times out, middle drops the future, so the source must cope with being stopped at any `.await`.
 /// An error fails the request, and middle retries it, see [`crate::Error::is_retryable`] and [`SourceError::permanent`].
 ///
 /// middle shows the `Debug` output of a source in its own `Debug` output, which may end up in logs, so it must not show secrets, keys or assertions.
 #[cfg(feature = "client-credentials")]
 pub trait AssertionSource: fmt::Debug + Send + Sync + 'static {
     /// A new assertion for one token request.
-    fn assertion<'a>(&'a self, context: &'a AssertionContext) -> AssertionFuture<'a>;
+    fn assertion(
+        &self,
+        context: &AssertionContext,
+    ) -> impl Future<Output = Result<Assertion, SourceError>> + Send;
 }
 
 #[cfg(feature = "client-credentials")]
-impl<S: AssertionSource + ?Sized> AssertionSource for Arc<S> {
-    fn assertion<'a>(&'a self, context: &'a AssertionContext) -> AssertionFuture<'a> {
+impl<S: AssertionSource> AssertionSource for Arc<S> {
+    fn assertion(
+        &self,
+        context: &AssertionContext,
+    ) -> impl Future<Output = Result<Assertion, SourceError>> + Send {
         (**self).assertion(context)
     }
 }
 
+/// An [`AssertionSource`] with a boxed future, so that middle can keep a source of any type behind one pointer.
 #[cfg(feature = "client-credentials")]
-impl<S: AssertionSource + ?Sized> AssertionSource for Box<S> {
-    fn assertion<'a>(&'a self, context: &'a AssertionContext) -> AssertionFuture<'a> {
-        (**self).assertion(context)
+pub(crate) trait BoxedAssertionSource: fmt::Debug + Send + Sync + 'static {
+    fn boxed<'a>(
+        &'a self,
+        context: &'a AssertionContext,
+    ) -> BoxFuture<'a, Result<Assertion, SourceError>>;
+}
+
+#[cfg(feature = "client-credentials")]
+impl<S: AssertionSource> BoxedAssertionSource for S {
+    fn boxed<'a>(
+        &'a self,
+        context: &'a AssertionContext,
+    ) -> BoxFuture<'a, Result<Assertion, SourceError>> {
+        Box::pin(self.assertion(context))
     }
 }
 
@@ -246,15 +262,13 @@ impl FileAssertion {
 
 #[cfg(feature = "client-credentials")]
 impl AssertionSource for FileAssertion {
-    fn assertion<'a>(&'a self, _context: &'a AssertionContext) -> AssertionFuture<'a> {
+    async fn assertion(&self, _context: &AssertionContext) -> Result<Assertion, SourceError> {
         let path = self.path.clone();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || read_assertion(&path))
-                .await
-                .map_err(|error| {
-                    SourceError::new("reading the assertion file failed").with_source(error)
-                })?
-        })
+        tokio::task::spawn_blocking(move || read_assertion(&path))
+            .await
+            .map_err(|error| {
+                SourceError::new("reading the assertion file failed").with_source(error)
+            })?
     }
 }
 
