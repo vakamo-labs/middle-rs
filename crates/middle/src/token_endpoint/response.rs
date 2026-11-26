@@ -54,21 +54,26 @@ impl Meta {
 }
 
 /// A token answer middle can use.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct TokenResponse {
-    pub(crate) access_token: AccessToken,
+    pub(crate) access_token: TokenValue,
     /// At most [`MAX_EXPIRES_IN`].
     pub(crate) expires_in: Option<Duration>,
 }
 
 /// An access token of visible ASCII characters (RFC 6749, appendix A.12), without spaces, so that it fits after `Bearer ` in a header.
 /// It is always a valid header value.
-pub(crate) struct AccessToken(String);
+#[derive(Clone)]
+pub(crate) struct TokenValue(String);
 
-impl AccessToken {
+impl TokenValue {
     pub(crate) fn parse(token: &str) -> Option<Self> {
+        Self::new(token.to_string())
+    }
+
+    pub(crate) fn new(token: String) -> Option<Self> {
         let valid = !token.is_empty() && token.bytes().all(|b| b.is_ascii_graphic());
-        valid.then(|| Self(token.to_string()))
+        valid.then_some(Self(token))
     }
 
     pub(crate) fn as_str(&self) -> &str {
@@ -76,9 +81,9 @@ impl AccessToken {
     }
 }
 
-impl fmt::Debug for AccessToken {
+impl fmt::Debug for TokenValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("AccessToken([redacted])")
+        f.write_str("TokenValue([redacted])")
     }
 }
 
@@ -131,7 +136,7 @@ pub(super) fn parse(meta: Meta, body: Option<&[u8]>) -> Result<TokenResponse, Er
 
     let access_token = match present(&object, "access_token") {
         None => return Err(meta.invalid(ResponseProblem::MissingField("access_token"))),
-        Some(Value::String(token)) => AccessToken::parse(token)
+        Some(Value::String(token)) => TokenValue::parse(token)
             .ok_or_else(|| meta.invalid(ResponseProblem::InvalidAccessToken))?,
         Some(_) => {
             return Err(meta.invalid(ResponseProblem::WrongType {
@@ -240,7 +245,7 @@ mod tests {
 
     #[test]
     fn test_debug_hides_the_access_token() {
-        let token = AccessToken::parse("SECRET").unwrap();
-        assert_eq!(format!("{token:?}"), "AccessToken([redacted])");
+        let token = TokenValue::parse("SECRET").unwrap();
+        assert_eq!(format!("{token:?}"), "TokenValue([redacted])");
     }
 }

@@ -7,7 +7,7 @@ use http::StatusCode;
 use super::*;
 use crate::{
     error::{ErrorCode, HttpError, OAuthError},
-    token_endpoint::AccessToken,
+    token_endpoint::TokenValue,
 };
 
 /// What the scripted source does for one request.
@@ -34,8 +34,11 @@ impl fmt::Debug for ScriptedSource {
     }
 }
 
-impl TokenSource for ScriptedSource {
-    fn fetch(&self) -> BoxFuture<'_, Result<TokenResponse, Error>> {
+impl Fetch for ScriptedSource {
+    fn fetch<'a>(
+        &'a self,
+        _context: &'a TokenContext,
+    ) -> BoxFuture<'a, Result<TokenResponse, Error>> {
         let number = {
             let mut requests = self.requests.lock().unwrap();
             requests.push(Instant::now());
@@ -46,7 +49,7 @@ impl TokenSource for ScriptedSource {
             match step {
                 Step::Token(token, expires_in) => Ok(response(token, expires_in)),
                 Step::Lasting(token, lifetime) => Ok(TokenResponse {
-                    access_token: AccessToken::parse(token).unwrap(),
+                    access_token: TokenValue::parse(token).unwrap(),
                     expires_in: Some(lifetime),
                 }),
                 Step::Slow(delay, token, expires_in) => {
@@ -87,7 +90,7 @@ impl ScriptedSource {
 
 fn response(token: &str, expires_in: Option<u64>) -> TokenResponse {
     TokenResponse {
-        access_token: AccessToken::parse(token).unwrap(),
+        access_token: TokenValue::parse(token).unwrap(),
         expires_in: expires_in.map(Duration::from_secs),
     }
 }
@@ -129,7 +132,7 @@ fn sleep_machine(duration: Duration) {
 
 fn config() -> CacheConfig {
     CacheConfig {
-        client_id: "my-client".to_string(),
+        name: "client `my-client`".to_string(),
         timeout: Duration::from_secs(30),
         tolerance: Duration::from_secs(30),
         default_lifetime: Duration::from_secs(300),
@@ -165,7 +168,7 @@ async fn try_start(
         script: Box::new(script),
         requests: Mutex::default(),
     });
-    let result = TokenCache::start(Arc::clone(&source) as Arc<dyn TokenSource>, config)
+    let result = TokenCache::start(Arc::clone(&source) as Arc<dyn Fetch>, config)
         .await
         .map(|(cache, _task)| Arc::new(cache));
     (result, source)
@@ -179,7 +182,7 @@ async fn start(
         script: Box::new(script),
         requests: Mutex::default(),
     });
-    let (cache, task) = TokenCache::start(Arc::clone(&source) as Arc<dyn TokenSource>, config)
+    let (cache, task) = TokenCache::start(Arc::clone(&source) as Arc<dyn Fetch>, config)
         .await
         .unwrap();
     Started {
@@ -554,7 +557,7 @@ async fn test_a_missing_expires_in_is_logged_once() {
     logs_assert(|lines| {
         let count = lines
             .iter()
-            .filter(|line| line.contains("sent no `expires_in`"))
+            .filter(|line| line.contains("has no `expires_in`"))
             .count();
         if count == 1 {
             Ok(())
@@ -919,8 +922,12 @@ async fn test_fresh_tokens_rejected_in_a_row_are_requested_with_growing_waits() 
 
 #[tokio::test(start_paused = true)]
 async fn test_a_token_that_reaches_its_refresh_point_resets_the_count_of_rejections() {
-    // A token of 100 s is refreshed between 60 s and 70 s after its request.
-    let started = start(config(), |_| Step::Token("t", Some(100))).await;
+    // A token of 100 s is refreshed between 60 s and 70 s after its request. The refresh brings a new token, so it gets a new generation.
+    let started = start(config(), |number| match number {
+        4 => Step::Token("refreshed", Some(100)),
+        _ => Step::Token("t", Some(100)),
+    })
+    .await;
     for _ in 0..2 {
         let generation = started.cache.wait(Token::generation).await.unwrap();
         invalidate(&started.cache, generation);

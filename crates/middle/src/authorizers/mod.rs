@@ -13,11 +13,12 @@ use http::HeaderValue;
 use crate::cache::TokenId;
 use crate::error::{Error, Result};
 
-/// Puts an `Authorization` header on requests: a bearer token given once, or a token that middle requests from a token endpoint and keeps fresh.
+/// Puts an `Authorization` header on requests: a bearer token given once, or a token that middle requests and keeps fresh.
 ///
 /// - [`Authorizer::bearer`]: a token that never changes.
 /// - `Authorizer::client_credentials`: the client credentials grant (RFC 6749, section 4.4), with the feature `client-credentials`.
 /// - `Authorizer::jwt_bearer`: the JWT bearer grant (RFC 7523, section 2.1), with the feature `client-credentials`.
+/// - `Authorizer::from_source`: tokens from a `TokenSource` of your own, with the feature `client-credentials`.
 ///
 /// For a requested token, `AuthorizerBuilder::build` fetches the first token, and a background task refreshes it before it expires.
 /// If a refresh fails, the current token stays in use while it is valid, and the task retries with a backoff.
@@ -116,6 +117,7 @@ impl Authorizer {
     ///   and the authorizer has no newer valid token. Fail the request then.
     ///
     /// Retry a rejected request once: if a server rejects every token, for example because of a wrong audience, `invalidate` keeps returning `true`.
+    /// For an authorizer made with `from_source`, the source is asked with the reason `TokenReason::Rejected`, and a retry helps only if it returns another token.
     ///
     /// If the authorizer has a newer token already, that token stays in use, so concurrent calls for the same rejected token request one new token.
     ///

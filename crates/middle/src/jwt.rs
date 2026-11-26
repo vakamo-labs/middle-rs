@@ -31,7 +31,7 @@ use spki::{AlgorithmIdentifierRef, SubjectPublicKeyInfoRef};
 
 use crate::{
     SignedJwt,
-    error::{AssertionError, ConfigError, DisplayChain},
+    error::{ConfigError, DisplayChain, SourceError},
 };
 
 /// Registered claims middle sets itself (RFC 7519, section 4.1).
@@ -539,22 +539,22 @@ impl JwtAssertion {
     ///
     /// # Errors
     ///
-    /// [`AssertionError`] if the system clock is before 1970, the system has no randomness, or signing fails.
-    pub fn sign(&self) -> Result<SignedJwt, AssertionError> {
+    /// [`SourceError`] if the system clock is before 1970, the system has no randomness, or signing fails.
+    pub fn sign(&self) -> Result<SignedJwt, SourceError> {
         self.sign_for(&self.audience)
     }
 
     /// Signs a new assertion for `audience`.
-    fn sign_for(&self, audience: &str) -> Result<SignedJwt, AssertionError> {
+    fn sign_for(&self, audience: &str) -> Result<SignedJwt, SourceError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| {
-                AssertionError::new("the system clock is before 1970").with_source(error)
+                SourceError::new("the system clock is before 1970").with_source(error)
             })?
             .as_secs();
         let mut jti = [0u8; 16];
         getrandom::fill(&mut jti).map_err(|error| {
-            AssertionError::new("the system has no randomness for `jti`").with_source(error)
+            SourceError::new("the system has no randomness for `jti`").with_source(error)
         })?;
 
         let mut header = Map::new();
@@ -590,7 +590,7 @@ impl JwtAssertion {
             .key
             .sign_bytes(message.as_bytes())
             .map_err(|SignError(error)| {
-                AssertionError::new("signing the assertion failed").with_shared_source(error)
+                SourceError::new("signing the assertion failed").with_shared_source(error)
             })?;
         Ok(SignedJwt::from_signed(format!(
             "{message}.{}",
@@ -602,11 +602,11 @@ impl JwtAssertion {
 /// Signs a new assertion for every token request.
 #[cfg(feature = "client-credentials")]
 impl crate::AssertionSource for JwtAssertion {
-    fn assertion<'a>(
-        &'a self,
-        _context: &'a crate::AssertionContext,
-    ) -> crate::AssertionFuture<'a> {
-        Box::pin(std::future::ready(self.sign().map(crate::Assertion::from)))
+    async fn assertion(
+        &self,
+        _context: &crate::AssertionContext,
+    ) -> Result<crate::Assertion, crate::SourceError> {
+        self.sign().map(crate::Assertion::from)
     }
 }
 
@@ -650,7 +650,10 @@ impl ClientAuthenticationJwt {
 
 #[cfg(feature = "client-credentials")]
 impl crate::AssertionSource for ClientAuthenticationJwt {
-    fn assertion<'a>(&'a self, context: &'a crate::AssertionContext) -> crate::AssertionFuture<'a> {
+    async fn assertion(
+        &self,
+        context: &crate::AssertionContext,
+    ) -> Result<crate::Assertion, crate::SourceError> {
         let signed = match &self.audience {
             Audience::Issuer(issuer) => self.assertion.sign_for(issuer),
             Audience::TokenEndpoint => {
@@ -660,7 +663,7 @@ impl crate::AssertionSource for ClientAuthenticationJwt {
                 self.assertion.sign_for(token_url.as_str())
             }
         };
-        Box::pin(std::future::ready(signed.map(crate::Assertion::from)))
+        signed.map(crate::Assertion::from)
     }
 }
 

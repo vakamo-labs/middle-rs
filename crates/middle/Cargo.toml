@@ -127,6 +127,10 @@ required-features = ["client-credentials"]
 name = "token_response"
 required-features = ["client-credentials"]
 
+[[test]]
+name = "token_source"
+required-features = ["client-credentials"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

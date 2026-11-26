@@ -68,7 +68,7 @@ pub(crate) fn jwt_exp(token: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::token_endpoint::AccessToken;
+    use crate::token_endpoint::TokenValue;
 
     const DEFAULT: Duration = Duration::from_secs(300);
 
@@ -86,7 +86,7 @@ mod tests {
 
     fn response(access_token: &str, expires_in: Option<u64>) -> TokenResponse {
         TokenResponse {
-            access_token: AccessToken::parse(access_token).unwrap(),
+            access_token: TokenValue::parse(access_token).unwrap(),
             expires_in: expires_in.map(Duration::from_secs),
         }
     }
