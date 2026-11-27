@@ -623,7 +623,7 @@ impl fmt::Display for ConfigError {
             }
             Self::HttpTokenUrl(host) => write!(
                 f,
-                "the token URL uses http with the host `{host}`, which sends the client credentials or the assertion of the JWT bearer grant without TLS: use https, or allow http with `danger_allow_http`"
+                "the token URL uses http with the host `{host}`, which sends credentials and tokens without TLS: use https, or allow http with `danger_allow_http`"
             ),
             Self::TokenUrlWithFragment => {
                 f.write_str("the token URL must not have a fragment (RFC 6749, section 3.2)")
