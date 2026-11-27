@@ -1,8 +1,7 @@
 //! Assertions for JWT client authentication and the JWT bearer grant (RFC 7523, sections 2.1 and 2.2; RFC 7521).
 
-use std::fmt;
-#[cfg(feature = "client-credentials")]
 use std::{
+    fmt,
     future::Future,
     io::Read as _,
     path::{Path, PathBuf},
@@ -10,15 +9,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(feature = "client-credentials")]
 use url::Url;
 
-#[cfg(feature = "client-credentials")]
-use crate::cache::BoxFuture;
-use crate::error::SourceError;
+use crate::{cache::BoxFuture, error::SourceError};
 
 /// The largest assertion file [`FileAssertion`] reads, in bytes.
-#[cfg(feature = "client-credentials")]
 const MAX_FILE_BYTES: u64 = 64 * 1024;
 
 const NOT_A_SIGNED_JWT: &str = "is not a signed JWT: three base64url parts separated by dots";
@@ -84,11 +79,9 @@ fn is_compact_jws(jwt: &str) -> bool {
 /// An assertion as middle sends it to the token endpoint, such as a signed or an encrypted JWT (RFC 7523).
 /// middle sends it as the `assertion` of the JWT bearer grant, or as a `client_assertion` with the `client_assertion_type`
 /// `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`. `Debug` never shows it.
-#[cfg(feature = "client-credentials")]
 #[derive(Clone)]
 pub struct Assertion(String);
 
-#[cfg(feature = "client-credentials")]
 impl Assertion {
     /// An assertion that middle does not check for the form of a signed JWT, such as an encrypted JWT. [`SignedJwt`] converts into one with `From`.
     ///
@@ -119,14 +112,12 @@ impl Assertion {
     }
 }
 
-#[cfg(feature = "client-credentials")]
 impl From<SignedJwt> for Assertion {
     fn from(jwt: SignedJwt) -> Self {
         Self(jwt.0)
     }
 }
 
-#[cfg(feature = "client-credentials")]
 impl fmt::Debug for Assertion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Assertion([redacted])")
@@ -144,7 +135,6 @@ impl fmt::Debug for Assertion {
 /// An error fails the request, and middle retries it, see [`crate::Error::is_retryable`] and [`SourceError::permanent`].
 ///
 /// middle shows the `Debug` output of a source in its own `Debug` output, which may end up in logs, so it must not show secrets, keys or assertions.
-#[cfg(feature = "client-credentials")]
 pub trait AssertionSource: fmt::Debug + Send + Sync + 'static {
     /// A new assertion for one token request.
     fn assertion(
@@ -153,7 +143,6 @@ pub trait AssertionSource: fmt::Debug + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Assertion, SourceError>> + Send;
 }
 
-#[cfg(feature = "client-credentials")]
 impl<S: AssertionSource> AssertionSource for Arc<S> {
     fn assertion(
         &self,
@@ -164,7 +153,6 @@ impl<S: AssertionSource> AssertionSource for Arc<S> {
 }
 
 /// An [`AssertionSource`] with a boxed future, so that middle can keep a source of any type behind one pointer.
-#[cfg(feature = "client-credentials")]
 pub(crate) trait BoxedAssertionSource: fmt::Debug + Send + Sync + 'static {
     fn boxed<'a>(
         &'a self,
@@ -172,7 +160,6 @@ pub(crate) trait BoxedAssertionSource: fmt::Debug + Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<Assertion, SourceError>>;
 }
 
-#[cfg(feature = "client-credentials")]
 impl<S: AssertionSource> BoxedAssertionSource for S {
     fn boxed<'a>(
         &'a self,
@@ -185,14 +172,12 @@ impl<S: AssertionSource> BoxedAssertionSource for S {
 /// What an [`AssertionSource`] knows about the token request.
 ///
 /// `Debug` shows the token URL without user name, password and query.
-#[cfg(feature = "client-credentials")]
 #[derive(Clone)]
 pub struct AssertionContext {
     token_url: Url,
     client_id: Option<String>,
 }
 
-#[cfg(feature = "client-credentials")]
 impl AssertionContext {
     /// A context without a client id, for example to test an assertion source.
     #[must_use]
@@ -223,7 +208,6 @@ impl AssertionContext {
     }
 }
 
-#[cfg(feature = "client-credentials")]
 impl fmt::Debug for AssertionContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AssertionContext")
@@ -245,13 +229,11 @@ impl fmt::Debug for AssertionContext {
 ///
 /// If the payload of the JWT has an `exp` (RFC 7519, section 4.1.4) that has passed, middle does not send it. The token request then fails with a [`SourceError`]
 /// that names the file, and middle retries the request. When the file holds a new JWT, the next retry sends it.
-#[cfg(feature = "client-credentials")]
 #[derive(Debug, Clone)]
 pub struct FileAssertion {
     path: PathBuf,
 }
 
-#[cfg(feature = "client-credentials")]
 impl FileAssertion {
     /// An assertion from the file at `path`. The file is read with each token request, so it may be missing until then.
     #[must_use]
@@ -260,7 +242,6 @@ impl FileAssertion {
     }
 }
 
-#[cfg(feature = "client-credentials")]
 impl AssertionSource for FileAssertion {
     async fn assertion(&self, _context: &AssertionContext) -> Result<Assertion, SourceError> {
         let path = self.path.clone();
@@ -274,7 +255,7 @@ impl AssertionSource for FileAssertion {
 
 /// Opens the file for reading with `O_NONBLOCK`, so that opening a FIFO that replaced the file after the check of its path returns at once,
 /// and the check of the opened file refuses it. The flag has no effect on a regular file.
-#[cfg(all(feature = "client-credentials", unix))]
+#[cfg(unix)]
 fn open_for_reading(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     std::fs::OpenOptions::new()
@@ -284,13 +265,12 @@ fn open_for_reading(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// Opens the file for reading.
-#[cfg(all(feature = "client-credentials", not(unix)))]
+#[cfg(not(unix))]
 fn open_for_reading(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::File::open(path)
 }
 
 /// Reads the assertion file at `path`. The errors name the file, never its content.
-#[cfg(feature = "client-credentials")]
 fn read_assertion(path: &Path) -> Result<Assertion, SourceError> {
     let cannot_read = |error: std::io::Error| {
         SourceError::new(format!(
@@ -343,7 +323,6 @@ fn read_assertion(path: &Path) -> Result<Assertion, SourceError> {
 }
 
 /// Whether the time `exp`, in seconds since 1970, has come (RFC 7519, section 4.1.4).
-#[cfg(feature = "client-credentials")]
 fn has_passed(exp: f64) -> bool {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -351,7 +330,7 @@ fn has_passed(exp: f64) -> bool {
     now >= exp
 }
 
-#[cfg(all(test, unix, feature = "client-credentials"))]
+#[cfg(all(test, unix))]
 mod tests {
     use std::time::Duration;
 

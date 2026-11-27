@@ -1,31 +1,31 @@
 //! The authorizer: a bearer token given once, or a token that middle requests from a token endpoint and keeps fresh.
 
-#[cfg(feature = "client-credentials")]
+#[cfg(feature = "oauth")]
 mod builder;
 
 use std::fmt;
 
-#[cfg(feature = "client-credentials")]
+#[cfg(feature = "oauth")]
 pub use builder::*;
 use http::HeaderValue;
 
-#[cfg(feature = "client-credentials")]
+#[cfg(feature = "oauth")]
 use crate::cache::TokenId;
 use crate::error::{Error, Result};
 
 /// Puts an `Authorization` header on requests: a bearer token given once, or a token that middle requests and keeps fresh.
 ///
 /// - [`Authorizer::bearer`]: a token that never changes.
-/// - `Authorizer::client_credentials`: the client credentials grant (RFC 6749, section 4.4), with the feature `client-credentials`.
-/// - `Authorizer::jwt_bearer`: the JWT bearer grant (RFC 7523, section 2.1), with the feature `client-credentials`.
-/// - `Authorizer::from_source`: tokens from a `TokenSource` of your own, with the feature `client-credentials`.
+/// - `Authorizer::client_credentials`: the client credentials grant (RFC 6749, section 4.4), with the feature `oauth`.
+/// - `Authorizer::jwt_bearer`: the JWT bearer grant (RFC 7523, section 2.1), with the feature `oauth`.
+/// - `Authorizer::from_source`: tokens from a `TokenSource` of your own, with the feature `oauth`.
 ///
 /// For a requested token, `AuthorizerBuilder::build` fetches the first token, and a background task refreshes it before it expires.
 /// If a refresh fails, the current token stays in use while it is valid, and the task retries with a backoff.
 /// When the last clone of the authorizer is dropped, the refresh task is aborted.
 /// If the task ends for another reason, such as its runtime shutting down, the authorizer answers with [`Error::RefreshStopped`] once the token has expired.
 ///
-/// [`Self::authorization_header`] and [`Self::token_header`] never wait. With the feature `client-credentials`, `wait_for_header` waits for a refresh
+/// [`Self::authorization_header`] and [`Self::token_header`] never wait. With the feature `oauth`, `wait_for_header` waits for a refresh
 /// if a requested token has expired, and `invalidate` drops a token that a server rejected.
 ///
 /// Clones are cheap and share the token. `Debug` never shows the token or a secret.
@@ -45,7 +45,7 @@ enum Kind {
     /// A token given once.
     Static(BearerHeader),
     /// A token that middle requests and refreshes.
-    #[cfg(feature = "client-credentials")]
+    #[cfg(feature = "oauth")]
     Refreshing(Refreshing),
 }
 
@@ -81,10 +81,10 @@ impl Authorizer {
         match &self.0 {
             Kind::Static(header) => Ok(TokenHeader {
                 header: header.header.clone(),
-                #[cfg(feature = "client-credentials")]
+                #[cfg(feature = "oauth")]
                 token: None,
             }),
-            #[cfg(feature = "client-credentials")]
+            #[cfg(feature = "oauth")]
             Kind::Refreshing(refreshing) => refreshing.token_header(),
         }
     }
@@ -100,7 +100,7 @@ impl Authorizer {
     /// # Errors
     ///
     /// If no valid token arrives: [`Error::RefreshStopped`] if no refresh task runs, else the error of the last token request, else [`Error::TokenExpired`].
-    #[cfg(feature = "client-credentials")]
+    #[cfg(feature = "oauth")]
     pub async fn wait_for_header(&self) -> Result<TokenHeader> {
         match &self.0 {
             Kind::Static(_) => self.token_header(),
@@ -129,7 +129,7 @@ impl Authorizer {
     ///
     /// The token is dropped for every user of this authorizer and its clones. If one server rejects tokens that another one accepts,
     /// use one authorizer per server, so that the rejections of one server do not take the token away from the other.
-    #[cfg(feature = "client-credentials")]
+    #[cfg(feature = "oauth")]
     pub fn invalidate(&self, rejected: &TokenHeader) -> bool {
         match &self.0 {
             Kind::Static(_) => false,
@@ -156,7 +156,7 @@ impl fmt::Debug for Authorizer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.0 {
             Kind::Static(_) => f.write_str("Authorizer::Bearer([redacted])"),
-            #[cfg(feature = "client-credentials")]
+            #[cfg(feature = "oauth")]
             Kind::Refreshing(refreshing) => f.debug_tuple("Authorizer").field(refreshing).finish(),
         }
     }
@@ -170,7 +170,7 @@ pub struct TokenHeader {
     #[redact]
     header: HeaderValue,
     /// The cache and the generation of a requested token.
-    #[cfg(feature = "client-credentials")]
+    #[cfg(feature = "oauth")]
     token: Option<TokenId>,
 }
 
@@ -204,7 +204,7 @@ impl tonic::service::Interceptor for Interceptor {
             // The metadata value was built with the token, so this only clones it.
             let value = match &(self.0).0 {
                 Kind::Static(header) => header.metadata.clone(),
-                #[cfg(feature = "client-credentials")]
+                #[cfg(feature = "oauth")]
                 Kind::Refreshing(refreshing) => refreshing.metadata().map_err(status)?,
             };
             metadata.insert(http::header::AUTHORIZATION.as_str(), value);
@@ -214,7 +214,7 @@ impl tonic::service::Interceptor for Interceptor {
 }
 
 /// The status of a request that has no valid token: `unavailable` if a retry can help, else `unauthenticated`, with `error` as its source.
-#[cfg(all(feature = "tonic", feature = "client-credentials"))]
+#[cfg(all(feature = "tonic", feature = "oauth"))]
 fn status(error: Error) -> tonic::Status {
     let mut status = if error.is_retryable() {
         tonic::Status::unavailable(error.to_string())

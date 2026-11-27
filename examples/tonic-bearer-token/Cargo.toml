@@ -1,6 +1,5 @@
 [package]
 name = "middle-example-tonic-bearer-token"
-resolver = "2"
 version = "0.0.0"
 edition = { workspace = true }
 homepage = { workspace = true }
@@ -13,7 +12,7 @@ middle = { path = "../../crates/middle", features = ["tonic"] }
 prost = "0.14"
 reqwest = { version = "0.13" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["transport", "codegen"] }
 tonic-prost = { workspace = true }
 url = { workspace = true }
 

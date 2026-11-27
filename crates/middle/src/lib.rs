@@ -8,26 +8,26 @@
 )]
 #![forbid(unsafe_code)]
 
-#[cfg(any(feature = "client-credentials", feature = "jwt"))]
+#[cfg(feature = "oauth")]
 mod assertion;
 mod authorizers;
-#[cfg(feature = "client-credentials")]
+#[cfg(feature = "oauth")]
 mod cache;
 pub mod error;
 #[cfg(feature = "jwt")]
 pub mod jwt;
-#[cfg(feature = "client-credentials")]
+#[cfg(feature = "oauth")]
 mod token_endpoint;
-#[cfg(feature = "client-credentials")]
+#[cfg(feature = "oauth")]
 mod token_source;
-#[cfg(any(feature = "client-credentials", feature = "jwt"))]
-pub use assertion::SignedJwt;
-#[cfg(feature = "client-credentials")]
-pub use assertion::{Assertion, AssertionContext, AssertionSource, FileAssertion};
+#[cfg(feature = "oauth")]
+pub use assertion::{Assertion, AssertionContext, AssertionSource, FileAssertion, SignedJwt};
 pub use authorizers::*;
+#[cfg(feature = "oauth")]
+pub use error::TransportError;
 pub use error::{
     ConfigError, Error, ErrorCode, HttpError, InvalidResponse, OAuthError, ResponseProblem, Result,
-    SourceError, TransportError,
+    SourceError,
 };
-#[cfg(feature = "client-credentials")]
+#[cfg(feature = "oauth")]
 pub use token_source::{AccessToken, TokenContext, TokenReason, TokenSource};

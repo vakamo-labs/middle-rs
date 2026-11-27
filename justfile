@@ -13,6 +13,7 @@ check-clippy:
 	cargo clippy -p middle --all-targets -- -D warnings
 	cargo clippy -p middle --all-targets --features tonic -- -D warnings
 	cargo clippy -p middle --no-default-features -- -D warnings
+	cargo clippy -p middle --all-targets --no-default-features --features tonic -- -D warnings
 	cargo clippy -p middle --no-default-features --features "jwt rust-crypto" -- -D warnings
 
 check-cargo-sort:
@@ -31,6 +32,7 @@ test: doc-test
 	cargo test --all-targets --workspace --features "all"
 	cargo test --all-targets -p middle
 	cargo test --all-targets -p middle --no-default-features --features "jwt rust-crypto"
+	cargo test --all-targets -p middle --no-default-features --features tonic
 
 doc-test:
 	cargo test --no-fail-fast --doc --all-features --workspace

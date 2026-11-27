@@ -8,7 +8,7 @@ This crate provides authentication middleware for clients that need to access se
 
 * Automatic token renewal before expiry in a background task
 * One `Authorizer` type, cheap to clone and shared between threads
-* `reqwest` integration: take the header of a valid token from the `Authorizer`
+* Works with any HTTP client, such as `reqwest`: take the header of a valid token from the `Authorizer`
 * `tonic` integration through an interceptor
 * Support for OAuth2 Client Credential flow, with the client secret (Basic or form body) or a JWT client assertion (RFC 7523): `private_key_jwt`, `client_secret_jwt`, or an assertion from a file such as a Kubernetes service account token
 * Support for the JWT bearer grant (RFC 7523, section 2.1), with or without client authentication
@@ -161,13 +161,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 # Feature Flags
 
-- **all**: Includes `rustls-tls`, `tonic`, `client-credentials`, `runtime-tokio`, `jwt`, and `aws-lc-rs`.
-- **default**: Includes `rustls-tls`, `client-credentials`, and `runtime-tokio`.
-- **rustls-tls**: Enables reqwest's `rustls` feature: TLS with rustls and aws-lc-rs, checking certificates against the root certificates of the operating system. A container image needs them installed, for example with the `ca-certificates` package. Without `rustls-tls`, enable a TLS feature of reqwest 0.13 in your own `Cargo.toml`, such as `native-tls`: middle uses the reqwest of your build, and a reqwest without TLS cannot reach an `https` token endpoint.
+- **default**: Includes `rustls` and `oauth`.
+- **all**: Includes `rustls`, `tonic`, `oauth`, `jwt`, and `aws-lc-rs`.
+- **oauth**: Tokens that middle requests and keeps fresh in a background task on Tokio: from a token endpoint with `Authorizer::client_credentials` or `Authorizer::jwt_bearer`, or from a `TokenSource` of your own with `Authorizer::from_source`. Without `oauth`, middle offers `Authorizer::bearer` for a token that never changes, and middle itself depends on neither reqwest nor Tokio.
+- **rustls**: Enables reqwest's `rustls` feature: TLS with rustls and aws-lc-rs, checking certificates against the root certificates of the operating system. A container image needs them installed, for example with the `ca-certificates` package. Without `rustls`, enable a TLS feature of reqwest 0.13 in your own `Cargo.toml`, such as `native-tls`: middle uses the reqwest of your build, and a reqwest without TLS cannot reach an `https` token endpoint. `rustls` changes nothing without `oauth`.
 - **tonic**: `Authorizer::interceptor`, a `tonic::service::Interceptor` of tonic 0.14
-- **runtime-tokio**: Refreshes requested tokens in a background task on Tokio. `client-credentials` needs it.
-- **client-credentials**: Tokens that middle requests and keeps fresh: from a token endpoint, such as `Authorizer::client_credentials` for the OAuth2 client credentials grant, or from a `TokenSource` of your own with `Authorizer::from_source`
-- **jwt**: Signs JWT assertions (RFC 7523) with `middle::jwt`. Enable `jwt` with exactly one of these crypto backends:
+- **jwt**: Signs JWT assertions (RFC 7523) with `middle::jwt`, and enables `oauth`. Enable `jwt` with exactly one of these crypto backends:
     - **aws-lc-rs**: aws-lc-rs.
     - **rust-crypto**: the RustCrypto crates.
 

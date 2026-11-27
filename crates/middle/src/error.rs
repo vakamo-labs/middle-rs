@@ -10,7 +10,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// An error of middle.
 ///
 /// Errors are cheap to clone, so an authorizer can hand the error of its last refresh to every caller.
-/// [`std::error::Error::source`] leads to the cause, for example the [`reqwest::Error`] of a failed connection.
+/// [`std::error::Error::source`] leads to the cause, for example the `reqwest::Error` of a failed connection.
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -24,6 +24,7 @@ pub enum Error {
     #[error(transparent)]
     InvalidResponse(#[from] InvalidResponse),
     /// The token request did not complete, for example because the connection failed.
+    #[cfg(feature = "oauth")]
     #[error(transparent)]
     Transport(#[from] TransportError),
     /// The token request did not complete within this time, creating an assertion and reading the answer included.
@@ -99,6 +100,7 @@ impl Error {
                     )
             }
             Self::Http(error) => is_retryable_status(error.status()),
+            #[cfg(feature = "oauth")]
             Self::Transport(TransportError(error)) => !error.is_builder() && !error.is_redirect(),
             Self::Timeout(_) | Self::TokenExpired | Self::ExpiredOnArrival(_) => true,
             Self::Source(error) => !error.permanent,
@@ -219,7 +221,7 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    #[cfg(feature = "client-credentials")]
+    #[cfg(feature = "oauth")]
     pub(crate) fn parse(code: &str) -> Self {
         match code {
             "invalid_request" => Self::InvalidRequest,
@@ -502,15 +504,18 @@ impl std::error::Error for SourceError {
 /// A token request that did not complete, for example because the connection failed.
 ///
 /// [`std::error::Error::source`] is the [`reqwest::Error`].
+#[cfg(feature = "oauth")]
 #[derive(Debug, Clone)]
 pub struct TransportError(pub(crate) Arc<reqwest::Error>);
 
+#[cfg(feature = "oauth")]
 impl From<reqwest::Error> for TransportError {
     fn from(error: reqwest::Error) -> Self {
         Self(Arc::new(error))
     }
 }
 
+#[cfg(feature = "oauth")]
 impl fmt::Display for TransportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.0.is_connect() {
@@ -523,6 +528,7 @@ impl fmt::Display for TransportError {
     }
 }
 
+#[cfg(feature = "oauth")]
 impl std::error::Error for TransportError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&*self.0)
@@ -548,6 +554,7 @@ pub enum ConfigError {
     /// The token URL contains a user name or password.
     TokenUrlWithUserInfo,
     /// reqwest cannot build the HTTP client. [`std::error::Error::source`] is the [`reqwest::Error`].
+    #[cfg(feature = "oauth")]
     HttpClient(Arc<reqwest::Error>),
     /// The default token lifetime is shorter than 2 s.
     /// A token is refreshed 1 s after its request at the earliest, so a lifetime of at least 2 s makes the refresh come before the token expires.
@@ -612,6 +619,7 @@ impl fmt::Display for ConfigError {
             Self::TokenUrlWithUserInfo => {
                 f.write_str("the token URL must not contain a user name or password")
             }
+            #[cfg(feature = "oauth")]
             Self::HttpClient(_) => {
                 f.write_str("the HTTP client for the token endpoint cannot be built")
             }
@@ -660,6 +668,7 @@ impl fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {
+    #[cfg(feature = "oauth")]
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::HttpClient(error) => Some(&**error),
@@ -669,10 +678,10 @@ impl std::error::Error for ConfigError {
 }
 
 /// Displays an error with all its causes, separated by `: `.
-#[cfg(any(feature = "client-credentials", feature = "jwt"))]
+#[cfg(feature = "oauth")]
 pub(crate) struct DisplayChain<'a>(pub(crate) &'a (dyn std::error::Error + 'static));
 
-#[cfg(any(feature = "client-credentials", feature = "jwt"))]
+#[cfg(feature = "oauth")]
 impl fmt::Display for DisplayChain<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)?;
@@ -685,7 +694,7 @@ impl fmt::Display for DisplayChain<'_> {
     }
 }
 
-#[cfg(all(test, feature = "client-credentials"))]
+#[cfg(all(test, feature = "oauth"))]
 mod tests {
     use super::*;
 
