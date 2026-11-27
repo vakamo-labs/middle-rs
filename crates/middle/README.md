@@ -8,7 +8,7 @@ This crate provides authentication middleware for clients that need to access se
 
 * Automatic token renewal before expiry in a background task
 * One `Authorizer` type, cheap to clone and shared between threads
-* `reqwest` integration: take the header of a valid token from the `Authorizer`
+* Works with any HTTP client, such as `reqwest`: take the header of a valid token from the `Authorizer`
 * `tonic` integration through an interceptor
 * Support for OAuth2 Client Credential flow, with the client secret (Basic or form body) or a JWT client assertion (RFC 7523): `private_key_jwt`, `client_secret_jwt`, or an assertion from a file such as a Kubernetes service account token
 * Support for the JWT bearer grant (RFC 7523, section 2.1), with or without client authentication

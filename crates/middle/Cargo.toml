@@ -8,7 +8,7 @@ repository = { workspace = true }
 rust-version = { workspace = true }
 license = { workspace = true }
 description = """
-Client Authorization Middleware for APIs secured via OAuth2 or Bearer Tokens. Tonic & reqwest integration.
+Keeps OAuth2 and bearer tokens fresh for HTTP and gRPC clients, with a tonic interceptor.
 """
 keywords = ["oauth2", "bearer", "token", "tonic", "jwt"]
 categories = ["authentication", "web-programming::http-client"]
