@@ -162,18 +162,19 @@ impl Drop for Started {
     }
 }
 
-async fn try_start(
+/// Starts a cache whose first token request fails, and returns the error. A cache that starts fails the test.
+async fn start_error(
     config: CacheConfig,
     script: impl Fn(usize) -> Step + Send + Sync + 'static,
-) -> (Result<Arc<TokenCache>, Error>, Arc<ScriptedSource>) {
+) -> (Error, Arc<ScriptedSource>) {
     let source = Arc::new(ScriptedSource {
         script: Box::new(script),
         requests: Mutex::default(),
     });
-    let result = TokenCache::start(Arc::clone(&source) as Arc<dyn Fetch>, config)
-        .await
-        .map(|(cache, _task)| Arc::new(cache));
-    (result, source)
+    let Err(error) = TokenCache::start(Arc::clone(&source) as Arc<dyn Fetch>, config).await else {
+        panic!("the cache started");
+    };
+    (error, source)
 }
 
 async fn start(
@@ -279,9 +280,8 @@ async fn test_a_token_shorter_than_a_second_is_requested_once_per_second() {
 #[tokio::test(start_paused = true)]
 async fn test_a_first_token_that_arrives_expired_fails_start_after_the_retries() {
     // Each answer takes 2 s, longer than the token lives.
-    let (result, source) = try_start(config(), |_| Step::Slow(secs(2.0), "t", Some(1))).await;
+    let (error, source) = start_error(config(), |_| Step::Slow(secs(2.0), "t", Some(1))).await;
 
-    let error = result.unwrap_err();
     assert!(
         matches!(&error, Error::ExpiredOnArrival(lifetime) if *lifetime == secs(1.0)),
         "{error:?}"
@@ -767,9 +767,9 @@ async fn test_a_waiter_gives_up_after_the_timeout() {
 async fn test_the_first_request_is_retried_after_an_error_a_retry_can_fix() {
     let mut config = config();
     config.first_token_retries = 1;
-    let (cache, source) = try_start(config, |_| Step::Fail(unavailable(None))).await;
+    let (error, source) = start_error(config, |_| Step::Fail(unavailable(None))).await;
 
-    assert!(matches!(cache.unwrap_err(), Error::Http(_)));
+    assert!(matches!(error, Error::Http(_)));
     assert_eq!(source.count(), 2);
 }
 
@@ -777,9 +777,9 @@ async fn test_the_first_request_is_retried_after_an_error_a_retry_can_fix() {
 async fn test_the_first_request_gives_up_when_retry_after_passes_the_timeout() {
     let mut config = config();
     config.timeout = Duration::from_secs(5);
-    let (cache, source) = try_start(config, |_| Step::Fail(unavailable(Some(10)))).await;
+    let (error, source) = start_error(config, |_| Step::Fail(unavailable(Some(10)))).await;
 
-    assert!(matches!(cache.unwrap_err(), Error::Http(_)));
+    assert!(matches!(error, Error::Http(_)));
     assert_eq!(source.count(), 1);
 }
 
@@ -790,23 +790,23 @@ async fn test_the_first_request_takes_at_most_the_timeout() {
     config.first_token_retries = 100;
     let begin = Instant::now();
 
-    let (cache, source) = try_start(config.clone(), |_| Step::Hang).await;
-    assert!(matches!(cache.unwrap_err(), Error::Timeout(timeout) if timeout == secs(5.0)));
+    let (error, source) = start_error(config.clone(), |_| Step::Hang).await;
+    assert!(matches!(error, Error::Timeout(timeout) if timeout == secs(5.0)));
     assert_eq!(source.count(), 1);
     assert_eq!(begin.elapsed(), secs(5.0));
 
     let begin = Instant::now();
-    let (cache, source) = try_start(config, |_| Step::Fail(unavailable(None))).await;
-    assert!(matches!(cache.unwrap_err(), Error::Http(_)));
+    let (error, source) = start_error(config, |_| Step::Fail(unavailable(None))).await;
+    assert!(matches!(error, Error::Http(_)));
     assert!(source.count() >= 2, "{:?}", source.request_times());
     assert!(begin.elapsed() < secs(5.0));
 }
 
 #[tokio::test(start_paused = true)]
 async fn test_a_panic_in_the_first_request_fails_start() {
-    let (cache, _) = try_start(config(), |_| Step::Panic).await;
+    let (error, _) = start_error(config(), |_| Step::Panic).await;
 
-    assert!(matches!(cache.unwrap_err(), Error::TokenRequestPanicked));
+    assert!(matches!(error, Error::TokenRequestPanicked));
 }
 
 #[tokio::test(start_paused = true)]
@@ -900,39 +900,6 @@ async fn test_a_refresh_request_after_the_machine_slept_leaves_time_for_another_
     assert_eq!(&times[..2], &[Duration::ZERO, secs(10.0)]);
     assert_between(times[2], 16.0, 17.0);
     assert_eq!(header(&started.cache).unwrap(), "Bearer second");
-}
-
-#[tokio::test(start_paused = true)]
-async fn test_the_refresh_task_ends_when_the_cache_is_dropped() {
-    let mut started = start(config(), |_| Step::Token("t", Some(60))).await;
-    let task = started.task.take().unwrap();
-    let source = Arc::clone(&started.source);
-
-    drop(started);
-    tokio::time::sleep(secs(120.0)).await;
-
-    assert!(task.is_finished());
-    assert_eq!(source.count(), 1);
-}
-
-#[tokio::test(start_paused = true)]
-async fn test_the_refresh_task_ends_when_the_cache_is_dropped_while_it_waits_after_a_failure() {
-    let mut started = start(config(), |number| match number {
-        1 => Step::Token("t", Some(60)),
-        _ => Step::Fail(invalid_client()),
-    })
-    .await;
-    let task = started.task.take().unwrap();
-    let source = Arc::clone(&started.source);
-    // The refresh comes at 24 s to 30 s and fails. The next request waits half the time the token has left, so none comes before 39 s.
-    tokio::time::sleep(secs(31.0)).await;
-    assert_eq!(source.count(), 2);
-
-    drop(started);
-    tokio::time::sleep(Duration::from_millis(1)).await;
-
-    assert!(task.is_finished());
-    assert_eq!(source.count(), 2);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1193,49 +1160,6 @@ async fn test_a_read_of_a_token_expired_by_the_wall_clock_starts_the_refresh() {
         vec![Duration::ZERO, secs(10.0)]
     );
     assert_eq!(header(&started.cache).unwrap(), "Bearer second");
-}
-
-#[tokio::test(start_paused = true)]
-async fn test_the_refresh_task_ends_when_the_cache_is_dropped_during_a_request() {
-    let mut started = start(config(), |number| match number {
-        1 => Step::Token("first", Some(60)),
-        _ => Step::Slow(secs(10.0), "second", Some(60)),
-    })
-    .await;
-    let task = started.task.take().unwrap();
-    let source = Arc::clone(&started.source);
-    // The refresh between 24 s and 30 s takes 10 s.
-    tokio::time::sleep(secs(31.0)).await;
-    assert_eq!(source.count(), 2);
-
-    drop(started);
-    tokio::time::sleep(Duration::from_millis(1)).await;
-
-    assert!(task.is_finished());
-}
-
-#[tokio::test(start_paused = true)]
-async fn test_readers_gone_wins_over_a_wait_that_ends_at_the_same_time() {
-    let token = Token::new(
-        &response("t", None),
-        TokenId {
-            cache: 1,
-            generation: 1,
-        },
-        (Instant::now(), SystemTime::now()),
-        secs(60.0),
-        Duration::from_secs(30),
-        None,
-    );
-    let (sender, receiver) = watch::channel(State::new(token));
-    drop(receiver);
-
-    let result = until_readers_gone(&sender, std::future::ready(())).await;
-
-    assert!(
-        result.is_err(),
-        "no request starts once every reader is gone"
-    );
 }
 
 #[tokio::test(start_paused = true)]

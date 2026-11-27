@@ -13,7 +13,8 @@ use std::{
 use middle::{AccessToken, Authorizer, Error, SourceError, TokenContext, TokenReason, TokenSource};
 use support::wait_until;
 
-/// Hands out `token-1`, `token-2`, and so on, valid for `expires_in`, and fails the calls in `failing`, counted from 1, with `error`.
+/// Hands out `token-1`, `token-2`, and so on, valid for `expires_in`, fails the calls in `failing`, counted from 1, with `error`,
+/// and never answers the calls in `hanging`.
 #[derive(Debug, Default)]
 struct CountingSource {
     calls: AtomicUsize,
@@ -23,6 +24,7 @@ struct CountingSource {
     expires_at: Option<SystemTime>,
     failing: Vec<usize>,
     error: Option<SourceError>,
+    hanging: Vec<usize>,
     /// How long each call after the first takes.
     delay: Duration,
 }
@@ -48,6 +50,9 @@ impl TokenSource for CountingSource {
     async fn token(&self, context: &TokenContext) -> Result<AccessToken, SourceError> {
         self.reasons.lock().unwrap().push(context.reason());
         let number = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.hanging.contains(&number) {
+            std::future::pending::<()>().await;
+        }
         if number > 1 {
             tokio::time::sleep(self.delay).await;
         }
@@ -442,6 +447,56 @@ async fn test_a_source_that_does_not_answer_is_bounded_by_the_timeout() {
         matches!(error, Error::Timeout(timeout) if timeout == Duration::from_millis(200)),
         "{error:?}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_a_refresh_without_an_answer_does_not_stop_refreshing() {
+    let source = Arc::new(CountingSource {
+        hanging: vec![2],
+        ..CountingSource::valid_for(Duration::from_secs(2))
+    });
+    let authorizer = Authorizer::from_source(Arc::clone(&source))
+        .timeout(Duration::from_millis(200))
+        .build()
+        .await
+        .unwrap();
+    let built = tokio::time::Instant::now();
+
+    // The refresh at 1 s gets no answer and times out at 1.2 s. The token has less than 2 s left, so the next request waits 1 s.
+    // The token expires at 2 s, before that request.
+    tokio::time::sleep_until(built + Duration::from_millis(2199)).await;
+    assert_eq!(source.calls(), 2);
+    let error = authorizer.authorization_header().unwrap_err();
+    assert!(
+        matches!(error, Error::Timeout(timeout) if timeout == Duration::from_millis(200)),
+        "{error:?}"
+    );
+
+    let header = authorizer.wait_for_header().await.unwrap();
+    assert_eq!(header.header().to_str().unwrap(), "Bearer token-3");
+    assert_eq!(built.elapsed(), Duration::from_millis(2200));
+    assert_eq!(source.calls(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_dropping_the_authorizer_ends_the_refresh_task_and_its_request() {
+    let source = Arc::new(CountingSource {
+        hanging: vec![2],
+        ..CountingSource::valid_for(Duration::from_secs(2))
+    });
+    let authorizer = Authorizer::from_source(Arc::clone(&source))
+        .build()
+        .await
+        .unwrap();
+    // The refresh at 1 s gets no answer, so a request runs when the authorizer is dropped.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(source.calls(), 2);
+
+    drop(authorizer);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+
+    // The authorizer, its refresh task and the request each held the source.
+    assert_eq!(Arc::strong_count(&source), 1);
 }
 
 #[tokio::test(start_paused = true)]
