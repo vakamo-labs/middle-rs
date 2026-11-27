@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 use http::{HeaderMap, StatusCode, header};
 use serde_json::{Map, Value};
 
-use super::MAX_RESPONSE_BYTES;
+use super::{MAX_RESPONSE_BYTES, Secret};
 use crate::{
     authorizers::TokenValue,
     error::{Error, ErrorCode, HttpError, InvalidResponse, OAuthError, ResponseProblem},
@@ -37,10 +37,10 @@ impl Meta {
     }
 
     /// The error for a status other than 200 without an OAuth error middle can read.
-    pub(super) fn http_error(self) -> Error {
+    pub(super) fn http_error(&self) -> Error {
         HttpError {
             status: self.status,
-            content_type: self.content_type,
+            content_type: self.content_type.clone(),
             retry_after: self.retry_after,
         }
         .into()
@@ -66,11 +66,89 @@ pub(crate) struct TokenResponse {
     pub(crate) expires_at: Option<SystemTime>,
 }
 
-/// Reads the answer. `body` is `None` if it was larger than [`MAX_RESPONSE_BYTES`].
+/// A token exchange answer middle can use (RFC 8693, section 2.2.1).
+#[derive(Debug, Clone)]
+pub(crate) struct ExchangeResponse {
+    /// The issued token, from `access_token`, and `expires_in`.
+    pub(crate) token: TokenResponse,
+    /// Whether `token_type` is `Bearer`. Otherwise it is `N_A`.
+    pub(crate) is_bearer: bool,
+    /// Without control characters.
+    pub(crate) issued_token_type: Option<String>,
+    pub(crate) refresh_token: Option<Secret>,
+    /// Without control characters.
+    pub(crate) scope: Option<String>,
+}
+
+/// A `token_type` that middle accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenType {
+    /// `Bearer` (RFC 6750).
+    Bearer,
+    /// `N_A`: the issued token is not an access token (RFC 8693, section 2.2.1).
+    NotApplicable,
+}
+
+impl TokenType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bearer => "Bearer",
+            Self::NotApplicable => "N_A",
+        }
+    }
+}
+
+/// What a token answer may say in `expires_in`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpiresInRule {
+    /// More than 0: an authorizer keeps the token and refreshes it, and a token that expires at once cannot be kept.
+    Positive,
+    /// 0 or more: a token exchange returns the token with a lifetime of 0. A token endpoint that limits the token to the expiry of the subject token
+    /// can answer 0 in the last second of the subject token.
+    NonNegative,
+}
+
+impl ExpiresInRule {
+    fn expected(self) -> &'static str {
+        match self {
+            Self::Positive => "a positive integer",
+            Self::NonNegative => "a non-negative integer",
+        }
+    }
+}
+
+/// Reads the answer to the client credentials grant or the JWT bearer grant, whose `token_type` must be `Bearer`. `body` is `None` if it was larger than [`MAX_RESPONSE_BYTES`].
 ///
 /// A JSON object with an `error` string is an OAuth error at any status, because some token endpoints send OAuth errors with status 200.
 /// Errors never contain the body, which may hold an access token.
-pub(super) fn parse(meta: Meta, body: Option<&[u8]>) -> Result<TokenResponse, Error> {
+pub(super) fn parse(meta: &Meta, body: Option<&[u8]>) -> Result<TokenResponse, Error> {
+    let object = token_object(meta, body)?;
+    let (token, _) = token(meta, &object, &[TokenType::Bearer], ExpiresInRule::Positive)?;
+    Ok(token)
+}
+
+/// Reads the answer to a token exchange (RFC 8693, section 2.2), whose `token_type` must be `Bearer` or `N_A`, as [`parse`] reads other answers.
+/// `issued_token_type`, `refresh_token` and `scope` are optional strings.
+pub(super) fn parse_exchange(meta: &Meta, body: Option<&[u8]>) -> Result<ExchangeResponse, Error> {
+    let object = token_object(meta, body)?;
+    let (token, token_type) = token(
+        meta,
+        &object,
+        &[TokenType::Bearer, TokenType::NotApplicable],
+        ExpiresInRule::NonNegative,
+    )?;
+    Ok(ExchangeResponse {
+        token,
+        is_bearer: token_type == TokenType::Bearer,
+        issued_token_type: optional_string(meta, &object, "issued_token_type")?
+            .map(without_control_characters),
+        refresh_token: optional_string(meta, &object, "refresh_token")?.map(Secret::new),
+        scope: optional_string(meta, &object, "scope")?.map(without_control_characters),
+    })
+}
+
+/// The JSON object of a token answer with status 200, or the error the answer holds.
+fn token_object(meta: &Meta, body: Option<&[u8]>) -> Result<Map<String, Value>, Error> {
     let object = body.and_then(|body| match serde_json::from_slice(body) {
         Ok(Value::Object(object)) => Some(object),
         _ => None,
@@ -109,11 +187,18 @@ pub(super) fn parse(meta: Meta, body: Option<&[u8]>) -> Result<TokenResponse, Er
             limit: MAX_RESPONSE_BYTES,
         }));
     }
-    let Some(object) = object else {
-        return Err(meta.invalid(ResponseProblem::NotJsonObject));
-    };
+    object.ok_or_else(|| meta.invalid(ResponseProblem::NotJsonObject))
+}
 
-    let access_token = match present(&object, "access_token") {
+/// The token of a token answer, and its `token_type`, which must be one of `accepted`, compared ignoring upper and lower case (RFC 6749, section 5.1).
+/// `expires_in` follows `rule`.
+fn token(
+    meta: &Meta,
+    object: &Map<String, Value>,
+    accepted: &[TokenType],
+    rule: ExpiresInRule,
+) -> Result<(TokenResponse, TokenType), Error> {
+    let access_token = match present(object, "access_token") {
         None => return Err(meta.invalid(ResponseProblem::MissingField("access_token"))),
         Some(Value::String(token)) => TokenValue::parse(token)
             .ok_or_else(|| meta.invalid(ResponseProblem::InvalidAccessToken))?,
@@ -125,40 +210,60 @@ pub(super) fn parse(meta: Meta, body: Option<&[u8]>) -> Result<TokenResponse, Er
         }
     };
 
-    match present(&object, "token_type") {
+    let token_type = match present(object, "token_type") {
         None => return Err(meta.invalid(ResponseProblem::MissingField("token_type"))),
-        Some(Value::String(token_type)) if token_type.eq_ignore_ascii_case("bearer") => {}
-        Some(Value::String(token_type)) => {
-            return Err(meta.invalid(ResponseProblem::UnsupportedTokenType(sanitize(
-                token_type,
-                MAX_CODE_CHARS,
-            ))));
-        }
+        Some(Value::String(token_type)) => accepted
+            .iter()
+            .copied()
+            .find(|accepted| token_type.eq_ignore_ascii_case(accepted.as_str()))
+            .ok_or_else(|| {
+                meta.invalid(ResponseProblem::UnsupportedTokenType(sanitize(
+                    token_type,
+                    MAX_CODE_CHARS,
+                )))
+            })?,
         Some(_) => {
             return Err(meta.invalid(ResponseProblem::WrongType {
                 field: "token_type",
                 expected: "a string",
             }));
         }
-    }
+    };
 
-    let expires_in = expires_in(present(&object, "expires_in")).map_err(|()| {
+    let expires_in = expires_in(present(object, "expires_in"), rule).map_err(|()| {
         meta.invalid(ResponseProblem::WrongType {
             field: "expires_in",
-            expected: "a positive integer",
+            expected: rule.expected(),
         })
     })?;
 
-    Ok(TokenResponse {
+    let token = TokenResponse {
         access_token,
         expires_in,
         expires_at: None,
-    })
+    };
+    Ok((token, token_type))
 }
 
 /// The field, unless it is missing or `null`.
 fn present<'a>(object: &'a Map<String, Value>, field: &str) -> Option<&'a Value> {
     object.get(field).filter(|value| !value.is_null())
+}
+
+/// An optional string field of a token answer. A field of another type is an error.
+fn optional_string<'a>(
+    meta: &Meta,
+    object: &'a Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<&'a str>, Error> {
+    match present(object, field) {
+        None => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text)),
+        Some(_) => Err(meta.invalid(ResponseProblem::WrongType {
+            field,
+            expected: "a string",
+        })),
+    }
 }
 
 /// A text field of an OAuth error. A field of another type counts as missing.
@@ -169,9 +274,8 @@ fn text_field(object: &Map<String, Value>, field: &str) -> Option<String> {
     }
 }
 
-/// `expires_in` as a positive JSON integer or a string of digits, as some token endpoints send it. At most [`MAX_EXPIRES_IN`].
-/// A lifetime of 0 is an error, because such a token has expired on arrival.
-fn expires_in(value: Option<&Value>) -> Result<Option<Duration>, ()> {
+/// `expires_in` as a JSON integer or a string of digits, as some token endpoints send it, if `rule` allows the value. At most [`MAX_EXPIRES_IN`].
+fn expires_in(value: Option<&Value>, rule: ExpiresInRule) -> Result<Option<Duration>, ()> {
     let seconds = match value {
         None => return Ok(None),
         Some(Value::Number(number)) => number.as_u64(),
@@ -183,19 +287,28 @@ fn expires_in(value: Option<&Value>) -> Result<Option<Duration>, ()> {
         Some(_) => None,
     };
     seconds
-        .filter(|seconds| *seconds > 0)
+        .filter(|seconds| *seconds > 0 || rule == ExpiresInRule::NonNegative)
         .map(|seconds| Some(Duration::from_secs(seconds).min(MAX_EXPIRES_IN)))
         .ok_or(())
 }
 
 /// Text from the token endpoint without control characters and at most `max_chars` long, so it is safe to log.
 fn sanitize(text: &str, max_chars: usize) -> String {
-    let mut visible = text.chars().filter(|c| !c.is_control());
+    let mut visible = visible_chars(text);
     let mut clean: String = visible.by_ref().take(max_chars).collect();
     if visible.next().is_some() {
         clean.push('…');
     }
     clean
+}
+
+/// Text from the token endpoint without control characters, so it is safe to log. The answer limits its length to [`MAX_RESPONSE_BYTES`].
+fn without_control_characters(text: &str) -> String {
+    visible_chars(text).collect()
+}
+
+fn visible_chars(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars().filter(|c| !c.is_control())
 }
 
 #[cfg(test)]
@@ -209,17 +322,114 @@ mod tests {
         assert_eq!(sanitize("abc", 3), "abc");
     }
 
+    fn ok() -> Meta {
+        Meta::from_headers(StatusCode::OK, &HeaderMap::new())
+    }
+
+    fn problem(error: Error) -> ResponseProblem {
+        match error {
+            Error::InvalidResponse(invalid) => invalid.problem,
+            other => panic!("expected an invalid response, got {other:?}"),
+        }
+    }
+
+    fn exchange_answer(body: &Value) -> Result<ExchangeResponse, Error> {
+        parse_exchange(&ok(), Some(body.to_string().as_bytes()))
+    }
+
+    #[test]
+    fn test_a_token_exchange_answer_may_be_bearer_or_n_a() {
+        for (token_type, is_bearer) in [
+            ("Bearer", true),
+            ("bearer", true),
+            ("N_A", false),
+            ("n_a", false),
+        ] {
+            let body = serde_json::json!({"access_token": "t", "token_type": token_type});
+            let answer = exchange_answer(&body).unwrap();
+            assert_eq!(answer.is_bearer, is_bearer, "{token_type}");
+            assert_eq!(answer.token.access_token.as_str(), "t");
+        }
+    }
+
+    #[test]
+    fn test_a_token_exchange_member_of_another_type_is_refused() {
+        for field in ["issued_token_type", "refresh_token", "scope"] {
+            let mut body = serde_json::json!({"access_token": "t", "token_type": "Bearer"});
+            body[field] = serde_json::json!(["SECRET"]);
+            let error = exchange_answer(&body).unwrap_err();
+            assert!(!format!("{error:?}").contains("SECRET"), "{error:?}");
+            assert_eq!(
+                problem(error),
+                ResponseProblem::WrongType {
+                    field,
+                    expected: "a string"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn test_the_issued_token_type_and_the_scope_lose_control_characters() {
+        let body = serde_json::json!({
+            "access_token": "t",
+            "token_type": "Bearer",
+            "issued_token_type": "urn:a\n\u{1b}[31mb",
+            "scope": "read\r\nwrite",
+        });
+        let answer = exchange_answer(&body).unwrap();
+        assert_eq!(answer.issued_token_type.as_deref(), Some("urn:a[31mb"));
+        assert_eq!(answer.scope.as_deref(), Some("readwrite"));
+    }
+
+    #[test]
+    fn test_the_scope_of_a_token_exchange_answer_is_not_shortened() {
+        let scope = vec!["s"; 1000].join(" ");
+        let body = serde_json::json!({"access_token": "t", "token_type": "Bearer", "scope": scope});
+        assert_eq!(exchange_answer(&body).unwrap().scope, Some(scope));
+    }
+
+    #[test]
+    fn test_the_other_grants_ignore_the_token_exchange_members() {
+        let body = serde_json::json!({
+            "access_token": "t",
+            "token_type": "Bearer",
+            "issued_token_type": 1,
+            "refresh_token": 2,
+            "scope": ["read"],
+        });
+        let answer = parse(&ok(), Some(body.to_string().as_bytes())).unwrap();
+        assert_eq!(answer.access_token.as_str(), "t");
+    }
+
     #[test]
     fn test_expires_in_is_capped() {
         assert_eq!(
-            expires_in(Some(&Value::from(u64::MAX))),
+            expires_in(Some(&Value::from(u64::MAX)), ExpiresInRule::Positive),
             Ok(Some(MAX_EXPIRES_IN))
         );
         assert_eq!(
-            expires_in(Some(&Value::from("99999999999999999999999"))),
+            expires_in(
+                Some(&Value::from("99999999999999999999999")),
+                ExpiresInRule::Positive
+            ),
             Ok(Some(MAX_EXPIRES_IN))
         );
-        assert_eq!(expires_in(Some(&Value::from(0))), Err(()));
-        assert_eq!(expires_in(Some(&Value::from("000"))), Err(()));
+    }
+
+    #[test]
+    fn test_an_expires_in_of_zero_is_refused_for_an_authorizer_and_kept_for_a_token_exchange() {
+        for value in [Value::from(0), Value::from("000")] {
+            assert_eq!(
+                expires_in(Some(&value), ExpiresInRule::Positive),
+                Err(()),
+                "{value}"
+            );
+            assert_eq!(
+                expires_in(Some(&value), ExpiresInRule::NonNegative),
+                Ok(Some(Duration::ZERO)),
+                "{value}"
+            );
+        }
     }
 }

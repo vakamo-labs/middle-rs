@@ -12,6 +12,7 @@ This crate provides authentication middleware for clients that need to access se
 * `tonic` integration through an interceptor
 * Support for OAuth2 Client Credential flow, with the client secret (Basic or form body) or a JWT client assertion (RFC 7523): `private_key_jwt`, `client_secret_jwt`, or an assertion from a file such as a Kubernetes service account token
 * Support for the JWT bearer grant (RFC 7523, section 2.1), with or without client authentication
+* Token exchange (RFC 8693) for a server that exchanges the token of each caller: `TokenEndpoint::exchange` sends one request per call, with any client authentication of the Client Credential flow
 * Tokens from a `TokenSource` of your own, such as a token exchange or a cloud SDK, kept fresh in the same way
 * Support for Bearer Token authentication
 * Safe defaults - does not follow redirects and hides sensitive data in Debug
@@ -124,6 +125,55 @@ async fn get_data(client: &Client, header: &TokenHeader) -> reqwest::Result<Resp
 }
 ```
 
+## Token Exchange
+
+With token exchange (RFC 8693), a server that calls other services for its callers exchanges the token of each caller for a token of another service. `TokenEndpoint::exchange` sends one exchange per call and returns the issued token. It keeps no token and does not retry, so your application decides what to cache and when to try again.
+
+```rust,no_run
+use middle::{ClientAuthentication, ExchangeRequest, TokenEndpoint};
+use url::Url;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Build the endpoint once, and clone it for each task.
+    let token_endpoint = Url::parse("https://identity.example.com/oauth2/token")?;
+    let endpoint = TokenEndpoint::builder(token_endpoint)
+        .client_authentication(ClientAuthentication::client_secret_basic("my-service", "my-secret"))
+        .build()?;
+
+    // The token of a caller, which your service has validated.
+    let caller_token = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyLTEifQ.c2lnbmF0dXJl";
+    let request = ExchangeRequest::new(caller_token, "urn:ietf:params:oauth:token-type:access_token")
+        .add_scope("data:read")
+        .append_param("resource", "https://api.example.com")
+        .append_param("requested_token_type", "urn:ietf:params:oauth:token-type:access_token");
+
+    let started = std::time::Instant::now();
+    let issued = endpoint.exchange(&request).await?;
+    // Send the token as a Bearer token only if the token endpoint says it is one.
+    if issued.is_bearer() {
+        // Keep the token until this instant at the latest, with a margin.
+        let keep_until = started + issued.lifetime().saturating_sub(std::time::Duration::from_secs(30));
+        println!("the token can be used until {keep_until:?}");
+    }
+    Ok(())
+}
+```
+
+Rules for a server that exchanges the tokens of its callers:
+
+* Validate the token of the caller on every request, also when you answer from a cache: its signature, its issuer, an audience that names your service, and that it has not expired. Choose the token endpoint by the verified issuer. Some token endpoints do not check the audience of the subject token.
+* Key a cache of issued tokens by a hash of the whole subject token and by the target parameters, such as `scope`, `resource` and `audience`. Never key it by a claim such as `sub` or `jti`: claims are not secret, so a forged token with the claim of another caller would find the token issued for that caller.
+* Take the time before you call `exchange`, and keep the issued token until that time plus `lifetime()` at the latest: `lifetime()` counts from when the answer arrived, which is later. Drop the token a margin earlier, for example 30 seconds, as the `Authorizer` refreshes early, so that it is still valid when a server checks it. If the answer does not say how long the token lives and the token is not a JWT, `lifetime()` is the default token lifetime of the builder, 5 minutes unless you set another one. For a subject token that is a signed JWT, `lifetime()` ends at the `exp` of the subject token at the latest. `expires_in()` is the lifetime the token endpoint stated, `None` if it stated none: use it for a policy of your own, and cache by `lifetime()`.
+* Send one exchange at a time for each cache key, and cache a failed exchange for a short time.
+* What `scope` does in a token exchange depends on the token endpoint: some narrow the scopes of the subject token, others add scopes of your client, also when you send none. Check `scope()` or the issued token.
+* A token endpoint may ignore `resource` or `audience`. Check `scope()` or the audience of the issued token before you rely on them.
+* A token endpoint may issue a refresh token that lives longer than the subject token. Keep one only if your service must act for the caller after the token of the caller has expired, and store it as a secret.
+* Never fall back to another identity, such as a token of your service, when an exchange fails. Fail the request of the caller.
+* When an exchange fails, `oauth_code()` tells who caused the error. A token endpoint that fails with HTTP 5xx can send any code, so check `is_retryable()` first: if it is true, the error can go away, so try again later.
+    * `invalid_request`, `invalid_grant`, `access_denied` or `invalid_scope`: refuse the request of the caller. RFC 8693 (section 2.2.2) requires `invalid_request` for a subject token the token endpoint refuses, and some token endpoints send the other codes. Some also send these codes for a request of your service they refuse, so log the `error_description`, and alert when many callers fail at once.
+    * Any other code, such as `invalid_client`, `unauthorized_client` or `invalid_target`, or no code (`oauth_code()` is `None`): an error of your service.
+
 ## Tonic Integration
 
 With the `tonic` feature, `Authorizer::interceptor` returns an interceptor that puts the authorization header on every request.
@@ -163,7 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - **default**: Includes `rustls` and `oauth`.
 - **all**: Includes `rustls`, `tonic`, `oauth`, `jwt`, and `aws-lc-rs`.
-- **oauth**: Tokens that middle requests and keeps fresh in a background task on Tokio: from a token endpoint with `Authorizer::client_credentials` or `Authorizer::jwt_bearer`, or from a `TokenSource` of your own with `Authorizer::from_source`. Without `oauth`, middle offers `Authorizer::bearer` for a token that never changes, and middle itself depends on neither reqwest nor Tokio.
+- **oauth**: Tokens that middle requests on Tokio. middle keeps them fresh in a background task: from a token endpoint with `Authorizer::client_credentials` or `Authorizer::jwt_bearer`, or from a `TokenSource` of your own with `Authorizer::from_source`. `TokenEndpoint::exchange` sends one token exchange (RFC 8693) per call. Without `oauth`, middle offers `Authorizer::bearer` for a token that never changes, and middle itself depends on neither reqwest nor Tokio.
 - **rustls**: Enables reqwest's `rustls` feature: TLS with rustls and aws-lc-rs, checking certificates against the root certificates of the operating system. A container image needs them installed, for example with the `ca-certificates` package. Without `rustls`, enable a TLS feature of reqwest 0.13 in your own `Cargo.toml`, such as `native-tls`: middle uses the reqwest of your build, and a reqwest without TLS cannot reach an `https` token endpoint. `rustls` changes nothing without `oauth`.
 - **tonic**: `Authorizer::interceptor`, a `tonic::service::Interceptor` of tonic 0.14
 - **jwt**: Signs JWT assertions (RFC 7523) with `middle::jwt`, and enables `oauth`. Enable `jwt` with exactly one of these crypto backends:

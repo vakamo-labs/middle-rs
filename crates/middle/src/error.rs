@@ -82,6 +82,17 @@ impl Error {
         }
     }
 
+    /// The `error` code of the token endpoint's OAuth error answer (RFC 6749, section 5.2), if the error is one. The same as [`OAuthError::code`] of [`Error::OAuth`].
+    ///
+    /// Check [`Self::is_retryable`] first: a code with HTTP 5xx comes from a server that failed.
+    #[must_use]
+    pub fn oauth_code(&self) -> Option<&ErrorCode> {
+        match self {
+            Self::OAuth(error) => Some(error.code()),
+            _ => None,
+        }
+    }
+
     /// Whether the same request can succeed later.
     ///
     /// Retryable are transport errors, timeouts, and answers with HTTP 408, 429 or 5xx, whatever OAuth error they carry. These statuses ask for a later attempt, and a 5xx comes from a server that failed, so its code is not reliable.
@@ -206,7 +217,8 @@ pub enum ErrorCode {
     AuthorizationPending,
     /// `slow_down`: poll the device authorization less often (RFC 8628, section 3.5).
     SlowDown,
-    /// `access_denied`: the user denied the device authorization (RFC 8628, section 3.5).
+    /// `access_denied`: the resource owner or the authorization server denied the request (RFC 6749, section 4.1.2.1),
+    /// for example a user who denied the device authorization (RFC 8628, section 3.5), or a token endpoint that refuses a token exchange.
     AccessDenied,
     /// `expired_token`: the device code has expired (RFC 8628, section 3.5).
     ExpiredToken,
@@ -379,7 +391,7 @@ pub enum ResponseProblem {
         /// What the field must be.
         expected: &'static str,
     },
-    /// The `token_type` is not `Bearer`.
+    /// The `token_type` is not `Bearer`, and in the answer to a token exchange also not `N_A`.
     UnsupportedTokenType(String),
     /// The access token is empty or holds a character other than visible ASCII without space, so that it cannot follow `Bearer ` in a header.
     InvalidAccessToken,
@@ -401,7 +413,7 @@ impl fmt::Display for ResponseProblem {
             }
             Self::UnsupportedTokenType(token_type) => write!(
                 f,
-                "the token type `{token_type}` is not supported; middle supports `Bearer` only"
+                "the token type `{token_type}` is not supported; middle supports `Bearer`, and `N_A` in a token exchange"
             ),
             Self::InvalidAccessToken => f.write_str(
                 "the access token is empty or holds a character other than visible ASCII without space, so it cannot follow `Bearer ` in a header",
@@ -749,6 +761,26 @@ mod tests {
         assert!(!oauth(StatusCode::UNAUTHORIZED, "invalid_client").is_retryable());
         assert!(!oauth(StatusCode::BAD_REQUEST, "invalid_request").is_retryable());
         assert!(!oauth(StatusCode::BAD_REQUEST, "account_locked").is_retryable());
+    }
+
+    #[test]
+    fn test_the_oauth_code_is_that_of_an_oauth_error() {
+        assert_eq!(
+            oauth(StatusCode::BAD_REQUEST, "invalid_grant").oauth_code(),
+            Some(&ErrorCode::InvalidGrant)
+        );
+        assert_eq!(
+            oauth(StatusCode::UNAUTHORIZED, "vendor_specific").oauth_code(),
+            Some(&ErrorCode::Other("vendor_specific".to_string()))
+        );
+        let http: Error = HttpError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            content_type: None,
+            retry_after: None,
+        }
+        .into();
+        assert_eq!(http.oauth_code(), None);
+        assert_eq!(Error::Timeout(Duration::from_secs(1)).oauth_code(), None);
     }
 
     #[test]

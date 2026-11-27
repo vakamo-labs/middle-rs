@@ -40,21 +40,48 @@ pub(super) fn lifetime(
         let lifetime = expires_at.duration_since(requested_at).unwrap_or_default();
         return (lifetime.min(MAX_EXPIRES_IN), Origin::ExpiresAt);
     }
-    let Some(exp) = jwt_exp(response.access_token.as_str()).filter(|exp| *exp > 0.0) else {
-        return (default, Origin::Default);
-    };
-    let requested_at = requested_at
+    match jwt_expiry(response.access_token.as_str(), requested_at) {
+        None => (default, Origin::Default),
+        Some(JwtExpiry::After(lifetime)) => (lifetime, Origin::JwtExp),
+        Some(JwtExpiry::Passed(passed_by)) => (default, Origin::PassedExp(passed_by)),
+    }
+}
+
+/// Where the `exp` of a JWT lies, seen from an instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JwtExpiry {
+    /// This long after the instant, at most one year.
+    After(Duration),
+    /// At the instant, or this long before it.
+    Passed(Duration),
+}
+
+impl JwtExpiry {
+    /// The time until the `exp`, 0 if it has passed.
+    pub(crate) fn time_left(self) -> Duration {
+        match self {
+            Self::After(time_left) => time_left,
+            Self::Passed(_) => Duration::ZERO,
+        }
+    }
+}
+
+/// Where the `exp` of the JWT `token` lies, seen from `from`, read as [`jwt_exp`] reads it.
+/// `None` if `token` is not a JWT with an `exp`, or if its `exp` is 0 or less, which some libraries read as not set.
+pub(crate) fn jwt_expiry(token: &str, from: SystemTime) -> Option<JwtExpiry> {
+    let exp = jwt_exp(token).filter(|exp| *exp > 0.0)?;
+    let from = from
         .duration_since(UNIX_EPOCH)
         .map_or(0.0, |since_epoch| since_epoch.as_secs_f64());
-    let seconds = exp - requested_at;
-    if seconds > 0.0 {
-        let lifetime = Duration::try_from_secs_f64(seconds.min(MAX_EXPIRES_IN.as_secs_f64()))
-            .unwrap_or(MAX_EXPIRES_IN);
-        (lifetime, Origin::JwtExp)
+    let seconds = exp - from;
+    Some(if seconds > 0.0 {
+        JwtExpiry::After(
+            Duration::try_from_secs_f64(seconds.min(MAX_EXPIRES_IN.as_secs_f64()))
+                .unwrap_or(MAX_EXPIRES_IN),
+        )
     } else {
-        let passed_by = Duration::try_from_secs_f64(-seconds).unwrap_or(Duration::MAX);
-        (default, Origin::PassedExp(passed_by))
-    }
+        JwtExpiry::Passed(Duration::try_from_secs_f64(-seconds).unwrap_or(Duration::MAX))
+    })
 }
 
 /// The `exp` claim of a JWT in seconds since 1970, read without checking the signature.

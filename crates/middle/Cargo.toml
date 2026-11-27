@@ -19,7 +19,7 @@ default = ["rustls", "oauth"]
 # TLS for the token endpoint client. Without it, the application enables a TLS feature of reqwest 0.13.
 rustls = ["reqwest?/rustls"]
 tonic = ["dep:tonic"]
-# Tokens that middle requests and refreshes on Tokio: from a token endpoint, or from a `TokenSource` of the application.
+# Tokens that middle requests on Tokio: refreshed from a token endpoint or from a `TokenSource` of the application, and token exchanges (RFC 8693) with `TokenEndpoint`, one request per call.
 oauth = [
     "dep:base64",
     "dep:libc",
@@ -114,6 +114,10 @@ required-features = ["jwt"]
 
 [[test]]
 name = "proxy"
+required-features = ["oauth"]
+
+[[test]]
+name = "token_exchange"
 required-features = ["oauth"]
 
 [[test]]
