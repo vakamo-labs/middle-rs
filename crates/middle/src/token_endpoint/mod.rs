@@ -1,9 +1,11 @@
 //! The client of the token endpoint: one form POST per token request (RFC 6749, sections 2.3.1, 4.4 and 5).
 
+mod exchange;
 mod response;
 
 use std::{fmt, sync::Arc, time::Duration};
 
+pub use exchange::{ExchangeRequest, IssuedToken, TokenEndpoint, TokenEndpointBuilder};
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 pub(crate) use response::{MAX_EXPIRES_IN, TokenResponse};
 use url::Url;
@@ -16,10 +18,19 @@ use crate::{
 /// The largest answer middle reads from a token endpoint, in bytes.
 pub(crate) const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
+/// How long one token request may take, reading the answer included.
+pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The lifetime of a token if the token endpoint does not say.
+pub(crate) const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(5 * 60);
+
+/// How long connecting to the token endpoint may take with the HTTP client middle builds.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The longest `Retry-After` middle reports, so that adding it to an instant cannot overflow.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Form parameters middle sets itself, so a caller cannot add them.
+/// Form parameters middle reserves for every grant and the client authentication, so a caller cannot add them.
 const RESERVED_PARAMETERS: [&str; 7] = [
     "grant_type",
     "scope",
@@ -28,6 +39,14 @@ const RESERVED_PARAMETERS: [&str; 7] = [
     "client_assertion",
     "client_assertion_type",
     "assertion",
+];
+
+/// The subject and the actor of a token exchange (RFC 8693, section 2.1), which a caller cannot add as form parameters.
+const TOKEN_EXCHANGE_RESERVED_PARAMETERS: [&str; 4] = [
+    "subject_token",
+    "subject_token_type",
+    "actor_token",
+    "actor_token_type",
 ];
 
 /// A secret that `Debug` never prints.
@@ -56,13 +75,50 @@ const JWT_BEARER_CLIENT_ASSERTION: &str = "urn:ietf:params:oauth:client-assertio
 /// The `grant_type` of the JWT bearer grant (RFC 7523, section 2.1).
 const JWT_BEARER_GRANT: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
 
-/// The grant of a token request.
+/// The `grant_type` of the token exchange grant (RFC 8693, section 2.1).
+const TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+
+/// The grant of an authorizer's token request.
 #[derive(Clone, Debug)]
 pub(crate) enum Grant {
     /// The client credentials grant (RFC 6749, section 4.4).
     ClientCredentials,
     /// The JWT bearer grant (RFC 7523, section 2.1): an assertion from the source is the grant.
     JwtBearer(Arc<dyn BoxedAssertionSource>),
+}
+
+/// The grant of one request, borrowed from where it lives: the grant of an authorizer, or the subject of one token exchange.
+#[derive(Clone, Copy, Debug)]
+enum GrantRef<'a> {
+    /// The client credentials grant (RFC 6749, section 4.4).
+    ClientCredentials,
+    /// The JWT bearer grant (RFC 7523, section 2.1): an assertion from the source is the grant.
+    JwtBearer(&'a dyn BoxedAssertionSource),
+    /// The token exchange grant (RFC 8693, section 2.1): the subject token and its type are the grant.
+    TokenExchange {
+        subject_token: &'a Secret,
+        subject_token_type: &'a str,
+    },
+}
+
+impl<'a> From<&'a Grant> for GrantRef<'a> {
+    fn from(grant: &'a Grant) -> Self {
+        match grant {
+            Grant::ClientCredentials => Self::ClientCredentials,
+            Grant::JwtBearer(source) => Self::JwtBearer(source.as_ref()),
+        }
+    }
+}
+
+impl GrantRef<'_> {
+    /// Whether middle reserves the form parameter `name` for this grant and the client authentication, so a caller cannot add it.
+    fn reserves(self, name: &str) -> bool {
+        RESERVED_PARAMETERS.contains(&name)
+            || match self {
+                Self::ClientCredentials | Self::JwtBearer(_) => false,
+                Self::TokenExchange { .. } => TOKEN_EXCHANGE_RESERVED_PARAMETERS.contains(&name),
+            }
+    }
 }
 
 /// How the client authenticates at the token endpoint.
@@ -111,6 +167,23 @@ fn check_token_url(url: &Url, allow_http: bool) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// The HTTP client that middle builds for the token endpoint at `token_url`, unless the application sets its own: no redirects, a connect timeout of 10 s,
+/// and a proxy from the environment, except for a token URL with a loopback host.
+pub(crate) fn default_http_client(token_url: &Url) -> Result<reqwest::Client, ConfigError> {
+    let builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(DEFAULT_CONNECT_TIMEOUT);
+    // A proxy on another machine cannot reach the loopback address of this one, and would see the credentials of an `http` request.
+    let builder = if is_loopback(token_url) {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    builder
+        .build()
+        .map_err(|error| ConfigError::HttpClient(Arc::new(error)))
+}
+
 /// Whether the host of the URL is `localhost` or a loopback address: `127.0.0.0/8` or `::1`. The url crate writes domains in lower case.
 fn is_loopback(url: &Url) -> bool {
     match url.host() {
@@ -121,38 +194,48 @@ fn is_loopback(url: &Url) -> bool {
     }
 }
 
-/// One OAuth scope (RFC 6749, section 3.3): one or more visible ASCII characters other than `"` and `\`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Scope(String);
-
-impl Scope {
-    fn new(scope: &str) -> Result<Self, ConfigError> {
-        let valid = !scope.is_empty()
-            && scope
-                .bytes()
-                .all(|b| b == 0x21 || (0x23..=0x5B).contains(&b) || (0x5D..=0x7E).contains(&b));
-        if valid {
-            Ok(Self(scope.to_string()))
-        } else {
-            Err(ConfigError::InvalidScope(scope.to_string()))
-        }
+/// Checks one OAuth scope (RFC 6749, section 3.3): one or more visible ASCII characters other than `"` and `\`.
+fn check_scope(scope: &str) -> Result<(), ConfigError> {
+    let valid = !scope.is_empty()
+        && scope
+            .bytes()
+            .all(|b| b == 0x21 || (0x23..=0x5B).contains(&b) || (0x5D..=0x7E).contains(&b));
+    if valid {
+        Ok(())
+    } else {
+        Err(ConfigError::InvalidScope(scope.to_string()))
     }
 }
 
-/// A checked token request, sent again for every token.
+/// A checked token request of an authorizer, sent again for every token.
 #[derive(Clone)]
 pub(crate) struct TokenRequest {
     url: Url,
     grant: Grant,
     client_auth: Option<ClientAuth>,
-    scopes: Vec<Scope>,
+    scopes: Vec<String>,
     params: Vec<(String, String)>,
 }
 
+/// One token request as it is sent, borrowed from where its parts live: a [`TokenRequest`] of an authorizer,
+/// or a token endpoint and one exchange request. The token URL is checked where it lives.
+#[derive(Clone, Copy)]
+struct Request<'a> {
+    url: &'a Url,
+    grant: GrantRef<'a>,
+    client_auth: Option<&'a ClientAuth>,
+    scopes: &'a [String],
+    params: &'a [(String, String)],
+}
+
 /// The grant parameters of one request, with a new assertion for [`Grant::JwtBearer`].
-enum GrantForm {
+enum GrantForm<'a> {
     ClientCredentials,
     JwtBearer(Assertion),
+    TokenExchange {
+        subject_token: &'a str,
+        subject_token_type: &'a str,
+    },
 }
 
 /// The client credentials in the form body of one request, with a new assertion for [`ClientAuth::Assertion`].
@@ -170,7 +253,7 @@ enum ClientForm<'a> {
 }
 
 impl TokenRequest {
-    /// Checks the token URL, the scopes and the extra form parameters. `allow_http` allows an `http` token URL with any host.
+    /// Checks the token URL, the scopes and the extra form parameters, which must not be parameters the grant reserves. `allow_http` allows an `http` token URL with any host.
     pub(crate) fn new(
         url: Url,
         grant: Grant,
@@ -180,29 +263,26 @@ impl TokenRequest {
         allow_http: bool,
     ) -> Result<Self, ConfigError> {
         check_token_url(&url, allow_http)?;
-        let scopes = scopes
-            .iter()
-            .map(|scope| Scope::new(scope))
-            .collect::<Result<Vec<_>, _>>()?;
-        let params = params
-            .into_iter()
-            .map(|(name, value)| {
-                if name.is_empty() {
-                    Err(ConfigError::EmptyParameterName)
-                } else if RESERVED_PARAMETERS.contains(&name.as_str()) {
-                    Err(ConfigError::ReservedParameter(name))
-                } else {
-                    Ok((name, value))
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
+        let request = Self {
             url,
             grant,
             client_auth,
-            scopes,
-            params,
-        })
+            scopes: scopes.to_vec(),
+            params: params.into_iter().collect(),
+        };
+        request.as_request().check()?;
+        Ok(request)
+    }
+
+    /// The request as it is sent, borrowing the parts of this one.
+    fn as_request(&self) -> Request<'_> {
+        Request {
+            url: &self.url,
+            grant: GrantRef::from(&self.grant),
+            client_auth: self.client_auth.as_ref(),
+            scopes: &self.scopes,
+            params: &self.params,
+        }
     }
 
     /// Names the client in log messages: the client id, or the token URL without user name, password and query if the client does not authenticate.
@@ -213,22 +293,51 @@ impl TokenRequest {
         )
     }
 
-    /// Whether the host of the token URL is `localhost` or a loopback address.
-    pub(crate) fn has_loopback_host(&self) -> bool {
-        is_loopback(&self.url)
+    /// The token URL.
+    pub(crate) fn url(&self) -> &Url {
+        &self.url
+    }
+}
+
+impl Request<'_> {
+    /// Checks the scopes and the extra form parameters, which must have a name and must not be parameters the grant reserves.
+    fn check(&self) -> Result<(), ConfigError> {
+        for scope in self.scopes {
+            check_scope(scope)?;
+        }
+        for (name, _) in self.params {
+            if name.is_empty() {
+                return Err(ConfigError::EmptyParameterName);
+            }
+            if self.grant.reserves(name) {
+                return Err(ConfigError::ReservedParameter(name.clone()));
+            }
+        }
+        Ok(())
     }
 
     /// The form body, with a new assertion for the JWT bearer grant and for a client assertion.
     async fn form(&self) -> Result<String, SourceError> {
-        let mut context = AssertionContext::new(self.url.clone());
-        if let Some(client_auth) = &self.client_auth {
-            context = context.with_client_id(client_auth.client_id());
-        }
-        let grant = match &self.grant {
-            Grant::ClientCredentials => GrantForm::ClientCredentials,
-            Grant::JwtBearer(source) => GrantForm::JwtBearer(source.boxed(&context).await?),
+        // Only an assertion source gets the context.
+        let context = || {
+            let context = AssertionContext::new(self.url.clone());
+            match self.client_auth {
+                Some(client_auth) => context.with_client_id(client_auth.client_id()),
+                None => context,
+            }
         };
-        let client = match &self.client_auth {
+        let grant = match self.grant {
+            GrantRef::ClientCredentials => GrantForm::ClientCredentials,
+            GrantRef::JwtBearer(source) => GrantForm::JwtBearer(source.boxed(&context()).await?),
+            GrantRef::TokenExchange {
+                subject_token,
+                subject_token_type,
+            } => GrantForm::TokenExchange {
+                subject_token: subject_token.expose(),
+                subject_token_type,
+            },
+        };
+        let client = match self.client_auth {
             None | Some(ClientAuth::SecretBasic { .. }) => ClientForm::None,
             Some(ClientAuth::SecretPost { client_id, secret }) => {
                 ClientForm::Secret { client_id, secret }
@@ -239,14 +348,14 @@ impl TokenRequest {
                 send_client_id,
             }) => ClientForm::Assertion {
                 client_id: send_client_id.then_some(client_id.as_str()),
-                assertion: source.boxed(&context).await?,
+                assertion: source.boxed(&context()).await?,
             },
         };
         Ok(self.encode_form(&grant, &client))
     }
 
     /// The form body: the grant, the client credentials in the body, `scope`, then the extra parameters.
-    fn encode_form(&self, grant: &GrantForm, client: &ClientForm<'_>) -> String {
+    fn encode_form(&self, grant: &GrantForm<'_>, client: &ClientForm<'_>) -> String {
         let mut form = url::form_urlencoded::Serializer::new(String::new());
         match grant {
             GrantForm::ClientCredentials => {
@@ -255,6 +364,14 @@ impl TokenRequest {
             GrantForm::JwtBearer(assertion) => {
                 form.append_pair("grant_type", JWT_BEARER_GRANT);
                 form.append_pair("assertion", assertion.as_str());
+            }
+            GrantForm::TokenExchange {
+                subject_token,
+                subject_token_type,
+            } => {
+                form.append_pair("grant_type", TOKEN_EXCHANGE_GRANT);
+                form.append_pair("subject_token", subject_token);
+                form.append_pair("subject_token_type", subject_token_type);
             }
         }
         match client {
@@ -275,10 +392,9 @@ impl TokenRequest {
             }
         }
         if !self.scopes.is_empty() {
-            let scopes: Vec<&str> = self.scopes.iter().map(|scope| scope.0.as_str()).collect();
-            form.append_pair("scope", &scopes.join(" "));
+            form.append_pair("scope", &self.scopes.join(" "));
         }
-        for (name, value) in &self.params {
+        for (name, value) in self.params {
             form.append_pair(name, value);
         }
         form.finish()
@@ -303,6 +419,24 @@ pub(crate) async fn request_token(
     http_client: &reqwest::Client,
     request: &TokenRequest,
 ) -> Result<TokenResponse, Error> {
+    let (meta, body) = send(http_client, request.as_request()).await?;
+    response::parse(&meta, body.as_deref())
+}
+
+/// Asks the token endpoint for a token exchange once, as [`request_token`] asks for other tokens. `request` has the grant [`GrantRef::TokenExchange`].
+async fn request_exchange(
+    http_client: &reqwest::Client,
+    request: Request<'_>,
+) -> Result<response::ExchangeResponse, Error> {
+    let (meta, body) = send(http_client, request).await?;
+    response::parse_exchange(&meta, body.as_deref())
+}
+
+/// Sends the request once and reads the answer: its status and headers, and its body, `None` if that is larger than [`MAX_RESPONSE_BYTES`].
+async fn send(
+    http_client: &reqwest::Client,
+    request: Request<'_>,
+) -> Result<(response::Meta, Option<Vec<u8>>), Error> {
     let mut builder = http_client
         .post(request.url.clone())
         .header(header::ACCEPT, HeaderValue::from_static("application/json"))
@@ -311,7 +445,7 @@ pub(crate) async fn request_token(
             HeaderValue::from_static("application/x-www-form-urlencoded"),
         )
         .body(request.form().await?);
-    if let Some(ClientAuth::SecretBasic { client_id, secret }) = &request.client_auth {
+    if let Some(ClientAuth::SecretBasic { client_id, secret }) = request.client_auth {
         // reqwest Base64-encodes `id:secret` and marks the header sensitive.
         builder = builder.basic_auth(
             form_urlencode(client_id),
@@ -321,10 +455,10 @@ pub(crate) async fn request_token(
     let response = builder
         .send()
         .await
-        .map_err(|error| transport_error(error, &request.url))?;
+        .map_err(|error| transport_error(error, request.url))?;
 
     let meta = response::Meta::from_headers(response.status(), response.headers());
-    if response.url() != &request.url {
+    if response.url() != request.url {
         return Err(InvalidResponse {
             status: meta.status,
             content_type: meta.content_type,
@@ -334,13 +468,12 @@ pub(crate) async fn request_token(
         }
         .into());
     }
-    let body = match read_body(response).await {
-        Ok(body) => body,
+    match read_body(response).await {
+        Ok(body) => Ok((meta, body)),
         // The status of a rejection decides, also when its body breaks off.
-        Err(_) if meta.status != StatusCode::OK => return Err(meta.http_error()),
-        Err(error) => return Err(transport_error(error, &request.url)),
-    };
-    response::parse(meta, body.as_deref())
+        Err(_) if meta.status != StatusCode::OK => Err(meta.http_error()),
+        Err(error) => Err(transport_error(error, request.url)),
+    }
 }
 
 /// Reads the body, or `None` if it is larger than [`MAX_RESPONSE_BYTES`].
@@ -494,6 +627,7 @@ mod tests {
         assert_eq!(
             request(&[], &[])
                 .unwrap()
+                .as_request()
                 .encode_form(&GrantForm::ClientCredentials, &ClientForm::None),
             "grant_type=client_credentials"
         );
@@ -504,6 +638,7 @@ mod tests {
         assert_eq!(
             request(&["a", "b:c", "https://api.example.com/.default"], &[])
                 .unwrap()
+                .as_request()
                 .encode_form(&GrantForm::ClientCredentials, &ClientForm::None),
             "grant_type=client_credentials&scope=a+b%3Ac+https%3A%2F%2Fapi.example.com%2F.default"
         );
@@ -514,6 +649,7 @@ mod tests {
         assert_eq!(
             request(&[], &[("resource", "a"), ("resource", "b")])
                 .unwrap()
+                .as_request()
                 .encode_form(&GrantForm::ClientCredentials, &ClientForm::None),
             "grant_type=client_credentials&resource=a&resource=b"
         );
@@ -536,6 +672,86 @@ mod tests {
             request(&[], &[("", "x")]),
             Err(ConfigError::EmptyParameterName)
         ));
+    }
+
+    const SUBJECT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
+
+    fn exchange(subject_token: &Secret) -> GrantRef<'_> {
+        GrantRef::TokenExchange {
+            subject_token,
+            subject_token_type: SUBJECT_TOKEN_TYPE,
+        }
+    }
+
+    /// A source for a grant whose form a test does not build.
+    #[derive(Debug)]
+    struct UnusedSource;
+
+    impl crate::AssertionSource for UnusedSource {
+        async fn assertion(&self, _context: &AssertionContext) -> Result<Assertion, SourceError> {
+            Err(SourceError::new("not used"))
+        }
+    }
+
+    fn with_param(grant: GrantRef<'_>, name: &str) -> Result<(), ConfigError> {
+        let url = "https://idp.example.com/token".parse().unwrap();
+        let params = [(name.to_string(), "x".to_string())];
+        Request {
+            url: &url,
+            grant,
+            client_auth: None,
+            scopes: &[],
+            params: &params,
+        }
+        .check()
+    }
+
+    #[test]
+    fn test_only_the_token_exchange_reserves_the_subject_and_the_actor() {
+        let subject = Secret::new("t");
+        for name in [
+            "subject_token",
+            "subject_token_type",
+            "actor_token",
+            "actor_token_type",
+        ] {
+            assert!(
+                matches!(with_param(exchange(&subject), name), Err(ConfigError::ReservedParameter(n)) if n == name),
+                "{name}"
+            );
+            assert!(
+                with_param(GrantRef::ClientCredentials, name).is_ok(),
+                "{name}"
+            );
+            assert!(
+                with_param(GrantRef::JwtBearer(&UnusedSource), name).is_ok(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_every_grant_reserves_the_grant_and_the_client_parameters() {
+        let subject = Secret::new("t");
+        for name in RESERVED_PARAMETERS {
+            for grant in [
+                GrantRef::ClientCredentials,
+                GrantRef::JwtBearer(&UnusedSource),
+                exchange(&subject),
+            ] {
+                assert!(
+                    matches!(with_param(grant, name), Err(ConfigError::ReservedParameter(n)) if n == name),
+                    "{name} {grant:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_debug_of_a_token_exchange_hides_the_subject_token() {
+        let debug = format!("{:?}", exchange(&Secret::new("SECRET-SUBJECT")));
+        assert!(debug.contains(SUBJECT_TOKEN_TYPE), "{debug}");
+        assert!(!debug.contains("SECRET"), "{debug}");
     }
 
     #[test]

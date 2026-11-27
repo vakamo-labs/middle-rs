@@ -35,7 +35,7 @@ use std::{
 };
 
 use http::HeaderValue;
-pub(crate) use lifetime::jwt_exp;
+pub(crate) use lifetime::{JwtExpiry, jwt_exp, jwt_expiry};
 use tokio::{
     sync::{Notify, watch},
     task::JoinHandle,

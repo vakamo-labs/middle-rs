@@ -11,21 +11,15 @@ use crate::{
     AccessToken, AssertionSource, TokenContext, TokenSource,
     cache::{BoxFuture, CacheConfig, Fetch, Token, TokenCache},
     error::{ConfigError, Error},
-    token_endpoint::{self, ClientAuth, Grant, Secret, TokenRequest, TokenResponse},
+    token_endpoint::{
+        self, ClientAuth, DEFAULT_TIMEOUT, DEFAULT_TOKEN_LIFETIME, Grant, Secret, TokenRequest,
+        TokenResponse,
+    },
     token_source::BoxedTokenSource,
 };
 
-/// How long one token request may take, reading the answer included.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How long connecting to the token endpoint may take with the HTTP client middle builds.
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// How long before expiry a token is refreshed at the latest.
 const DEFAULT_REFRESH_TOLERANCE: Duration = Duration::from_secs(30);
-
-/// The lifetime of a token if the token endpoint does not say.
-const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(5 * 60);
 
 /// The shortest default token lifetime: a token is refreshed 1 s after its request at the earliest, so this lifetime makes the refresh come before expiry.
 const MIN_DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(2);
@@ -148,23 +142,6 @@ impl fmt::Debug for Inner {
     }
 }
 
-/// The HTTP client for a builder without [`AuthorizerBuilder::danger_http_client`]: no redirects, a connect timeout of 10 s,
-/// and a proxy from the environment, except for a token URL with a loopback host.
-fn default_http_client(request: &TokenRequest) -> Result<reqwest::Client, ConfigError> {
-    let builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(DEFAULT_CONNECT_TIMEOUT);
-    // A proxy on another machine cannot reach the loopback address of this one, and would see the credentials of an `http` request.
-    let builder = if request.has_loopback_host() {
-        builder.no_proxy()
-    } else {
-        builder
-    };
-    builder
-        .build()
-        .map_err(|error| ConfigError::HttpClient(Arc::new(error)))
-}
-
 fn token_header(token: &Token) -> TokenHeader {
     TokenHeader {
         header: token.header().clone(),
@@ -176,7 +153,7 @@ fn token_header(token: &Token) -> TokenHeader {
 ///
 /// `Debug` shows the client id and, for a client assertion, the `Debug` output of its source. It never shows a secret, a key of middle's types or an assertion.
 #[derive(Clone, Debug)]
-pub struct ClientAuthentication(ClientAuth);
+pub struct ClientAuthentication(pub(crate) ClientAuth);
 
 impl ClientAuthentication {
     /// The client id and secret in an HTTP Basic `Authorization` header, each form-urlencoded first (`client_secret_basic`, RFC 6749, section 2.3.1).
@@ -605,7 +582,7 @@ impl AuthorizerBuilder<FromTokenEndpoint> {
             TokenRequest::new(token_url, grant, client_auth, &scopes, params, allow_http)?;
         let http_client = match http_client {
             Some(http_client) => http_client,
-            None => default_http_client(&request)?,
+            None => token_endpoint::default_http_client(request.url())?,
         };
         let name = format!("client `{}`", request.log_name());
         let source = Arc::new(ClientCredentials {

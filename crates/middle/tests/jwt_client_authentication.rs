@@ -9,7 +9,7 @@ use jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER as PROVIDER;
 use jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER as PROVIDER;
 use jsonwebtoken::{Algorithm, DecodingKey};
 use middle::{
-    Authorizer, ClientAuthentication, ConfigError,
+    Authorizer, ClientAuthentication, ConfigError, ExchangeRequest, TokenEndpoint,
     jwt::{Audience, JwtAssertion, SigningAlgorithm, SigningKey},
 };
 use serde_json::{Value, json};
@@ -219,6 +219,58 @@ async fn test_a_jwt_assertion_is_a_source_that_sends_its_own_header() {
     let jwt = verify(&assertion, Algorithm::ES256, &public_key);
     assert_eq!(jwt.header, json!({"alg": "ES256", "typ": "JWT"}));
     assert_client_claims(&jwt.claims, "my-client", ISSUER, before);
+}
+
+#[tokio::test]
+async fn test_private_key_jwt_signs_a_new_assertion_for_each_token_exchange() {
+    let idp = FakeIdp::start(|_| Reply::token("t", Some(3600))).await;
+    let endpoint = TokenEndpoint::builder(idp.token_url())
+        .client_authentication(ClientAuthentication::private_key_jwt(
+            "my-client",
+            ec_key(),
+            issuer(),
+        ))
+        .build()
+        .unwrap();
+    let request = ExchangeRequest::new(
+        "subject-token",
+        "urn:ietf:params:oauth:token-type:access_token",
+    );
+
+    let before = now();
+    endpoint.exchange(&request).await.unwrap();
+    endpoint.exchange(&request).await.unwrap();
+
+    let public_key = DecodingKey::from_ec_pem(EC_P256_PUBLIC.as_bytes()).unwrap();
+    let mut ids = Vec::new();
+    for request in idp.requests() {
+        let names: Vec<String> = request.form().into_iter().map(|(name, _)| name).collect();
+        assert_eq!(
+            names,
+            [
+                "grant_type",
+                "subject_token",
+                "subject_token_type",
+                "client_id",
+                "client_assertion_type",
+                "client_assertion"
+            ]
+        );
+        assert_eq!(
+            request.form_value("client_id").as_deref(),
+            Some("my-client")
+        );
+        assert_eq!(
+            request.form_value("client_assertion_type").as_deref(),
+            Some(JWT_BEARER)
+        );
+        let assertion = request.form_value("client_assertion").unwrap();
+        let jwt = verify(&assertion, Algorithm::ES256, &public_key);
+        assert_client_claims(&jwt.claims, "my-client", ISSUER, before);
+        ids.push(jwt.claims["jti"].clone());
+    }
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
 }
 
 #[test]

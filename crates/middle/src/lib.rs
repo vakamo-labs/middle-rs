@@ -30,4 +30,6 @@ pub use error::{
     SourceError,
 };
 #[cfg(feature = "oauth")]
+pub use token_endpoint::{ExchangeRequest, IssuedToken, TokenEndpoint, TokenEndpointBuilder};
+#[cfg(feature = "oauth")]
 pub use token_source::{AccessToken, TokenContext, TokenReason, TokenSource};
