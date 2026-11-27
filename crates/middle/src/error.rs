@@ -217,7 +217,8 @@ pub enum ErrorCode {
     AuthorizationPending,
     /// `slow_down`: poll the device authorization less often (RFC 8628, section 3.5).
     SlowDown,
-    /// `access_denied`: the user denied the device authorization (RFC 8628, section 3.5).
+    /// `access_denied`: the resource owner or the authorization server denied the request (RFC 6749, section 4.1.2.1),
+    /// for example a user who denied the device authorization (RFC 8628, section 3.5), or a token endpoint that refuses a token exchange.
     AccessDenied,
     /// `expired_token`: the device code has expired (RFC 8628, section 3.5).
     ExpiredToken,

@@ -363,6 +363,15 @@ async fn test_an_authorizer_still_refuses_an_n_a_token() {
 }
 
 #[tokio::test]
+async fn test_an_expires_in_of_zero_gives_no_lifetime() {
+    let (issued, _) = exchange_once(Reply::token("t", Some(0)), "s").await;
+
+    let issued = issued.unwrap();
+    assert_eq!(issued.lifetime(), Duration::ZERO);
+    assert_eq!(issued.expires_in(), Some(Duration::ZERO));
+}
+
+#[tokio::test]
 async fn test_an_answer_without_issued_token_type_is_accepted() {
     // A member that is `null` counts as missing.
     for reply in [

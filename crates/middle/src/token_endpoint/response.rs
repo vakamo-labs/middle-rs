@@ -98,13 +98,32 @@ impl TokenType {
     }
 }
 
+/// What a token answer may say in `expires_in`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpiresInRule {
+    /// More than 0: an authorizer keeps the token and refreshes it, and a token that expires at once cannot be kept.
+    Positive,
+    /// 0 or more: a token exchange returns the token with a lifetime of 0. A token endpoint that limits the token to the expiry of the subject token
+    /// can answer 0 in the last second of the subject token.
+    NonNegative,
+}
+
+impl ExpiresInRule {
+    fn expected(self) -> &'static str {
+        match self {
+            Self::Positive => "a positive integer",
+            Self::NonNegative => "a non-negative integer",
+        }
+    }
+}
+
 /// Reads the answer to the client credentials grant or the JWT bearer grant, whose `token_type` must be `Bearer`. `body` is `None` if it was larger than [`MAX_RESPONSE_BYTES`].
 ///
 /// A JSON object with an `error` string is an OAuth error at any status, because some token endpoints send OAuth errors with status 200.
 /// Errors never contain the body, which may hold an access token.
 pub(super) fn parse(meta: &Meta, body: Option<&[u8]>) -> Result<TokenResponse, Error> {
     let object = token_object(meta, body)?;
-    let (token, _) = token(meta, &object, &[TokenType::Bearer])?;
+    let (token, _) = token(meta, &object, &[TokenType::Bearer], ExpiresInRule::Positive)?;
     Ok(token)
 }
 
@@ -116,6 +135,7 @@ pub(super) fn parse_exchange(meta: &Meta, body: Option<&[u8]>) -> Result<Exchang
         meta,
         &object,
         &[TokenType::Bearer, TokenType::NotApplicable],
+        ExpiresInRule::NonNegative,
     )?;
     Ok(ExchangeResponse {
         token,
@@ -171,10 +191,12 @@ fn token_object(meta: &Meta, body: Option<&[u8]>) -> Result<Map<String, Value>, 
 }
 
 /// The token of a token answer, and its `token_type`, which must be one of `accepted`, compared ignoring upper and lower case (RFC 6749, section 5.1).
+/// `expires_in` follows `rule`.
 fn token(
     meta: &Meta,
     object: &Map<String, Value>,
     accepted: &[TokenType],
+    rule: ExpiresInRule,
 ) -> Result<(TokenResponse, TokenType), Error> {
     let access_token = match present(object, "access_token") {
         None => return Err(meta.invalid(ResponseProblem::MissingField("access_token"))),
@@ -208,10 +230,10 @@ fn token(
         }
     };
 
-    let expires_in = expires_in(present(object, "expires_in")).map_err(|()| {
+    let expires_in = expires_in(present(object, "expires_in"), rule).map_err(|()| {
         meta.invalid(ResponseProblem::WrongType {
             field: "expires_in",
-            expected: "a positive integer",
+            expected: rule.expected(),
         })
     })?;
 
@@ -252,9 +274,8 @@ fn text_field(object: &Map<String, Value>, field: &str) -> Option<String> {
     }
 }
 
-/// `expires_in` as a positive JSON integer or a string of digits, as some token endpoints send it. At most [`MAX_EXPIRES_IN`].
-/// A lifetime of 0 is an error, because such a token has expired on arrival.
-fn expires_in(value: Option<&Value>) -> Result<Option<Duration>, ()> {
+/// `expires_in` as a JSON integer or a string of digits, as some token endpoints send it, if `rule` allows the value. At most [`MAX_EXPIRES_IN`].
+fn expires_in(value: Option<&Value>, rule: ExpiresInRule) -> Result<Option<Duration>, ()> {
     let seconds = match value {
         None => return Ok(None),
         Some(Value::Number(number)) => number.as_u64(),
@@ -266,7 +287,7 @@ fn expires_in(value: Option<&Value>) -> Result<Option<Duration>, ()> {
         Some(_) => None,
     };
     seconds
-        .filter(|seconds| *seconds > 0)
+        .filter(|seconds| *seconds > 0 || rule == ExpiresInRule::NonNegative)
         .map(|seconds| Some(Duration::from_secs(seconds).min(MAX_EXPIRES_IN)))
         .ok_or(())
 }
@@ -384,14 +405,31 @@ mod tests {
     #[test]
     fn test_expires_in_is_capped() {
         assert_eq!(
-            expires_in(Some(&Value::from(u64::MAX))),
+            expires_in(Some(&Value::from(u64::MAX)), ExpiresInRule::Positive),
             Ok(Some(MAX_EXPIRES_IN))
         );
         assert_eq!(
-            expires_in(Some(&Value::from("99999999999999999999999"))),
+            expires_in(
+                Some(&Value::from("99999999999999999999999")),
+                ExpiresInRule::Positive
+            ),
             Ok(Some(MAX_EXPIRES_IN))
         );
-        assert_eq!(expires_in(Some(&Value::from(0))), Err(()));
-        assert_eq!(expires_in(Some(&Value::from("000"))), Err(()));
+    }
+
+    #[test]
+    fn test_an_expires_in_of_zero_is_refused_for_an_authorizer_and_kept_for_a_token_exchange() {
+        for value in [Value::from(0), Value::from("000")] {
+            assert_eq!(
+                expires_in(Some(&value), ExpiresInRule::Positive),
+                Err(()),
+                "{value}"
+            );
+            assert_eq!(
+                expires_in(Some(&value), ExpiresInRule::NonNegative),
+                Ok(Some(Duration::ZERO)),
+                "{value}"
+            );
+        }
     }
 }

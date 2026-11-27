@@ -42,26 +42,40 @@ struct Endpoint {
     timeout: Duration,
     /// At most one year.
     default_lifetime: Duration,
-    /// Whether an answer without `expires_in` was logged, by this endpoint or a clone.
-    logged_missing_expires_in: AtomicBool,
+    /// Whether an answer without `expires_in` whose lifetime came from the `exp` of the issued JWT was logged, by this endpoint or a clone.
+    logged_jwt_exp: AtomicBool,
+    /// Whether an answer without `expires_in` whose issued JWT had expired was logged.
+    logged_passed_exp: AtomicBool,
+    /// Whether an answer without `expires_in` whose lifetime is the default was logged.
+    logged_default: AtomicBool,
 }
 
 impl Endpoint {
-    /// Logs the first answer without `expires_in` whose lifetime comes from the `exp` of the issued JWT or from the default, once for the endpoint and its clones.
+    /// Logs the first answer without `expires_in` of each kind, once for the endpoint and its clones: one endpoint can get a JWT for one target and an opaque token for another.
     fn log_missing_expires_in(&self, origin: Origin) {
-        let first = || !self.logged_missing_expires_in.swap(true, Ordering::Relaxed);
+        let first = |logged: &AtomicBool| !logged.swap(true, Ordering::Relaxed);
         match origin {
-            Origin::ExpiresIn | Origin::PassedExp => {}
+            Origin::ExpiresIn => {}
             Origin::JwtExp(time_left) => {
-                if first() {
+                if first(&self.logged_jwt_exp) {
                     tracing::info!(
                         "The token of the token endpoint `{}` has no `expires_in`. middle uses the `exp` of the JWT access token, which is {time_left:?} after the answer arrived",
                         redacted_url(&self.token_url)
                     );
                 }
             }
+            Origin::PassedExp(passed_by) => {
+                if first(&self.logged_passed_exp) {
+                    tracing::warn!(
+                        "The token of the token endpoint `{}` has no `expires_in`, and the `exp` of the JWT access token lies {passed_by:?} before the answer arrived: \
+                         the token endpoint hands out tokens that have expired, or the clock of this machine runs ahead of its clock. \
+                         middle gives the token a lifetime of 0, so callers do not keep it",
+                        redacted_url(&self.token_url)
+                    );
+                }
+            }
             Origin::Default => {
-                if first() {
+                if first(&self.logged_default) {
                     tracing::warn!(
                         "The token of the token endpoint `{}` has no `expires_in`. middle uses the default lifetime of {:?}",
                         redacted_url(&self.token_url),
@@ -236,7 +250,9 @@ impl TokenEndpointBuilder {
                 .default_token_lifetime
                 .unwrap_or(DEFAULT_TOKEN_LIFETIME)
                 .min(MAX_EXPIRES_IN),
-            logged_missing_expires_in: AtomicBool::new(false),
+            logged_jwt_exp: AtomicBool::new(false),
+            logged_passed_exp: AtomicBool::new(false),
+            logged_default: AtomicBool::new(false),
         })))
     }
 }
@@ -288,8 +304,8 @@ impl ExchangeRequest {
     /// Adds a scope to the request. An empty scope is skipped.
     /// [`TokenEndpoint::exchange`] fails if the scope is not valid (RFC 6749, section 3.3), for example if it contains a space.
     ///
-    /// In a token exchange, a scope narrows the scopes of the subject token. It does not ask for the default scopes of your client.
-    /// [`IssuedToken::scope`] tells if the server granted other scopes.
+    /// What a scope does in a token exchange depends on the token endpoint: some narrow the scopes of the subject token,
+    /// others add scopes of your client, also when you send none. [`IssuedToken::scope`] tells if the server granted other scopes.
     #[must_use]
     pub fn add_scope(mut self, scope: &str) -> Self {
         if !scope.is_empty() {
@@ -355,12 +371,13 @@ impl IssuedToken {
         self.is_bearer
     }
 
-    /// How long the issued token can be used, counted from when the answer arrived, so that `Instant::now()` after `exchange` returns plus `lifetime()`
-    /// never passes the `exp` of the subject token. At most one year.
+    /// How long the issued token can be used, counted from when the answer arrived. At most one year.
+    /// Add it to the current time right after `exchange` returns, and drop the token a margin earlier, for example 30 seconds:
+    /// the token endpoint counted `expires_in` from when it answered, and time passes until you read the clock.
     ///
     /// The lifetime is `expires_in`, else the time until the `exp` of the issued token if it is a JWT, 0 if that has passed,
     /// else the default token lifetime of the builder, see [`TokenEndpointBuilder::default_token_lifetime`].
-    /// It is at most the time until the `exp` of the subject token if that is a JWT, 0 if that has passed, also if the token endpoint issues a longer one.
+    /// It is at most the time until the `exp` of the subject token if that is a signed JWT, 0 if that has passed, also if the token endpoint issues a longer one.
     /// middle reads `exp` without checking signatures, and an `exp` of 0 or less counts as not set.
     #[must_use]
     pub fn lifetime(&self) -> Duration {
@@ -384,7 +401,8 @@ impl IssuedToken {
         self.issued_type.as_deref()
     }
 
-    /// The `refresh_token` of the answer, if the token endpoint issued one. Store it as a secret (RFC 9700, section 4.14).
+    /// The `refresh_token` of the answer, if the token endpoint issued one. It may live longer than the subject token:
+    /// keep it only if your service must act for the caller after the token of the caller has expired, and store it as a secret (RFC 9700, section 4.14).
     #[must_use]
     pub fn refresh_token(&self) -> Option<&str> {
         self.refresh_token.as_ref().map(Secret::expose)
@@ -404,8 +422,8 @@ enum Origin {
     ExpiresIn,
     /// The `exp` of the issued JWT, this long after the answer arrived.
     JwtExp(Duration),
-    /// The `exp` of the issued JWT, at or before the arrival of the answer.
-    PassedExp,
+    /// The `exp` of the issued JWT, this long before the arrival of the answer.
+    PassedExp(Duration),
     /// The default token lifetime of the builder.
     Default,
 }
@@ -424,7 +442,7 @@ fn lifetime(
         Some(expires_in) => (expires_in, Origin::ExpiresIn),
         None => match jwt_expiry(answer.access_token.as_str(), arrived_at) {
             Some(JwtExpiry::After(time_left)) => (time_left, Origin::JwtExp(time_left)),
-            Some(JwtExpiry::Passed(_)) => (Duration::ZERO, Origin::PassedExp),
+            Some(JwtExpiry::Passed(passed_by)) => (Duration::ZERO, Origin::PassedExp(passed_by)),
             None => (default, Origin::Default),
         },
     };
@@ -662,6 +680,73 @@ mod tests {
                 Ok(())
             } else {
                 Err(format!("{infos} infos and {warnings} warnings"))
+            }
+        });
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_an_info_for_an_issued_jwt_does_not_hide_the_warning_for_the_default() {
+        // One endpoint answers with a JWT for one resource and with an opaque token for another.
+        let mut server = mockito::Server::new_async().await;
+        let mut mocks = Vec::new();
+        for (resource, access_token) in [("jwt", jwt(u64::MAX)), ("opaque", "t".to_string())] {
+            let body = serde_json::json!({"access_token": access_token, "token_type": "Bearer"});
+            mocks.push(
+                server
+                    .mock("POST", "/token")
+                    .match_body(mockito::Matcher::Regex(format!("resource={resource}")))
+                    .with_status(200)
+                    .with_header("content-type", "application/json")
+                    .with_body(body.to_string())
+                    .create_async()
+                    .await,
+            );
+        }
+        let endpoint = TokenEndpoint::builder(format!("{}/token", server.url()).parse().unwrap())
+            .build()
+            .unwrap();
+
+        for resource in ["jwt", "opaque", "opaque", "jwt"] {
+            endpoint
+                .exchange(&subject().append_param("resource", resource))
+                .await
+                .unwrap();
+        }
+
+        logs_assert(|lines| {
+            let infos = count(lines, "INFO", "uses the `exp` of the JWT access token");
+            let warnings = count(lines, "WARN", "uses the default lifetime of 300s");
+            if (infos, warnings) == (1, 1) {
+                Ok(())
+            } else {
+                Err(format!("{infos} infos and {warnings} warnings"))
+            }
+        });
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_an_issued_jwt_whose_exp_has_passed_is_logged_as_a_warning_once() {
+        let (_server, _mock, endpoint) = endpoint_answering(
+            &serde_json::json!({"access_token": jwt(1), "token_type": "Bearer"}),
+        )
+        .await;
+
+        let issued = endpoint.exchange(&subject()).await.unwrap();
+        endpoint.clone().exchange(&subject()).await.unwrap();
+
+        assert_eq!(issued.lifetime(), Duration::ZERO);
+        logs_assert(|lines| {
+            let warnings = count(
+                lines,
+                "WARN",
+                "has no `expires_in`, and the `exp` of the JWT access token lies",
+            );
+            if warnings == 1 {
+                Ok(())
+            } else {
+                Err(format!("{warnings} warnings"))
             }
         });
     }
