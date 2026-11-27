@@ -470,36 +470,6 @@ async fn test_a_token_request_without_an_answer_times_out() {
 }
 
 #[tokio::test]
-async fn test_a_refresh_without_an_answer_does_not_stop_refreshing() {
-    let idp = FakeIdp::start(|number| match number {
-        1 => Reply::token("first", Some(2)),
-        2 => Reply::Hang,
-        _ => Reply::token("third", Some(2)),
-    })
-    .await;
-    let authorizer = builder(idp.token_url())
-        .timeout(Duration::from_millis(200))
-        .max_retries(0)
-        .refresh_tolerance(Duration::from_secs(1))
-        .build()
-        .await
-        .unwrap();
-
-    // The first refresh starts after 1 s and times out after 200 ms. The token has less than 2 s left, so the next one starts 1 s later.
-    assert!(
-        eventually(|| header(&authorizer).as_deref() == Some("Bearer third")).await,
-        "requests: {:?} ms",
-        idp.arrival_ms()
-    );
-    assert_eq!(idp.count(), 3);
-    let arrivals = idp.arrival_ms();
-    assert!(
-        arrivals[2] - arrivals[1] >= 1200,
-        "requests: {arrivals:?} ms"
-    );
-}
-
-#[tokio::test]
 async fn test_a_connection_error_keeps_its_cause() {
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()

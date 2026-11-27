@@ -16,8 +16,8 @@
 //! counted from the request of the rejected token. A rejection counts only while that wait still lies ahead, so a token that lasted longer than
 //! the wait starts a new series. A token that reaches its refresh point ends the series.
 //!
-//! The task owns the only [`watch::Sender`]. When the task ends, because its runtime shut down or the last handle aborted it,
-//! the channel closes, and readers know that no refresh will come. The task also ends when every reader is gone.
+//! The task owns the only [`watch::Sender`]. When the task ends, because its runtime shut down or the authorizer aborted it when its last clone was dropped,
+//! the channel closes, and readers know that no refresh will come.
 //! Each request runs in a task of its own, so a panic in a request does not end the refresh task.
 
 mod lifetime;
@@ -25,13 +25,12 @@ mod schedule;
 
 use std::{
     fmt,
-    future::{Future, poll_fn},
-    pin::{Pin, pin},
+    future::Future,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    task::Poll,
     time::{Duration, SystemTime},
 };
 
@@ -288,7 +287,7 @@ fn task_listens(state: &State, refreshing: bool, now: Instant) -> bool {
     refreshing && now < state.token.refresh_at && !waits_for_retry(state, now)
 }
 
-/// A token cache. The refresh task stops when the [`JoinHandle`] that [`TokenCache::start`] returns is aborted, and when the cache and every wait on it are gone.
+/// A token cache. The refresh task runs until the [`JoinHandle`] that [`TokenCache::start`] returns is aborted, as the authorizer does when its last clone is dropped.
 #[derive(Debug)]
 pub(crate) struct TokenCache {
     /// Unique in the process, so that a token of another cache cannot invalidate a token of this one.
@@ -505,30 +504,17 @@ impl Refresher {
         error
     }
 
-    /// Refreshes the token until every reader is gone.
+    /// Refreshes the token until the task is aborted.
     async fn run(mut self, sender: &watch::Sender<State>, shared: &Shared) {
         loop {
-            if until_readers_gone(sender, self.wait_until_due(sender, shared))
-                .await
-                .is_err()
-                || self.refresh(sender, shared).await.is_err()
-            {
-                break;
-            }
+            self.wait_until_due(sender, shared).await;
+            self.refresh(sender, shared).await;
         }
-        tracing::debug!(
-            "Every reader of the token of {} is gone, so the refresh task ends",
-            self.config.name
-        );
     }
 
     /// Requests tokens until one arrives. After a failure, the old token stays in use while it is valid,
     /// and the wait before the next request is at most [`half_time_left`], unless a `Retry-After` asks for longer.
-    async fn refresh(
-        &mut self,
-        sender: &watch::Sender<State>,
-        shared: &Shared,
-    ) -> Result<(), ReadersGone> {
+    async fn refresh(&mut self, sender: &watch::Sender<State>, shared: &Shared) {
         let mut failures: u32 = 0;
         loop {
             // Once the current token is invalidated, every attempt asks for a token other than the rejected one.
@@ -538,7 +524,7 @@ impl Refresher {
                 TokenReason::Refresh
             };
             let timeout = attempt_timeout(&sender.borrow().token, shared, self.config.timeout);
-            let error = match until_readers_gone(sender, self.request(timeout, reason)).await? {
+            let error = match self.request(timeout, reason).await {
                 Ok(mut token) => {
                     {
                         let current = &sender.borrow().token;
@@ -550,7 +536,7 @@ impl Refresher {
                         }
                     }
                     drop(sender.send_replace(State::new(token)));
-                    return Ok(());
+                    return;
                 }
                 Err(error) => error,
             };
@@ -581,7 +567,7 @@ impl Refresher {
                 error: Some(error),
                 retry_at: Some(retry_at),
             }));
-            until_readers_gone(sender, tokio::time::sleep_until(retry_at)).await?;
+            tokio::time::sleep_until(retry_at).await;
         }
     }
 
@@ -771,26 +757,6 @@ fn half_time_left(token: &Token, shared: &Shared) -> Option<Duration> {
         .and_then(|expiry| expiry.duration_since(now_wall).ok())
         .unwrap_or(left);
     Some((left.min(left_wall) / 2).max(MIN_HALF_TIME_LEFT))
-}
-
-/// Every reader of the token is gone: the cache and every receiver cloned from it were dropped.
-#[derive(Debug)]
-struct ReadersGone;
-
-/// Runs `future` until it completes or every reader is gone. If both happen at once, the readers being gone wins, so that no further request starts.
-async fn until_readers_gone<F: Future>(
-    sender: &watch::Sender<State>,
-    future: F,
-) -> Result<F::Output, ReadersGone> {
-    let mut future = pin!(future);
-    let mut closed = pin!(sender.closed());
-    poll_fn(|cx| {
-        if closed.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(Err(ReadersGone));
-        }
-        future.as_mut().poll(cx).map(Ok)
-    })
-    .await
 }
 
 /// Aborts the task when dropped, so that a request ends with its timeout or with the refresh task.
