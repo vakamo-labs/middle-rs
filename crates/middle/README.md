@@ -148,12 +148,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .append_param("resource", "https://api.example.com")
         .append_param("requested_token_type", "urn:ietf:params:oauth:token-type:access_token");
 
+    let started = std::time::Instant::now();
     let issued = endpoint.exchange(&request).await?;
     // Send the token as a Bearer token only if the token endpoint says it is one.
     if issued.is_bearer() {
         // Keep the token until this instant at the latest, with a margin.
-        let keep_until = std::time::Instant::now()
-            + issued.lifetime().saturating_sub(std::time::Duration::from_secs(30));
+        let keep_until = started + issued.lifetime().saturating_sub(std::time::Duration::from_secs(30));
         println!("the token can be used until {keep_until:?}");
     }
     Ok(())
@@ -164,7 +164,7 @@ Rules for a server that exchanges the tokens of its callers:
 
 * Validate the token of the caller on every request, also when you answer from a cache: its signature, its issuer, an audience that names your service, and that it has not expired. Choose the token endpoint by the verified issuer. Some token endpoints do not check the audience of the subject token.
 * Key a cache of issued tokens by a hash of the whole subject token and by the target parameters, such as `scope`, `resource` and `audience`. Never key it by a claim such as `sub` or `jti`: claims are not secret, so a forged token with the claim of another caller would find the token issued for that caller.
-* Add `lifetime()` to the current time right after `exchange` returns, and drop the token a margin earlier, for example 30 seconds, as the `Authorizer` refreshes early: `lifetime()` counts from when the answer arrived, and the token endpoint counted `expires_in` from when it answered. If the answer does not say how long the token lives and the token is not a JWT, `lifetime()` is the default token lifetime of the builder, 5 minutes unless you set another one. For a subject token that is a signed JWT, `lifetime()` ends at the `exp` of the subject token at the latest. `expires_in()` is the lifetime the token endpoint stated, `None` if it stated none: use it for a policy of your own, and cache by `lifetime()`.
+* Take the time before you call `exchange`, and keep the issued token until that time plus `lifetime()` at the latest: `lifetime()` counts from when the answer arrived, which is later. Drop the token a margin earlier, for example 30 seconds, as the `Authorizer` refreshes early, so that it is still valid when a server checks it. If the answer does not say how long the token lives and the token is not a JWT, `lifetime()` is the default token lifetime of the builder, 5 minutes unless you set another one. For a subject token that is a signed JWT, `lifetime()` ends at the `exp` of the subject token at the latest. `expires_in()` is the lifetime the token endpoint stated, `None` if it stated none: use it for a policy of your own, and cache by `lifetime()`.
 * Send one exchange at a time for each cache key, and cache a failed exchange for a short time.
 * What `scope` does in a token exchange depends on the token endpoint: some narrow the scopes of the subject token, others add scopes of your client, also when you send none. Check `scope()` or the issued token.
 * A token endpoint may ignore `resource` or `audience`. Check `scope()` or the audience of the issued token before you rely on them.

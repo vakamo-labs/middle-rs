@@ -372,8 +372,9 @@ impl IssuedToken {
     }
 
     /// How long the issued token can be used, counted from when the answer arrived. At most one year.
-    /// Add it to the current time right after `exchange` returns, and drop the token a margin earlier, for example 30 seconds:
-    /// the token endpoint counted `expires_in` from when it answered, and time passes until you read the clock.
+    /// Take the time before you call [`TokenEndpoint::exchange`], and keep the token until that time plus `lifetime()` at the latest:
+    /// that never passes what `lifetime()` allows, however long the exchange took. Drop the token a margin earlier, for example 30 seconds,
+    /// so that it is still valid when a server checks it.
     ///
     /// The lifetime is `expires_in`, else the time until the `exp` of the issued token if it is a JWT, 0 if that has passed,
     /// else the default token lifetime of the builder, see [`TokenEndpointBuilder::default_token_lifetime`].
