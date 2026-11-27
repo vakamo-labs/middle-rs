@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/vakamo-labs/middle-rs/compare/v0.5.0...v0.6.0) - 2026-11-27
+
+### Added
+
+- danger_http_client and danger_allow_http on TokenEndpointBuilder ([#48](https://github.com/vakamo-labs/middle-rs/pull/48))
+- token exchange (RFC 8693) with TokenEndpoint::exchange, one request per call ([#47](https://github.com/vakamo-labs/middle-rs/pull/47))
+- [**breaking**] one `oauth` feature for requested tokens; `rustls` for TLS ([#45](https://github.com/vakamo-labs/middle-rs/pull/45))
+- refresh a JWT whose exp had passed within 10 s; AccessToken::with_expires_at ([#44](https://github.com/vakamo-labs/middle-rs/pull/44))
+- [**breaking**] tokens from a TokenSource of your own; one SourceError for both source traits ([#42](https://github.com/vakamo-labs/middle-rs/pull/42))
+- [**breaking**] one Authorizer type; JWT bearer grant (RFC 7523, section 2.1) ([#41](https://github.com/vakamo-labs/middle-rs/pull/41))
+- authenticate the client with a JWT assertion (RFC 7523, section 2.2) ([#39](https://github.com/vakamo-labs/middle-rs/pull/39))
+- [**breaking**] pass the client authentication to the builder; append parameters; refuse http token URLs ([#37](https://github.com/vakamo-labs/middle-rs/pull/37))
+- [**breaking**] keep tokens fresh with a token cache ([#36](https://github.com/vakamo-labs/middle-rs/pull/36))
+- sign JWT assertions with the jwt feature ([#35](https://github.com/vakamo-labs/middle-rs/pull/35))
+- [**breaking**] request tokens with our own token-endpoint client on reqwest 0.13 ([#34](https://github.com/vakamo-labs/middle-rs/pull/34))
+
+### Fixed
+
+- token URL audience without its query; exp minus iat is the assertion lifetime; open the assertion file without blocking ([#40](https://github.com/vakamo-labs/middle-rs/pull/40))
+- send token requests to localhost and loopback addresses without a proxy ([#38](https://github.com/vakamo-labs/middle-rs/pull/38))
+
+### Other
+
+- drop the cache's readers-gone shutdown; hanging-refresh test on the paused clock; fix the root README ([#46](https://github.com/vakamo-labs/middle-rs/pull/46))
+- one check for a token that can follow Bearer; build the header without an error path ([#43](https://github.com/vakamo-labs/middle-rs/pull/43))
+- add a scriptable fake token endpoint and pin the token request on the wire ([#32](https://github.com/vakamo-labs/middle-rs/pull/32))
+
 ## [0.5.0](https://github.com/vakamo-labs/middle-rs/compare/v0.4.0...v0.5.0) - 2026-07-01
 
 ### Fixed
