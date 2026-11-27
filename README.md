@@ -5,6 +5,6 @@
 [![Tests](https://github.com/vakamo-labs/middle-rs/actions/workflows/ci.yaml/badge.svg)](https://github.com/vakamo-labs/middle-rs/actions/workflows/ci.yaml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-Authentication middleware for clients of HTTP and gRPC APIs secured with OAuth2 or bearer tokens, with `reqwest` and `tonic` integration.
+Keeps OAuth2 and bearer tokens fresh for HTTP and gRPC clients, with a tonic interceptor.
 
 Read the [crate README](crates/middle/README.md) for features and examples, and the [API documentation](https://docs.rs/middle) on docs.rs.
