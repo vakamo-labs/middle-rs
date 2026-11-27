@@ -108,6 +108,8 @@ impl TokenEndpoint {
             client_auth: None,
             timeout: None,
             default_token_lifetime: None,
+            http_client: None,
+            allow_http: false,
         }
     }
 
@@ -185,17 +187,20 @@ impl fmt::Debug for TokenEndpoint {
 /// * [`Self::client_authentication`]: How the client authenticates. A token exchange does not require it (RFC 8693, section 2.1), and it is not set by default.
 /// * [`Self::timeout`]: How long one exchange may take, creating a client assertion and reading the answer included. Default is 30 seconds.
 /// * [`Self::default_token_lifetime`]: The lifetime of an issued token whose lifetime is not known. Default is 5 minutes.
+/// * [`Self::danger_http_client`]: The `reqwest::Client` for the exchanges, used as it is. Default is a client with redirects disabled, a connect timeout of 10 seconds,
+///   and a proxy from the environment (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY`), except for a token URL with `localhost` or a loopback address.
+/// * [`Self::danger_allow_http`]: Whether an `http` token URL may have any host. Default is `false`: `http` works only with `localhost` and loopback addresses.
 ///
-/// middle builds the HTTP client as for an [`crate::Authorizer`] without `danger_http_client`: redirects disabled, a connect timeout of 10 seconds,
-/// and a proxy from the environment (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY`), except for a token URL with `localhost` or a loopback address.
-///
-/// `Debug` shows the token URL without its query, the client authentication as [`ClientAuthentication`] shows it, and the timeout. It never shows the client secret.
+/// `Debug` shows the token URL without its query, the client authentication as [`ClientAuthentication`] shows it, the timeout, and whether the HTTP client is your own.
+/// It never shows the client secret.
 #[derive(Clone)]
 pub struct TokenEndpointBuilder {
     token_url: Url,
     client_auth: Option<ClientAuth>,
     timeout: Option<Duration>,
     default_token_lifetime: Option<Duration>,
+    http_client: Option<reqwest::Client>,
+    allow_http: bool,
 }
 
 impl TokenEndpointBuilder {
@@ -231,16 +236,44 @@ impl TokenEndpointBuilder {
         self
     }
 
+    /// Sets the `reqwest::Client` for the exchanges. middle uses it as it is, so its settings decide where the subject tokens and the client credentials go.
+    ///
+    /// If the client follows redirects, which reqwest does by default, a 307 or 308 answer of the token endpoint makes reqwest send the form body again
+    /// to the URL the answer names, also to another host or over `http`. That body holds the subject token, and with
+    /// [`ClientAuthentication::client_secret_post`] the client secret or with a client assertion the assertion.
+    /// middle refuses an answer whose final URL is not the token URL, but the other URL has already received the request.
+    /// Set `redirect(reqwest::redirect::Policy::none())` on the client to prevent this.
+    ///
+    /// Use it for a client certificate (RFC 8705), for root certificates that the operating system does not have, for extra headers, or for another connect timeout.
+    #[must_use]
+    pub fn danger_http_client(mut self, client: reqwest::Client) -> Self {
+        self.http_client = Some(client);
+        self
+    }
+
+    /// Whether an `http` token URL may have any host. middle then sends the subject tokens and the client credentials without TLS, so allow it only in a network you trust.
+    ///
+    /// The default is `false`: [`Self::build`] fails for an `http` token URL unless its host is `localhost` or a loopback address (`127.0.0.0/8` or `::1`).
+    #[must_use]
+    pub fn danger_allow_http(mut self, allow: bool) -> Self {
+        self.allow_http = allow;
+        self
+    }
+
     /// Builds the [`TokenEndpoint`]. It sends no request.
     ///
     /// # Errors
     ///
-    /// - [`ConfigError::TokenUrlScheme`] and [`ConfigError::HttpTokenUrl`] unless the token URL uses `https`, or `http` with `localhost` or a loopback address (`127.0.0.0/8` or `::1`).
+    /// - [`ConfigError::TokenUrlScheme`] and [`ConfigError::HttpTokenUrl`] unless the token URL uses `https`, or `http` with `localhost` or a loopback address (`127.0.0.0/8` or `::1`)
+    ///   or with [`Self::danger_allow_http`].
     /// - [`ConfigError::TokenUrlWithFragment`] and [`ConfigError::TokenUrlWithUserInfo`] if the token URL has a fragment, a user name or a password.
-    /// - [`ConfigError::HttpClient`] if the HTTP client cannot be built.
+    /// - [`ConfigError::HttpClient`] if middle cannot build its HTTP client.
     pub fn build(self) -> Result<TokenEndpoint, ConfigError> {
-        check_token_url(&self.token_url, false)?;
-        let http_client = default_http_client(&self.token_url)?;
+        check_token_url(&self.token_url, self.allow_http)?;
+        let http_client = match self.http_client {
+            Some(http_client) => http_client,
+            None => default_http_client(&self.token_url)?,
+        };
         Ok(TokenEndpoint(Arc::new(Endpoint {
             token_url: self.token_url,
             client_auth: self.client_auth,
@@ -269,6 +302,9 @@ impl fmt::Debug for TokenEndpointBuilder {
                     .default_token_lifetime
                     .unwrap_or(DEFAULT_TOKEN_LIFETIME),
             )
+            // A client of the application may carry default headers that hold secrets.
+            .field("http_client", &self.http_client.as_ref().map(|_| "custom"))
+            .field("allow_http", &self.allow_http)
             .finish()
     }
 }

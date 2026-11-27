@@ -611,6 +611,63 @@ fn test_the_builder_checks_the_token_url() {
 }
 
 #[tokio::test]
+async fn test_danger_allow_http_allows_an_http_token_url_with_any_host() {
+    let idp = FakeIdp::start(|_| Reply::token("t", Some(900))).await;
+    let address = idp.token_url().socket_addrs(|| None).unwrap()[0];
+    // The HTTP client of the application resolves `idp.example.com` to the fake token endpoint.
+    let http_client = reqwest::Client::builder()
+        .resolve("idp.example.com", address)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .unwrap();
+    let host = format!("idp.example.com:{}", address.port());
+    let builder = TokenEndpoint::builder(format!("http://{host}/token").parse().unwrap())
+        .danger_http_client(http_client);
+
+    let error = builder
+        .clone()
+        .danger_allow_http(false)
+        .build()
+        .expect_err("http with another host needs danger_allow_http");
+    assert!(
+        matches!(&error, ConfigError::HttpTokenUrl(h) if h == "idp.example.com"),
+        "{error:?}"
+    );
+
+    let endpoint = builder.danger_allow_http(true).build().unwrap();
+    let issued = endpoint.exchange(&request("s")).await.unwrap();
+    assert_eq!(issued.access_token(), "t");
+    assert_eq!(idp.count(), 1);
+    assert_eq!(idp.requests()[0].header("host"), Some(host.as_str()));
+}
+
+#[tokio::test]
+async fn test_a_client_of_the_application_is_used_as_it_is() {
+    let idp = FakeIdp::start(|_| Reply::token("t", Some(900))).await;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("x-api-key", "SECRET-HEADER".parse().unwrap());
+    let http_client = reqwest::Client::builder()
+        .default_headers(headers)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .unwrap();
+    let builder = TokenEndpoint::builder(idp.token_url()).danger_http_client(http_client);
+    let builder_debug = format!("{builder:?}");
+    let endpoint = builder.build().unwrap();
+
+    endpoint.exchange(&request("s")).await.unwrap();
+
+    assert_eq!(idp.requests()[0].header("x-api-key"), Some("SECRET-HEADER"));
+    // A client of the application may carry secrets in its default headers.
+    assert!(builder_debug.contains("custom"), "{builder_debug}");
+    for debug in [builder_debug, format!("{endpoint:?}")] {
+        assert!(!debug.contains("SECRET"), "{debug}");
+    }
+}
+
+#[tokio::test]
 async fn test_redirects_are_not_followed() {
     let target = FakeIdp::start(|_| Reply::token("t", Some(900))).await;
     let location = target.token_url().to_string();
