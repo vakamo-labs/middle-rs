@@ -68,7 +68,7 @@ pub(crate) fn jwt_exp(token: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::token_endpoint::TokenValue;
+    use crate::authorizers::TokenValue;
 
     const DEFAULT: Duration = Duration::from_secs(300);
 

@@ -5,7 +5,7 @@ mod response;
 use std::{fmt, sync::Arc, time::Duration};
 
 use http::{HeaderMap, HeaderValue, StatusCode, header};
-pub(crate) use response::{MAX_EXPIRES_IN, TokenResponse, TokenValue};
+pub(crate) use response::{MAX_EXPIRES_IN, TokenResponse};
 use url::Url;
 
 use crate::{

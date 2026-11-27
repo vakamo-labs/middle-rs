@@ -131,11 +131,11 @@ impl Token {
         requested_at: (Instant, SystemTime),
         lifetime: Duration,
         tolerance: Duration,
-    ) -> Result<Self, Error> {
-        let built = crate::authorizers::bearer_header(response.access_token.as_str())?;
+    ) -> Self {
+        let built = crate::authorizers::BearerHeader::new(&response.access_token);
         let (requested_at, requested_at_wall) = requested_at;
         let refresh_delay = schedule::refresh_delay(lifetime, tolerance, schedule::random());
-        Ok(Self {
+        Self {
             header: built.header,
             #[cfg(feature = "tonic")]
             metadata: built.metadata,
@@ -145,7 +145,7 @@ impl Token {
             expires_at_wall: requested_at_wall.checked_add(lifetime),
             refresh_at: requested_at + refresh_delay,
             refresh_at_wall: requested_at_wall.checked_add(refresh_delay),
-        })
+        }
     }
 
     pub(crate) fn header(&self) -> &HeaderValue {
@@ -594,7 +594,7 @@ impl Refresher {
             cache: self.cache,
             generation: self.generation + 1,
         };
-        let token = Token::new(&response, id, requested_at, lifetime, self.config.tolerance)?;
+        let token = Token::new(&response, id, requested_at, lifetime, self.config.tolerance);
         if token.is_expired_at(Instant::now(), (self.config.wall_clock)()) {
             return Err(Error::ExpiredOnArrival(lifetime));
         }

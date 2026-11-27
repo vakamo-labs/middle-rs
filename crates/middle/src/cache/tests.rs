@@ -6,8 +6,8 @@ use http::StatusCode;
 
 use super::*;
 use crate::{
+    authorizers::TokenValue,
     error::{ErrorCode, HttpError, OAuthError},
-    token_endpoint::TokenValue,
 };
 
 /// What the scripted source does for one request.
@@ -764,8 +764,7 @@ async fn test_a_token_expires_when_either_clock_says_so() {
         now,
         secs(60.0),
         Duration::from_secs(30),
-    )
-    .unwrap();
+    );
 
     assert!(!token.is_expired_at(now.0 + secs(59.0), now.1 + secs(59.0)));
     assert!(token.is_expired_at(now.0 + secs(61.0), now.1 + secs(59.0)));
@@ -1168,8 +1167,7 @@ async fn test_readers_gone_wins_over_a_wait_that_ends_at_the_same_time() {
         (Instant::now(), SystemTime::now()),
         secs(60.0),
         Duration::from_secs(30),
-    )
-    .unwrap();
+    );
     let (sender, receiver) = watch::channel(State::new(token));
     drop(receiver);
 

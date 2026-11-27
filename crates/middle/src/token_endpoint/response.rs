@@ -1,12 +1,15 @@
 //! Reading the answer of the token endpoint (RFC 6749, sections 5.1 and 5.2).
 
-use std::{fmt, time::Duration};
+use std::time::Duration;
 
 use http::{HeaderMap, StatusCode, header};
 use serde_json::{Map, Value};
 
 use super::MAX_RESPONSE_BYTES;
-use crate::error::{Error, ErrorCode, HttpError, InvalidResponse, OAuthError, ResponseProblem};
+use crate::{
+    authorizers::TokenValue,
+    error::{Error, ErrorCode, HttpError, InvalidResponse, OAuthError, ResponseProblem},
+};
 
 /// The longest lifetime middle believes. Longer lifetimes are shortened to this, so the expiry never overflows.
 pub(crate) const MAX_EXPIRES_IN: Duration = Duration::from_secs(365 * 24 * 60 * 60);
@@ -59,32 +62,6 @@ pub(crate) struct TokenResponse {
     pub(crate) access_token: TokenValue,
     /// At most [`MAX_EXPIRES_IN`].
     pub(crate) expires_in: Option<Duration>,
-}
-
-/// An access token of visible ASCII characters (RFC 6749, appendix A.12), without spaces, so that it fits after `Bearer ` in a header.
-/// It is always a valid header value.
-#[derive(Clone)]
-pub(crate) struct TokenValue(String);
-
-impl TokenValue {
-    pub(crate) fn parse(token: &str) -> Option<Self> {
-        Self::new(token.to_string())
-    }
-
-    pub(crate) fn new(token: String) -> Option<Self> {
-        let valid = !token.is_empty() && token.bytes().all(|b| b.is_ascii_graphic());
-        valid.then_some(Self(token))
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for TokenValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("TokenValue([redacted])")
-    }
 }
 
 /// Reads the answer. `body` is `None` if it was larger than [`MAX_RESPONSE_BYTES`].
@@ -241,11 +218,5 @@ mod tests {
         );
         assert_eq!(expires_in(Some(&Value::from(0))), Err(()));
         assert_eq!(expires_in(Some(&Value::from("000"))), Err(()));
-    }
-
-    #[test]
-    fn test_debug_hides_the_access_token() {
-        let token = TokenValue::parse("SECRET").unwrap();
-        assert_eq!(format!("{token:?}"), "TokenValue([redacted])");
     }
 }
