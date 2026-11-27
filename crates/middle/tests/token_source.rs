@@ -7,7 +7,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use middle::{AccessToken, Authorizer, Error, SourceError, TokenContext, TokenReason, TokenSource};
@@ -20,6 +20,7 @@ struct CountingSource {
     /// The reason of each call.
     reasons: Mutex<Vec<TokenReason>>,
     expires_in: Option<Duration>,
+    expires_at: Option<SystemTime>,
     failing: Vec<usize>,
     error: Option<SourceError>,
     /// How long each call after the first takes.
@@ -53,11 +54,14 @@ impl TokenSource for CountingSource {
         if self.failing.contains(&number) {
             return Err(self.error.clone().expect("an error for failing calls"));
         }
-        let token = AccessToken::new(format!("token-{number}"))?;
-        Ok(match self.expires_in {
-            Some(expires_in) => token.with_expires_in(expires_in),
-            None => token,
-        })
+        let mut token = AccessToken::new(format!("token-{number}"))?;
+        if let Some(expires_in) = self.expires_in {
+            token = token.with_expires_in(expires_in);
+        }
+        if let Some(expires_at) = self.expires_at {
+            token = token.with_expires_at(expires_at);
+        }
+        Ok(token)
     }
 }
 
@@ -366,6 +370,39 @@ async fn test_a_permanent_source_error_fails_build_at_once() {
     assert!(!error.is_retryable());
     assert_eq!(error.to_string(), "access denied");
     assert_eq!(source.calls(), 1);
+}
+
+#[test]
+fn test_an_access_token_keeps_the_lifetime_it_was_given_last() {
+    let expiry = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+    let token = AccessToken::new("t")
+        .unwrap()
+        .with_expires_in(Duration::from_secs(60))
+        .with_expires_at(expiry);
+    assert_eq!(token.expires_at(), Some(expiry));
+    assert_eq!(token.expires_in(), None);
+
+    let token = token.with_expires_in(Duration::from_secs(60));
+    assert_eq!(token.expires_in(), Some(Duration::from_secs(60)));
+    assert_eq!(token.expires_at(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_an_expiry_that_had_passed_fails_the_attempt() {
+    let source = Arc::new(CountingSource {
+        expires_at: Some(SystemTime::now() - Duration::from_secs(3600)),
+        ..CountingSource::default()
+    });
+    let error = Authorizer::from_source(Arc::clone(&source))
+        .max_retries(0)
+        .build()
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, Error::ExpiredOnArrival(lifetime) if lifetime.is_zero()),
+        "{error:?}"
+    );
 }
 
 #[test]

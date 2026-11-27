@@ -8,6 +8,10 @@
 //! at the earliest one second after the last one, unless it waits after a failure. A refresh with the reason `Refresh` that brings back the current token
 //! keeps its id, so that an invalidation with a header taken before or during the refresh drops it. An answer to the reason `Rejected` gets a new id.
 //!
+//! A JWT whose `exp` had passed at its request comes from a source that hands out stale tokens, or the clock of this machine runs ahead, and middle
+//! cannot tell which. Such a token lives the default lifetime, so it stays usable if servers accept it, and the task asks for a new token within 10 s.
+//! The first token of each row of such tokens is logged as a warning.
+//!
 //! If the server rejects tokens before their refresh point again and again, each further rejection in a row waits longer before the next request,
 //! counted from the request of the rejected token. A rejection counts only while that wait still lies ahead, so a token that lasted longer than
 //! the wait starts a new series. A token that reaches its refresh point ends the series.
@@ -80,7 +84,7 @@ pub(crate) struct CacheConfig {
     pub(crate) timeout: Duration,
     /// How long before expiry a refresh comes at the latest.
     pub(crate) tolerance: Duration,
-    /// The lifetime of a token whose answer has no `expires_in`, unless the access token is a JWT with an `exp` in the future.
+    /// The lifetime of a token whose answer has no `expires_in` and whose source set no expiry, unless the access token is a JWT with an `exp` in the future.
     pub(crate) default_lifetime: Duration,
     /// How often [`TokenCache::start`] retries the first request after an error a retry can fix.
     pub(crate) first_token_retries: u32,
@@ -124,17 +128,20 @@ pub(crate) struct Token {
 }
 
 impl Token {
-    /// A token that lives `lifetime` from its request. `lifetime` is at most one year.
+    /// A token that lives `lifetime` from its request, refreshed at the latest `refresh_within` after it. `lifetime` is at most one year.
     fn new(
         response: &TokenResponse,
         id: TokenId,
         requested_at: (Instant, SystemTime),
         lifetime: Duration,
         tolerance: Duration,
+        refresh_within: Option<Duration>,
     ) -> Self {
         let built = crate::authorizers::BearerHeader::new(&response.access_token);
         let (requested_at, requested_at_wall) = requested_at;
         let refresh_delay = schedule::refresh_delay(lifetime, tolerance, schedule::random());
+        let refresh_delay =
+            refresh_within.map_or(refresh_delay, |within| refresh_delay.min(within));
         Self {
             header: built.header,
             #[cfg(feature = "tonic")]
@@ -196,6 +203,9 @@ impl Token {
                 .is_some_and(|expiry| now_wall >= expiry)
     }
 }
+
+/// How soon middle asks for a new token when the JWT `exp` of the current one had passed at its request.
+const PASSED_EXP_REFRESH: Duration = Duration::from_secs(10);
 
 /// What readers and the refresh task share besides the channel.
 #[derive(Debug)]
@@ -307,6 +317,7 @@ impl TokenCache {
             cache: id,
             generation: 0,
             logged_missing_expires_in: false,
+            passed_exp: false,
             fresh_rejections: 0,
         };
         let token = refresher.first_token().await?;
@@ -444,6 +455,8 @@ struct Refresher {
     /// The generation of the newest token.
     generation: u64,
     logged_missing_expires_in: bool,
+    /// Whether the JWT `exp` of the newest token had passed at its request, so that a row of such tokens is logged once.
+    passed_exp: bool,
     /// Fresh tokens rejected in a row: tokens invalidated before their refresh point by either clock, while the wait after the rejection still lay ahead.
     /// A rejection whose wait has passed starts a new series at 1. A token that reaches its refresh point resets the count to 0,
     /// also when it is invalidated after that point. An expired token neither counts nor resets.
@@ -594,11 +607,25 @@ impl Refresher {
             cache: self.cache,
             generation: self.generation + 1,
         };
-        let token = Token::new(&response, id, requested_at, lifetime, self.config.tolerance);
+        let passed_exp = matches!(origin, lifetime::Origin::PassedExp(_));
+        let token = Token::new(
+            &response,
+            id,
+            requested_at,
+            lifetime,
+            self.config.tolerance,
+            passed_exp.then_some(PASSED_EXP_REFRESH),
+        );
         if token.is_expired_at(Instant::now(), (self.config.wall_clock)()) {
             return Err(Error::ExpiredOnArrival(lifetime));
         }
         self.generation = id.generation;
+        if let lifetime::Origin::PassedExp(passed_by) = origin
+            && !self.passed_exp
+        {
+            self.warn_passed_exp(passed_by, lifetime);
+        }
+        self.passed_exp = passed_exp;
         self.log_missing_expires_in(origin, lifetime);
         tracing::debug!(
             "Fetched a token for {}. It is valid for {lifetime:?}",
@@ -607,12 +634,31 @@ impl Refresher {
         Ok(token)
     }
 
+    /// Warns about the first token of a row whose JWT `exp` had passed at its request.
+    fn warn_passed_exp(&self, passed_by: Duration, lifetime: Duration) {
+        let refresh = if self.config.refresh {
+            format!(
+                ", and asks for a new one at least every {PASSED_EXP_REFRESH:?} while this goes on"
+            )
+        } else {
+            String::new()
+        };
+        tracing::warn!(
+            "The token of {} has no `expires_in`, and the `exp` of its JWT lies {passed_by:?} before the request: the source hands out stale tokens, \
+             or the clock of this machine runs ahead of the clock of the token issuer. If servers reject the token, check the source; \
+             if they accept it, check the clock of this machine. middle uses the token for {lifetime:?}{refresh}",
+            self.config.name
+        );
+    }
+
     fn log_missing_expires_in(&mut self, origin: lifetime::Origin, lifetime: Duration) {
         if self.logged_missing_expires_in {
             return;
         }
         match origin {
-            lifetime::Origin::ExpiresIn => return,
+            lifetime::Origin::ExpiresIn
+            | lifetime::Origin::ExpiresAt
+            | lifetime::Origin::PassedExp(_) => return,
             lifetime::Origin::JwtExp => tracing::info!(
                 "The token of {} has no `expires_in`. middle uses the `exp` of the JWT access token, which is {lifetime:?} after the request",
                 self.config.name

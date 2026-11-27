@@ -487,10 +487,13 @@ impl<S> AuthorizerBuilder<S> {
         self
     }
 
-    /// Set how long a token lives if its lifetime is not known: the token endpoint sends no `expires_in`, or the token source sets none with [`AccessToken::with_expires_in`],
-    /// and the access token is not a JWT with an `exp` in the future.
+    /// Set how long a token lives if its lifetime is not known: the token endpoint sends no `expires_in`, or the token source sets none
+    /// with [`AccessToken::with_expires_in`] or [`AccessToken::with_expires_at`], and the access token is not a JWT with an `exp` in the future.
     /// Longer lifetimes are shortened to one year.
     /// Default is 5 minutes.
+    ///
+    /// A JWT whose `exp` had passed when middle asked for it lives this lifetime too, but middle asks for a new token within 10 s:
+    /// the source hands out stale tokens, or the clock of this machine runs ahead. The first such token in a row is logged as a warning.
     ///
     /// [`Self::build`] fails for a lifetime shorter than 2 s: a token is refreshed 1 s after its request at the earliest, so a lifetime of at least 2 s makes the refresh come before the token expires.
     #[must_use]

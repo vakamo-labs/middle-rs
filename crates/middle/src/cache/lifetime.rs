@@ -11,16 +11,23 @@ use crate::token_endpoint::{MAX_EXPIRES_IN, TokenResponse};
 pub(super) enum Origin {
     /// The `expires_in` of the answer.
     ExpiresIn,
+    /// The expiry that the token source set with `AccessToken::with_expires_at`.
+    ExpiresAt,
     /// The `exp` claim of a JWT access token.
     JwtExp,
+    /// The configured default, for a JWT access token whose `exp` lay this long before the request.
+    PassedExp(Duration),
     /// The configured default.
     Default,
 }
 
 /// The lifetime of the token in `response`, requested at `requested_at`.
 ///
-/// `expires_in` if the answer has it. Otherwise the `exp` claim of the access token if it is a JWT (RFC 9068) and `exp` lies after `requested_at`.
-/// Otherwise `default`, which the caller keeps at most one year. The other two are at most one year, whatever the token source sends.
+/// `expires_in` if the answer has it. Otherwise the time from `requested_at` to the expiry the token source set, 0 if it had passed:
+/// that expiry is on the clock of this machine, as SDKs keep it. Otherwise, for a JWT access token (RFC 9068), the time from `requested_at` to its `exp`,
+/// or `default` if the `exp` lies at or before `requested_at`. An `exp` of 0 or less counts as not set, as some libraries read it.
+/// Otherwise `default`, which the caller keeps at most one year.
+/// The other lifetimes are at most one year, whatever the token source sends.
 pub(super) fn lifetime(
     response: &TokenResponse,
     requested_at: SystemTime,
@@ -29,18 +36,25 @@ pub(super) fn lifetime(
     if let Some(expires_in) = response.expires_in {
         return (expires_in.min(MAX_EXPIRES_IN), Origin::ExpiresIn);
     }
+    if let Some(expires_at) = response.expires_at {
+        let lifetime = expires_at.duration_since(requested_at).unwrap_or_default();
+        return (lifetime.min(MAX_EXPIRES_IN), Origin::ExpiresAt);
+    }
+    let Some(exp) = jwt_exp(response.access_token.as_str()).filter(|exp| *exp > 0.0) else {
+        return (default, Origin::Default);
+    };
     let requested_at = requested_at
         .duration_since(UNIX_EPOCH)
         .map_or(0.0, |since_epoch| since_epoch.as_secs_f64());
-    jwt_exp(response.access_token.as_str())
-        .map(|exp| exp - requested_at)
-        .filter(|seconds| *seconds > 0.0)
-        .and_then(|seconds| {
-            Duration::try_from_secs_f64(seconds.min(MAX_EXPIRES_IN.as_secs_f64())).ok()
-        })
-        .map_or((default, Origin::Default), |lifetime| {
-            (lifetime, Origin::JwtExp)
-        })
+    let seconds = exp - requested_at;
+    if seconds > 0.0 {
+        let lifetime = Duration::try_from_secs_f64(seconds.min(MAX_EXPIRES_IN.as_secs_f64()))
+            .unwrap_or(MAX_EXPIRES_IN);
+        (lifetime, Origin::JwtExp)
+    } else {
+        let passed_by = Duration::try_from_secs_f64(-seconds).unwrap_or(Duration::MAX);
+        (default, Origin::PassedExp(passed_by))
+    }
 }
 
 /// The `exp` claim of a JWT in seconds since 1970, read without checking the signature.
@@ -88,6 +102,14 @@ mod tests {
         TokenResponse {
             access_token: TokenValue::parse(access_token).unwrap(),
             expires_in: expires_in.map(Duration::from_secs),
+            expires_at: None,
+        }
+    }
+
+    fn expiring_at(access_token: &str, expires_at: SystemTime) -> TokenResponse {
+        TokenResponse {
+            expires_at: Some(expires_at),
+            ..response(access_token, None)
         }
     }
 
@@ -141,13 +163,57 @@ mod tests {
     }
 
     #[test]
-    fn test_an_exp_that_has_passed_gives_the_default() {
-        for exp in [2_000_000_000_u64, 1_999_999_999, 0] {
+    fn test_an_exp_at_or_before_the_request_gives_the_default_and_how_long_ago_it_passed() {
+        for (exp, by) in [
+            (2_000_000_000.0, 0.0),
+            (1_999_999_999.5, 0.5),
+            (1.0, 1_999_999_999.0),
+        ] {
             let token = jwt(&serde_json::json!({"exp": exp}));
             assert_eq!(
                 lifetime(&response(&token, None), at(2_000_000_000), DEFAULT),
-                (DEFAULT, Origin::Default),
+                (DEFAULT, Origin::PassedExp(Duration::from_secs_f64(by))),
                 "{exp}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_an_expiry_the_source_set_counts_from_the_request() {
+        assert_eq!(
+            lifetime(
+                &expiring_at("t", at(2_000_000_100)),
+                at(2_000_000_000),
+                DEFAULT
+            ),
+            (Duration::from_secs(100), Origin::ExpiresAt)
+        );
+    }
+
+    #[test]
+    fn test_an_expiry_the_source_set_comes_before_the_exp_of_a_jwt() {
+        let token = jwt(&serde_json::json!({"exp": 2_000_000_100_u64}));
+        assert_eq!(
+            lifetime(
+                &expiring_at(&token, at(2_000_000_050)),
+                at(2_000_000_000),
+                DEFAULT
+            ),
+            (Duration::from_secs(50), Origin::ExpiresAt)
+        );
+    }
+
+    #[test]
+    fn test_an_expiry_the_source_set_that_has_passed_gives_no_lifetime() {
+        for expires_at in [2_000_000_000, 1_999_999_000] {
+            assert_eq!(
+                lifetime(
+                    &expiring_at("t", at(expires_at)),
+                    at(2_000_000_000),
+                    DEFAULT
+                ),
+                (Duration::ZERO, Origin::ExpiresAt),
+                "{expires_at}"
             );
         }
     }
@@ -191,6 +257,8 @@ mod tests {
             format!("{}.{claims}.", encode(&serde_json::json!({"alg": "RS256"}))),
             jwt(&serde_json::json!({"sub": "c"})),
             jwt(&serde_json::json!({"exp": "2000000100"})),
+            // Some libraries read an `exp` of 0 as not set.
+            jwt(&serde_json::json!({"exp": 0})),
             jwt(&serde_json::json!({"exp": -5})),
         ];
         for token in tokens {
