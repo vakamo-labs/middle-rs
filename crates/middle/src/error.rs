@@ -32,7 +32,7 @@ pub enum Error {
     /// The configuration cannot work.
     #[error(transparent)]
     Config(#[from] ConfigError),
-    /// The token cannot follow `Bearer ` in a header: it is empty or holds a character other than visible ASCII, such as a space.
+    /// The token given to [`crate::Authorizer::bearer`] cannot follow `Bearer ` in a header: it is empty or holds a character other than visible ASCII without space.
     #[error(
         "the token cannot follow `Bearer ` in a header; it must be visible ASCII without spaces"
     )]
@@ -378,7 +378,7 @@ pub enum ResponseProblem {
     },
     /// The `token_type` is not `Bearer`.
     UnsupportedTokenType(String),
-    /// The access token is empty or has characters other than visible ASCII (RFC 6749, appendix A.12), such as a space.
+    /// The access token is empty or holds a character other than visible ASCII without space, so that it cannot follow `Bearer ` in a header.
     InvalidAccessToken,
     /// The HTTP client followed a redirect, so the answer comes from another URL.
     Redirected {
@@ -401,7 +401,7 @@ impl fmt::Display for ResponseProblem {
                 "the token type `{token_type}` is not supported; middle supports `Bearer` only"
             ),
             Self::InvalidAccessToken => f.write_str(
-                "the access token is empty or has characters other than visible ASCII (RFC 6749, appendix A.12)",
+                "the access token is empty or holds a character other than visible ASCII without space, so it cannot follow `Bearer ` in a header",
             ),
             Self::Redirected { to } => write!(
                 f,

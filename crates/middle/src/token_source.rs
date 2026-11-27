@@ -3,9 +3,10 @@
 use std::{fmt, future::Future, sync::Arc, time::Duration};
 
 use crate::{
+    authorizers::TokenValue,
     cache::BoxFuture,
     error::SourceError,
-    token_endpoint::{MAX_EXPIRES_IN, TokenResponse, TokenValue},
+    token_endpoint::{MAX_EXPIRES_IN, TokenResponse},
 };
 
 /// Supplies the access tokens of an authorizer made with [`crate::Authorizer::from_source`]. Implement it with `async fn token`.
@@ -135,12 +136,12 @@ impl AccessToken {
     ///
     /// # Errors
     ///
-    /// [`SourceError`] if the token is empty or holds a character other than visible ASCII, such as a space, so that it cannot follow `Bearer ` in a header.
+    /// [`SourceError`] if the token is empty or holds a character other than visible ASCII without space, so that it cannot follow `Bearer ` in a header.
     /// A retry may fix it. The message does not show the token.
     pub fn new(token: impl Into<String>) -> Result<Self, SourceError> {
         let access_token = TokenValue::new(token.into()).ok_or_else(|| {
             SourceError::new(
-                "the access token of the token source is empty or holds a character other than visible ASCII",
+                "the access token of the token source is empty or holds a character other than visible ASCII without space",
             )
         })?;
         Ok(Self(TokenResponse {

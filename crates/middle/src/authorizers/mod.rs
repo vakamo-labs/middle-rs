@@ -54,10 +54,10 @@ impl Authorizer {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidHeaderValue`] if the token is empty or holds a character other than visible ASCII, such as a space (RFC 6750, section 2.1).
+    /// [`Error::InvalidHeaderValue`] if the token is empty or holds a character other than visible ASCII without space, so that it cannot follow `Bearer ` in a header.
     pub fn bearer(token: &str) -> Result<Self> {
-        require_visible_ascii(token)?;
-        Ok(Self(Kind::Static(bearer_header(token)?)))
+        let token = TokenValue::parse(token).ok_or(Error::InvalidHeaderValue)?;
+        Ok(Self(Kind::Static(BearerHeader::new(&token))))
     }
 
     /// The header value of the current token, `Bearer` and the token, without waiting.
@@ -225,12 +225,30 @@ fn status(error: Error) -> tonic::Status {
     status
 }
 
-/// Fails with [`Error::InvalidHeaderValue`] if the token is empty or holds a character other than visible ASCII, so that it cannot follow `Bearer ` in a header.
-fn require_visible_ascii(token: &str) -> Result<()> {
-    if !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_graphic()) {
-        Ok(())
-    } else {
-        Err(Error::InvalidHeaderValue)
+/// An access token that can follow `Bearer ` in a header: one or more characters of visible ASCII without space, the bytes 0x21 to 0x7E.
+/// RFC 6749, appendix A.12, allows a space in an access token, but a token after `Bearer ` in a header cannot hold one (RFC 6750, section 2.1).
+/// It is always a valid header value. `Debug` never shows the token.
+#[derive(Clone)]
+pub(crate) struct TokenValue(String);
+
+impl TokenValue {
+    pub(crate) fn parse(token: &str) -> Option<Self> {
+        Self::new(token.to_string())
+    }
+
+    pub(crate) fn new(token: String) -> Option<Self> {
+        let valid = !token.is_empty() && token.bytes().all(|b| b.is_ascii_graphic());
+        valid.then_some(Self(token))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for TokenValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TokenValue([redacted])")
     }
 }
 
@@ -243,30 +261,30 @@ pub(crate) struct BearerHeader {
     pub(crate) metadata: tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
 }
 
-/// Builds the sensitive `Authorization: Bearer <token>` representations from a token without the `Bearer ` prefix.
-///
-/// # Errors
-///
-/// Fails with [`Error::InvalidHeaderValue`] if the header value is not valid, for example not ASCII.
-pub(crate) fn bearer_header(token: &str) -> Result<BearerHeader> {
-    let bearer = format!("Bearer {token}");
-    let mut header = HeaderValue::from_str(&bearer).map_err(|_| Error::InvalidHeaderValue)?;
-    header.set_sensitive(true);
+impl BearerHeader {
+    /// The sensitive `Authorization: Bearer <token>` representations of `token`. A [`TokenValue`] is always a valid header value, so this cannot fail.
+    pub(crate) fn new(token: &TokenValue) -> Self {
+        let bearer = format!("Bearer {}", token.as_str());
+        let mut header =
+            HeaderValue::from_str(&bearer).expect("a `TokenValue` is always a valid header value");
+        header.set_sensitive(true);
 
-    #[cfg(feature = "tonic")]
-    let metadata = {
-        use std::str::FromStr;
-        let mut metadata = tonic::metadata::MetadataValue::from_str(&bearer)
-            .map_err(|_| Error::InvalidHeaderValue)?;
-        metadata.set_sensitive(true);
-        metadata
-    };
-
-    Ok(BearerHeader {
-        header,
+        // tonic has no public conversion from a `HeaderValue`.
         #[cfg(feature = "tonic")]
-        metadata,
-    })
+        let metadata = {
+            use std::str::FromStr;
+            let mut metadata = tonic::metadata::MetadataValue::from_str(&bearer)
+                .expect("a `TokenValue` is always a valid header value");
+            metadata.set_sensitive(true);
+            metadata
+        };
+
+        Self {
+            header,
+            #[cfg(feature = "tonic")]
+            metadata,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -303,6 +321,12 @@ mod tests {
                 "{token:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_debug_hides_the_access_token() {
+        let token = TokenValue::parse("SECRET").unwrap();
+        assert_eq!(format!("{token:?}"), "TokenValue([redacted])");
     }
 
     #[cfg(feature = "tonic")]
