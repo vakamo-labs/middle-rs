@@ -51,6 +51,7 @@ impl Fetch for ScriptedSource {
                 Step::Lasting(token, lifetime) => Ok(TokenResponse {
                     access_token: TokenValue::parse(token).unwrap(),
                     expires_in: Some(lifetime),
+                    expires_at: None,
                 }),
                 Step::Slow(delay, token, expires_in) => {
                     tokio::time::sleep(delay).await;
@@ -92,6 +93,7 @@ fn response(token: &str, expires_in: Option<u64>) -> TokenResponse {
     TokenResponse {
         access_token: TokenValue::parse(token).unwrap(),
         expires_in: expires_in.map(Duration::from_secs),
+        expires_at: None,
     }
 }
 
@@ -567,6 +569,61 @@ async fn test_a_missing_expires_in_is_logged_once() {
     });
 }
 
+/// A JWT access token whose `exp` lies in 2001, long before the wall clock of the tests.
+const PASSED_JWT: &str = "eyJhbGciOiJSUzI1NiJ9.eyJleHAiOjEwMDAwMDAwMDB9.c2lnbmF0dXJl";
+
+#[tokio::test(start_paused = true)]
+async fn test_a_jwt_whose_exp_had_passed_lives_the_default_lifetime_and_is_refreshed_after_10_s() {
+    let started = start(config(), |_| Step::Token(PASSED_JWT, None)).await;
+
+    assert_eq!(
+        started
+            .cache
+            .read(|token| token.expires_at - token.requested_at)
+            .unwrap(),
+        secs(300.0)
+    );
+    tokio::time::sleep(secs(35.0)).await;
+    let gaps = started.source.gaps();
+    assert_eq!(gaps.len(), 3, "{gaps:?}");
+    for gap in gaps {
+        assert_between(gap, 10.0, 10.0);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+#[tracing_test::traced_test]
+async fn test_a_row_of_jwts_whose_exp_had_passed_is_logged_once() {
+    let started = start(config(), |number| match number {
+        3 => Step::Token("t", Some(100)),
+        _ => Step::Token(PASSED_JWT, None),
+    })
+    .await;
+
+    tokio::time::sleep(secs(105.0)).await;
+
+    // Refreshed after 10 s and 10 s, then a token of 100 s at 60–70 s, then after 10 s again: the fifth request comes at 100 s at the latest.
+    let gaps = started.source.gaps();
+    assert!(gaps.len() >= 4, "{gaps:?}");
+    for (gap, (low, high)) in
+        gaps.into_iter()
+            .zip([(10.0, 10.0), (10.0, 10.0), (60.0, 70.0), (10.0, 10.0)])
+    {
+        assert_between(gap, low, high);
+    }
+    logs_assert(|lines| {
+        let warnings = lines
+            .iter()
+            .filter(|line| line.contains(" WARN ") && line.contains("before the request"))
+            .count();
+        if warnings == 2 {
+            Ok(())
+        } else {
+            Err(format!("{warnings} warnings"))
+        }
+    });
+}
+
 #[tokio::test(start_paused = true)]
 async fn test_invalidate_drops_only_the_rejected_generation() {
     let started = start(config(), |number| match number {
@@ -764,6 +821,7 @@ async fn test_a_token_expires_when_either_clock_says_so() {
         now,
         secs(60.0),
         Duration::from_secs(30),
+        None,
     );
 
     assert!(!token.is_expired_at(now.0 + secs(59.0), now.1 + secs(59.0)));
@@ -1167,6 +1225,7 @@ async fn test_readers_gone_wins_over_a_wait_that_ends_at_the_same_time() {
         (Instant::now(), SystemTime::now()),
         secs(60.0),
         Duration::from_secs(30),
+        None,
     );
     let (sender, receiver) = watch::channel(State::new(token));
     drop(receiver);

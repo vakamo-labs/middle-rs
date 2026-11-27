@@ -1,6 +1,6 @@
 //! Reading the answer of the token endpoint (RFC 6749, sections 5.1 and 5.2).
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use http::{HeaderMap, StatusCode, header};
 use serde_json::{Map, Value};
@@ -62,6 +62,8 @@ pub(crate) struct TokenResponse {
     pub(crate) access_token: TokenValue,
     /// At most [`MAX_EXPIRES_IN`].
     pub(crate) expires_in: Option<Duration>,
+    /// The expiry that a token source set with `AccessToken::with_expires_at`. A token endpoint answer has none.
+    pub(crate) expires_at: Option<SystemTime>,
 }
 
 /// Reads the answer. `body` is `None` if it was larger than [`MAX_RESPONSE_BYTES`].
@@ -150,6 +152,7 @@ pub(super) fn parse(meta: Meta, body: Option<&[u8]>) -> Result<TokenResponse, Er
     Ok(TokenResponse {
         access_token,
         expires_in,
+        expires_at: None,
     })
 }
 

@@ -46,9 +46,10 @@ pub enum Error {
     /// The token request panicked.
     #[error("the token request panicked")]
     TokenRequestPanicked,
-    /// The token had expired when the answer arrived: the request took longer than the token lives, counted from the request. The value is that lifetime.
+    /// The token had expired when the answer arrived: the token endpoint or token source answered later than the token lives, counted from the request,
+    /// or handed out a token that had expired. The value is that lifetime.
     #[error(
-        "the token had expired when the answer arrived: it lives {0:?} from the request, and the request took longer"
+        "the token had expired when the answer arrived: it lives {0:?}, counted from the request"
     )]
     ExpiredOnArrival(Duration),
     /// A token source or an assertion source failed, for example because signing failed, an assertion file cannot be read, or a service did not answer.
@@ -84,7 +85,7 @@ impl Error {
     ///
     /// Retryable are transport errors, timeouts, and answers with HTTP 408, 429 or 5xx, whatever OAuth error they carry. These statuses ask for a later attempt, and a 5xx comes from a server that failed, so its code is not reliable.
     /// The OAuth errors `server_error` and `temporarily_unavailable` are retryable with any status.
-    /// [`Error::TokenExpired`] is retryable, because a refresh is due. [`Error::ExpiredOnArrival`] is retryable, because a faster answer brings a usable token.
+    /// [`Error::TokenExpired`] is retryable, because a refresh is due. [`Error::ExpiredOnArrival`] is retryable, because the next answer can come sooner or bring a token that lives longer.
     /// [`Error::Source`] is retryable unless [`SourceError::permanent`] marks it: a token source or an assertion file or signing service can recover, and a failed assertion costs the token endpoint nothing, because middle creates it before it sends the request.
     /// Not retryable are other OAuth errors with another status, such as `invalid_client` with HTTP 401 or `invalid_grant` with HTTP 400, redirect errors of the HTTP client, answers middle cannot use, configuration errors, a panicked token request, and [`Error::RefreshStopped`].
     #[must_use]

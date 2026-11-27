@@ -1,6 +1,11 @@
 //! Token sources of the application's own, see [`TokenSource`].
 
-use std::{fmt, future::Future, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    future::Future,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use crate::{
     authorizers::TokenValue,
@@ -20,7 +25,8 @@ use crate::{
 ///
 /// An error fails the attempt, and middle retries it, see [`SourceError`]. A token whose lifetime ends while middle waits for the source fails the attempt
 /// with [`crate::Error::ExpiredOnArrival`], which middle retries too. A JWT without a lifetime whose `exp` had passed when middle asked lives the default token lifetime
-/// of the builder, because middle cannot tell a stale token from a local clock that runs ahead.
+/// of the builder, because middle cannot tell a stale token from a local clock that runs ahead, and middle asks the source again within 10 s.
+/// A source that can tell that its token is stale, for example from the age of a file, returns a [`SourceError`].
 ///
 /// Each attempt may take at most the timeout of the builder, and during a refresh while the current token is valid, at most half the time it has left,
 /// but at least 1 s. middle then drops the future, so the source must cope with being stopped at any `.await`. A source that retries inside should
@@ -132,7 +138,7 @@ pub struct AccessToken(TokenResponse);
 
 impl AccessToken {
     /// An access token without a lifetime. middle then uses it until the `exp` of the token if it is a JWT with an `exp` in the future,
-    /// else for the default token lifetime of the builder. Set the lifetime with [`Self::with_expires_in`] if the source knows it.
+    /// else for the default token lifetime of the builder. Set the lifetime with [`Self::with_expires_in`] or [`Self::with_expires_at`] if the source knows it.
     ///
     /// # Errors
     ///
@@ -147,14 +153,26 @@ impl AccessToken {
         Ok(Self(TokenResponse {
             access_token,
             expires_in: None,
+            expires_at: None,
         }))
     }
 
     /// Sets how long the token is valid, counted from when middle asked the source, as `expires_in` of a token endpoint (RFC 6749, section 5.1).
-    /// Longer lifetimes are shortened to one year.
+    /// Longer lifetimes are shortened to one year. Replaces an expiry set with [`Self::with_expires_at`].
     #[must_use]
     pub fn with_expires_in(mut self, expires_in: Duration) -> Self {
         self.0.expires_in = Some(expires_in.min(MAX_EXPIRES_IN));
+        self.0.expires_at = None;
+        self
+    }
+
+    /// Sets when the token expires on the clock of this machine, as cloud SDKs and caches keep it. The lifetime counts from when middle asked the source.
+    /// An expiry that had passed by then fails the attempt with [`crate::Error::ExpiredOnArrival`], which middle retries.
+    /// Lifetimes longer than one year are shortened to one year. Replaces a lifetime set with [`Self::with_expires_in`].
+    #[must_use]
+    pub fn with_expires_at(mut self, expires_at: SystemTime) -> Self {
+        self.0.expires_at = Some(expires_at);
+        self.0.expires_in = None;
         self
     }
 
@@ -170,6 +188,12 @@ impl AccessToken {
         self.0.expires_in
     }
 
+    /// The expiry set with [`Self::with_expires_at`].
+    #[must_use]
+    pub fn expires_at(&self) -> Option<SystemTime> {
+        self.0.expires_at
+    }
+
     pub(crate) fn into_response(self) -> TokenResponse {
         self.0
     }
@@ -180,6 +204,7 @@ impl fmt::Debug for AccessToken {
         f.debug_struct("AccessToken")
             .field("token", &"[redacted]")
             .field("expires_in", &self.0.expires_in)
+            .field("expires_at", &self.0.expires_at)
             .finish()
     }
 }
