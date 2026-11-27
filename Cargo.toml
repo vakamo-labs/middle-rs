@@ -5,7 +5,7 @@ members = [
     "examples/reqwest-client-credentials",
     "examples/tonic-bearer-token",
 ]
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
 edition = "2024"
@@ -17,7 +17,8 @@ license = "Apache-2.0"
 [workspace.dependencies]
 tokio = { version = "1.48" }
 url = { version = "2.5" }
-tonic = { version = "0.14" }
+# middle needs only the interceptor and metadata types, which tonic has without features.
+tonic = { version = "0.14", default-features = false }
 protoc-bin-vendored = { version = "3" }
 tonic-prost-build = { version = "0.14" }
 tonic-prost = { version = "0.14" }

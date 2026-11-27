@@ -52,7 +52,6 @@ const MAX_LIFETIME: Duration = Duration::from_secs(3600);
 const IAT_BEFORE_SIGNING: u64 = 5;
 
 /// The `typ` header of a client authentication JWT for the issuer (RFC 10070, section 4).
-#[cfg(feature = "client-credentials")]
 const CLIENT_AUTHENTICATION_JWT_TYPE: &str = "client-authentication+jwt";
 
 /// RFC 7518, section 3.3: RSA keys have at least 2048 bits.
@@ -600,7 +599,6 @@ impl JwtAssertion {
 }
 
 /// Signs a new assertion for every token request.
-#[cfg(feature = "client-credentials")]
 impl crate::AssertionSource for JwtAssertion {
     async fn assertion(
         &self,
@@ -627,13 +625,11 @@ pub enum Audience {
 }
 
 /// The assertion of `private_key_jwt` and `client_secret_jwt`: `iss` and `sub` are the client id, `aud` and `typ` follow the [`Audience`].
-#[cfg(feature = "client-credentials")]
 pub(crate) struct ClientAuthenticationJwt {
     assertion: JwtAssertion,
     audience: Audience,
 }
 
-#[cfg(feature = "client-credentials")]
 impl ClientAuthenticationJwt {
     pub(crate) fn new(key: SigningKey, client_id: &str, audience: Audience) -> Self {
         let (aud, token_type) = match &audience {
@@ -648,7 +644,6 @@ impl ClientAuthenticationJwt {
     }
 }
 
-#[cfg(feature = "client-credentials")]
 impl crate::AssertionSource for ClientAuthenticationJwt {
     async fn assertion(
         &self,
@@ -667,7 +662,6 @@ impl crate::AssertionSource for ClientAuthenticationJwt {
     }
 }
 
-#[cfg(feature = "client-credentials")]
 impl fmt::Debug for ClientAuthenticationJwt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ClientAuthenticationJwt")

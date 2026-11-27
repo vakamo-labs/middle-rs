@@ -1,8 +1,3 @@
-#[cfg(not(feature = "runtime-tokio"))]
-compile_error!(
-    "If `client-credentials` feature is enabled, an async runtime, such as `runtime-tokio`, must be enabled too."
-);
-
 use std::{
     fmt,
     sync::Arc,
